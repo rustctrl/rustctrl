@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/rustctrl_server", "crates/rustctrl_agent"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+prost = "0.14.4"
+rcgen = { version = "0.14.10", features = ["x509-parser"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+thiserror = "2"
+time = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+toml = "1"
+tonic = { version = "0.14.6", features = ["tls-ring", "tls-connect-info"] }
+tonic-prost = "0.14.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+x509-parser = "0.18"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "66ed3027b8ca7fed0feeee91d1ce6346ccd4ac39", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "66ed3027b8ca7fed0feeee91d1ce6346ccd4ac39", default-features = false }
+
+rustctrl_core = { path = "crates/rustctrl_core" }
+rustctrl_protocol = { path = "crates/rustctrl_protocol" }
+rustctrl_network = { path = "crates/rustctrl_network" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+strip = true
+lto = "thin"

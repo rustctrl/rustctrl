@@ -1,0 +1,59 @@
+name: rustctrl
+
+services:
+  server:
+    image: rustctrl-server:local
+    build:
+      context: .
+      dockerfile: packaging/server/Dockerfile
+    command: ["serve", "--config", "/etc/rustctrl/server.toml"]
+    ports:
+      - "${RUSTCTRL_LISTEN_ADDRESS:-127.0.0.1}:${RUSTCTRL_PORT:-9876}:9876"
+    volumes:
+      - server-data:/data
+      - server-tls:/tls:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rustctrl-server", "healthcheck", "--tls-dir", "/tls"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  pki-init:
+    image: rustctrl-server:local
+    profiles: [tools]
+    command:
+      - init-pki
+      - --output
+      - /pki
+      - --server-output
+      - /tls
+      - --server-name
+      - localhost
+      - --server-name
+      - "${RUSTCTRL_SERVER_NAME:-localhost}"
+      - --server-ip
+      - 127.0.0.1
+      - --server-ip
+      - "${RUSTCTRL_SERVER_IP:-127.0.0.1}"
+      - --endpoint
+      - "${RUSTCTRL_SERVER_ENDPOINT:-https://localhost:9876}"
+      - --domain-name
+      - "${RUSTCTRL_SERVER_NAME:-localhost}"
+    volumes:
+      - admin-pki:/pki
+      - server-tls:/tls
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  server-data:
+  server-tls:
+  admin-pki:

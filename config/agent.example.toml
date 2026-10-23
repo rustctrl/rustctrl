@@ -1,0 +1,12 @@
+# Replace this ID and all certificate paths with the bundle generated for this agent.
+device_id = "00000000-0000-4000-8000-000000000001"
+name = "PC-Office-01"
+heartbeat_seconds = 10
+log_file = "../.local/agent.log"
+
+[server]
+endpoint = "https://localhost:9876"
+domain_name = "localhost"
+ca_certificate = "../.local/pki/clients/agent/ca.pem"
+certificate = "../.local/pki/clients/agent/cert.pem"
+private_key = "../.local/pki/clients/agent/key.pem"

@@ -1,0 +1,3 @@
+# Bootstrap an offline local CA
+
+Office deployments must establish trusted connections while operating without internet access, so RustCtrl provides one-time local CA initialization and mutually authenticated bootstrap connections while also accepting certificates from an existing office CA. This places CA custody and credential distribution with the administrator; the Server receives its runtime identity and public trust material, while the CA private key stays outside its mounts. These credentials establish component identity for health and heartbeat, and staff account authentication remains separate feature work.

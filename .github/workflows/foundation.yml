@@ -1,0 +1,70 @@
+name: Foundation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  headless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup show
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --exclude rustctrl_controller --all-targets -- -D warnings
+      - run: cargo test --locked --workspace --exclude rustctrl_controller
+      - run: cargo build --locked -p rustctrl_controller --no-default-features
+
+  almalinux-controller:
+    runs-on: ubuntu-latest
+    container: almalinux:10
+    steps:
+      - run: >-
+          dnf install -y git curl-minimal gcc gcc-c++ pkgconf-pkg-config fontconfig-devel
+          freetype-devel libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install rustup
+        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+      - name: Build and lint GPUI Controller
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo clippy --locked -p rustctrl_controller --all-targets -- -D warnings
+          cargo build --locked -p rustctrl_controller
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup show
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: cargo build --locked -p rustctrl_controller -p rustctrl_agent -p rustctrl_server
+      - name: Check service start and stop
+        shell: pwsh
+        run: |
+          ./target/debug/rustctrl-server.exe init-pki --output .local/pki
+          if ($LASTEXITCODE -ne 0) { throw "PKI initialization failed" }
+          $exe = (Resolve-Path ./target/debug/rustctrl-agent.exe).Path
+          $config = (Resolve-Path ./.local/pki/clients/agent/config.toml).Path
+          $binaryPath = "`"$exe`" service --config `"$config`""
+          New-Service -Name RustCtrlAgent -BinaryPathName $binaryPath -StartupType Manual
+          try {
+            Start-Service RustCtrlAgent
+            (Get-Service RustCtrlAgent).WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+            Stop-Service RustCtrlAgent
+            (Get-Service RustCtrlAgent).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+          } finally {
+            Stop-Service RustCtrlAgent -ErrorAction SilentlyContinue
+            sc.exe delete RustCtrlAgent
+          }
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup show
+      - run: scripts/smoke-compose.sh

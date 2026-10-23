@@ -1,0 +1,28 @@
+[package]
+name = "rustctrl_controller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[[bin]]
+name = "rustctrl-controller"
+path = "src/main.rs"
+[features]
+default = ["gui"]
+gui = ["dep:gpui", "dep:gpui_platform"]
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rustctrl_core.workspace = true
+rustctrl_network.workspace = true
+rustctrl_protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+gpui = { workspace = true, optional = true }
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { workspace = true, optional = true, features = ["x11", "wayland"] }
+gpui_platform = { workspace = true, optional = true, features = ["x11", "wayland"] }
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform = { workspace = true, optional = true }
+[lints]
+workspace = true

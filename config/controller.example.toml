@@ -1,0 +1,6 @@
+[server]
+endpoint = "https://localhost:9876"
+domain_name = "localhost"
+ca_certificate = "../.local/pki/clients/controller/ca.pem"
+certificate = "../.local/pki/clients/controller/cert.pem"
+private_key = "../.local/pki/clients/controller/key.pem"

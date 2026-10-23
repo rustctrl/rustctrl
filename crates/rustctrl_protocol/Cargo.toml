@@ -1,0 +1,15 @@
+[package]
+name = "rustctrl_protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+[build-dependencies]
+tonic-prost-build = "0.14.6"
+protoc-bin-vendored = "3.3.0"
+[lints]
+workspace = true

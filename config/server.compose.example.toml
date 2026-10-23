@@ -1,0 +1,7 @@
+listen = "0.0.0.0:9876"
+database = "/data/rustctrl.db"
+
+[tls]
+certificate = "/tls/cert.pem"
+private_key = "/tls/key.pem"
+client_ca = "/tls/ca.pem"

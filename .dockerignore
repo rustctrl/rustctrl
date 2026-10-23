@@ -1,0 +1,47 @@
+# Server image inputs only. Revisit this list when adding Dockerfile COPY inputs.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/**
+!config/
+config/**
+!config/*.example.toml
+!packaging/
+packaging/**
+!packaging/server/
+packaging/server/**
+!packaging/server/Dockerfile
+
+# Cargo resolves every workspace member, including desktop crates. Keep their
+# manifests, source, build scripts, and protobuf inputs, but exclude local state.
+**/target
+**/.local
+**/.git
+**/.idea
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.crt
+**/*.cer
+**/*.der
+**/*.csr
+**/*.p12
+**/*.pfx
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+**/*.sqlite3
+**/*.sqlite3-*
+**/*.log
+**/*.log.*
+**/*.swp
+**/*.swo
+**/*~
+**/.DS_Store
+**/._*
+**/Thumbs.db
+**/Desktop.ini

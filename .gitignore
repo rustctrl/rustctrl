@@ -1,0 +1,52 @@
+# Rust build and coverage output. Keep Cargo.lock versioned for these applications.
+target/
+/coverage/
+/lcov.info
+*.profraw
+*.profdata
+
+# Local experiments, dependency extracts, credentials, and exported bundles.
+/.local/
+/data/
+/pki/
+/tls/
+/rustctrl-server-image*.tar
+/rustctrl-server-image*.tar.gz
+
+# Deployment settings. Commit only templates with placeholder values.
+.env
+.env.*
+!.env.example
+!*.env.example
+/config/*.toml
+!/config/*.example.toml
+
+# Issued TLS material. Add deliberate public test fixtures with narrow exceptions.
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.csr
+*.p12
+*.pfx
+
+# Runtime state and SQLite sidecar files.
+*.log
+*.log.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Editor and operating system files.
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini

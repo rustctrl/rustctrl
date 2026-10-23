@@ -1,0 +1,20 @@
+syntax = "proto3";
+package rustctrl.bootstrap.v1;
+
+service Bootstrap {
+  rpc GetHealth(HealthRequest) returns (HealthReply);
+  rpc SendHeartbeat(HeartbeatRequest) returns (HeartbeatReply);
+}
+message HealthRequest {}
+message HealthReply {
+  string version = 1;
+  uint64 registered_devices = 2;
+}
+message HeartbeatRequest {
+  string device_id = 1;
+  string name = 2;
+  string agent_version = 3;
+}
+message HeartbeatReply {
+  int64 received_at_unix_ms = 1;
+}
