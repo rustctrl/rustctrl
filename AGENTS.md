@@ -11,6 +11,7 @@ RustCtrl coordinates Windows computers and Android TVs through a Linux Server an
 Write repository documentation, ADRs, context documents, specifications, and issue bodies in English. Follow the user's language in conversation.
 
 - Before domain or architecture work and codebase exploration, read [domain conventions](docs/agents/domain.md), then the relevant context and ADRs it points to. Surface conflicts with an accepted ADR.
+- Before planning delivery, check `ROADMAP.md` if it exists. Use it for milestones, ordering, dependencies, and progress. Keep feature requirements and acceptance criteria in GitHub Issues, and architectural choices with their rationale in ADRs. Link to those sources instead of copying their detail into the roadmap. Create or revise the roadmap when planning work or when an accepted plan changes.
 - Before locating specifications or operating on GitHub Issues, read [issue tracker conventions](docs/agents/issue-tracker.md). `SPEC.md` is the initial brief; published feature specs and implementation tickets define their current scope.
 - Before triaging or changing labels, read [triage label mapping](docs/agents/triage-labels.md).
 
