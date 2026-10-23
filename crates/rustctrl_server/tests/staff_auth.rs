@@ -856,8 +856,14 @@ async fn controller_login_cli_flow_exercises_complete_lifecycle() -> Result<()> 
         String::from_utf8_lossy(&out6.stderr)
     );
     let str6 = String::from_utf8_lossy(&out6.stdout);
-    assert!(str6.contains("username=admin role=admin"), "must list admin: {str6}");
-    assert!(str6.contains("username=tech1 role=operator"), "must list tech1: {str6}");
+    assert!(
+        str6.contains("username=admin role=admin"),
+        "must list admin: {str6}"
+    );
+    assert!(
+        str6.contains("username=tech1 role=operator"),
+        "must list tech1: {str6}"
+    );
 
     // 7. Admin changes role of tech1 to admin via controller CLI
     let c_exe7 = controller_exe.clone();
@@ -996,10 +1002,9 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         role: "operator".into(),
         temporary_password: "BobTempPassword123!".into(),
     });
-    create_bob_req.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {alice_session}").parse()?,
-    );
+    create_bob_req
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {alice_session}").parse()?);
     let bob_created = auth_client
         .create_staff_account(create_bob_req)
         .await?
@@ -1016,10 +1021,9 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         role: "admin".into(),
         temporary_password: "CharlieTempPass123!".into(),
     });
-    create_charlie_req.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {alice_session}").parse()?,
-    );
+    create_charlie_req
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {alice_session}").parse()?);
     let charlie_created = auth_client
         .create_staff_account(create_charlie_req)
         .await?
@@ -1032,19 +1036,30 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
 
     // 5. Alice lists accounts
     let mut list_req = Request::new(ListStaffAccountsRequest {});
-    list_req.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {alice_session}").parse()?,
-    );
+    list_req
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {alice_session}").parse()?);
     let accounts = auth_client
         .list_staff_accounts(list_req)
         .await?
         .into_inner()
         .accounts;
     assert_eq!(accounts.len(), 3);
-    assert!(accounts.iter().any(|a| a.username == "alice" && a.role == "admin"));
-    assert!(accounts.iter().any(|a| a.username == "bob" && a.role == "operator"));
-    assert!(accounts.iter().any(|a| a.username == "charlie" && a.role == "admin"));
+    assert!(
+        accounts
+            .iter()
+            .any(|a| a.username == "alice" && a.role == "admin")
+    );
+    assert!(
+        accounts
+            .iter()
+            .any(|a| a.username == "bob" && a.role == "operator")
+    );
+    assert!(
+        accounts
+            .iter()
+            .any(|a| a.username == "charlie" && a.role == "admin")
+    );
 
     // 6. Bob logs in with temporary password. Attempting to list accounts must be denied before changing password
     let bob_login1 = auth_client
@@ -1088,7 +1103,9 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
 
     // 7. Bob (Operator) cannot list accounts, create accounts, or change roles
     let mut bob_list = Request::new(ListStaffAccountsRequest {});
-    bob_list.metadata_mut().insert("authorization", format!("Bearer {bob_session}").parse()?);
+    bob_list
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {bob_session}").parse()?);
     let op_err1 = auth_client.list_staff_accounts(bob_list).await.unwrap_err();
     assert_eq!(op_err1.code(), Code::PermissionDenied);
 
@@ -1097,21 +1114,30 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         role: "admin".into(),
         temporary_password: "HackerPass123!".into(),
     });
-    bob_create.metadata_mut().insert("authorization", format!("Bearer {bob_session}").parse()?);
-    let op_err2 = auth_client.create_staff_account(bob_create).await.unwrap_err();
+    bob_create
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {bob_session}").parse()?);
+    let op_err2 = auth_client
+        .create_staff_account(bob_create)
+        .await
+        .unwrap_err();
     assert_eq!(op_err2.code(), Code::PermissionDenied);
 
     let mut bob_role = Request::new(ChangeStaffRoleRequest {
         username: "bob".into(),
         new_role: "admin".into(),
     });
-    bob_role.metadata_mut().insert("authorization", format!("Bearer {bob_session}").parse()?);
+    bob_role
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {bob_session}").parse()?);
     let op_err3 = auth_client.change_staff_role(bob_role).await.unwrap_err();
     assert_eq!(op_err3.code(), Code::PermissionDenied);
 
     // Operator can still get staff status
     let mut bob_status = Request::new(StaffStatusRequest {});
-    bob_status.metadata_mut().insert("authorization", format!("Bearer {bob_session}").parse()?);
+    bob_status
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {bob_session}").parse()?);
     let status_reply = auth_client.get_staff_status(bob_status).await?.into_inner();
     assert_eq!(status_reply.role, "operator");
 
@@ -1154,10 +1180,9 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         username: "charlie".into(),
         new_role: "operator".into(),
     });
-    demote_charlie.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {alice_session}").parse()?,
-    );
+    demote_charlie
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {alice_session}").parse()?);
     let demote_reply = auth_client
         .change_staff_role(demote_charlie)
         .await?
@@ -1185,10 +1210,9 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         username: "alice".into(),
         new_role: "operator".into(),
     });
-    demote_last_admin.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {alice_session}").parse()?,
-    );
+    demote_last_admin
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {alice_session}").parse()?);
     let last_admin_err = auth_client
         .change_staff_role(demote_last_admin)
         .await
@@ -1229,9 +1253,21 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         .into_inner()
         .accounts;
     assert_eq!(accounts_restarted.len(), 3);
-    assert!(accounts_restarted.iter().any(|a| a.username == "alice" && a.role == "admin"));
-    assert!(accounts_restarted.iter().any(|a| a.username == "bob" && a.role == "operator"));
-    assert!(accounts_restarted.iter().any(|a| a.username == "charlie" && a.role == "operator"));
+    assert!(
+        accounts_restarted
+            .iter()
+            .any(|a| a.username == "alice" && a.role == "admin")
+    );
+    assert!(
+        accounts_restarted
+            .iter()
+            .any(|a| a.username == "bob" && a.role == "operator")
+    );
+    assert!(
+        accounts_restarted
+            .iter()
+            .any(|a| a.username == "charlie" && a.role == "operator")
+    );
 
     server2.shutdown().await?;
 
@@ -1293,7 +1329,10 @@ async fn concurrent_demotions_cannot_leave_zero_active_admins() -> Result<()> {
     let mut rep = Request::new(ReplaceTemporaryPasswordRequest {
         new_password: "Admin1PermanentPass123!".into(),
     });
-    rep.metadata_mut().insert("authorization", format!("Bearer {}", l1.session_token).parse()?);
+    rep.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", l1.session_token).parse()?,
+    );
     auth_client.replace_temporary_password(rep).await?;
 
     let session1 = auth_client
@@ -1311,7 +1350,9 @@ async fn concurrent_demotions_cannot_leave_zero_active_admins() -> Result<()> {
         role: "admin".into(),
         temporary_password: "Admin2TempPass123!".into(),
     });
-    create2.metadata_mut().insert("authorization", format!("Bearer {session1}").parse()?);
+    create2
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {session1}").parse()?);
     auth_client.create_staff_account(create2).await?;
 
     // Now there are 2 active Admins: admin1 and admin2.
@@ -1324,7 +1365,8 @@ async fn concurrent_demotions_cannot_leave_zero_active_admins() -> Result<()> {
             username: "admin1".into(),
             new_role: "operator".into(),
         });
-        req.metadata_mut().insert("authorization", format!("Bearer {tok1}").parse()?);
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {tok1}").parse()?);
         let res = client.change_staff_role(req).await;
         Ok::<_, anyhow::Error>(res.is_ok())
     });
@@ -1337,7 +1379,8 @@ async fn concurrent_demotions_cannot_leave_zero_active_admins() -> Result<()> {
             username: "admin2".into(),
             new_role: "operator".into(),
         });
-        req.metadata_mut().insert("authorization", format!("Bearer {tok2}").parse()?);
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {tok2}").parse()?);
         let res = client.change_staff_role(req).await;
         Ok::<_, anyhow::Error>(res.is_ok())
     });
@@ -1357,25 +1400,47 @@ async fn concurrent_demotions_cannot_leave_zero_active_admins() -> Result<()> {
     let admin_count = {
         let accounts = if ok2 {
             // admin2 was demoted, admin1 is still admin!
-            list_req.metadata_mut().insert("authorization", format!("Bearer {session1}").parse()?);
-            auth_client.list_staff_accounts(list_req).await?.into_inner().accounts
+            list_req
+                .metadata_mut()
+                .insert("authorization", format!("Bearer {session1}").parse()?);
+            auth_client
+                .list_staff_accounts(list_req)
+                .await?
+                .into_inner()
+                .accounts
         } else {
             // admin1 was demoted, admin2 is still admin. Login as admin2.
-            let l2 = auth_client.login(LoginRequest {
-                username: "admin2".into(),
-                password: "Admin2TempPass123!".into(),
-            }).await?.into_inner();
+            let l2 = auth_client
+                .login(LoginRequest {
+                    username: "admin2".into(),
+                    password: "Admin2TempPass123!".into(),
+                })
+                .await?
+                .into_inner();
             let mut rep2 = Request::new(ReplaceTemporaryPasswordRequest {
                 new_password: "Admin2PermanentPass123!".into(),
             });
-            rep2.metadata_mut().insert("authorization", format!("Bearer {}", l2.session_token).parse()?);
+            rep2.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", l2.session_token).parse()?,
+            );
             auth_client.replace_temporary_password(rep2).await?;
-            let s2 = auth_client.login(LoginRequest {
-                username: "admin2".into(),
-                password: "Admin2PermanentPass123!".into(),
-            }).await?.into_inner().session_token;
-            list_req.metadata_mut().insert("authorization", format!("Bearer {s2}").parse()?);
-            auth_client.list_staff_accounts(list_req).await?.into_inner().accounts
+            let s2 = auth_client
+                .login(LoginRequest {
+                    username: "admin2".into(),
+                    password: "Admin2PermanentPass123!".into(),
+                })
+                .await?
+                .into_inner()
+                .session_token;
+            list_req
+                .metadata_mut()
+                .insert("authorization", format!("Bearer {s2}").parse()?);
+            auth_client
+                .list_staff_accounts(list_req)
+                .await?
+                .into_inner()
+                .accounts
         };
         accounts.iter().filter(|a| a.role == "admin").count()
     };

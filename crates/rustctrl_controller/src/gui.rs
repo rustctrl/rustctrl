@@ -413,10 +413,9 @@ impl ControllerApp {
                     let reply = client.get_staff_status(req).await?.into_inner();
                     let accounts = if is_admin || reply.role == "admin" {
                         let mut list_req = tonic::Request::new(ListStaffAccountsRequest {});
-                        list_req.metadata_mut().insert(
-                            "authorization",
-                            format!("Bearer {tok_for_req}").parse()?,
-                        );
+                        list_req
+                            .metadata_mut()
+                            .insert("authorization", format!("Bearer {tok_for_req}").parse()?);
                         client
                             .list_staff_accounts(list_req)
                             .await
@@ -1063,40 +1062,39 @@ impl Render for ControllerApp {
                 ..
             } => {
                 let is_admin = role == "admin";
-                let mut content = container
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(div().text_3xl().child("RustCtrl"))
-                                    .child(format!(
-                                        "Connected over mutual TLS · Server {server_version}"
-                                    ))
-                                    .child(format!("Logged in as: {username} ({role})"))
-                                    .child(format!(
-                                        "Registered devices in fleet: {registered_devices}"
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(rgb(0x883333))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("signout-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_logout(cx);
-                                    }))
-                                    .child("Sign Out"),
-                            ),
-                    );
+                let mut content = container.child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().text_3xl().child("RustCtrl"))
+                                .child(format!(
+                                    "Connected over mutual TLS · Server {server_version}"
+                                ))
+                                .child(format!("Logged in as: {username} ({role})"))
+                                .child(format!(
+                                    "Registered devices in fleet: {registered_devices}"
+                                )),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .py_2()
+                                .bg(rgb(0x883333))
+                                .text_color(rgb(0xffffff))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .id("signout-btn")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.submit_logout(cx);
+                                }))
+                                .child("Sign Out"),
+                        ),
+                );
 
                 if let Some(err) = error {
                     content = content.child(
@@ -1192,31 +1190,25 @@ impl Render for ControllerApp {
                                         }),
                                 )
                                 .child(
-                                    div()
-                                        .w(gpui::px(160.0))
-                                        .child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .bg(if *in_flight {
-                                                    rgb(0x556677)
-                                                } else {
-                                                    btn_bg
-                                                })
-                                                .text_color(rgb(0xffffff))
-                                                .rounded_md()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .id(format!("role-btn-{}", acc_username))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.submit_change_role(
-                                                        target_user_clone.clone(),
-                                                        new_target_role_str.clone(),
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child(btn_label),
-                                        ),
+                                    div().w(gpui::px(160.0)).child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(if *in_flight { rgb(0x556677) } else { btn_bg })
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .id(format!("role-btn-{}", acc_username))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.submit_change_role(
+                                                    target_user_clone.clone(),
+                                                    new_target_role_str.clone(),
+                                                    cx,
+                                                );
+                                            }))
+                                            .child(btn_label),
+                                    ),
                                 );
                             accounts_list = accounts_list.child(row);
                         }
@@ -1277,8 +1269,7 @@ impl Render for ControllerApp {
                                         .id("role-operator-btn")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if let ScreenState::Connected {
-                                                new_account_role,
-                                                ..
+                                                new_account_role, ..
                                             } = &mut this.state
                                             {
                                                 *new_account_role = "operator".into();
@@ -1301,8 +1292,7 @@ impl Render for ControllerApp {
                                         .id("role-admin-btn")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if let ScreenState::Connected {
-                                                new_account_role,
-                                                ..
+                                                new_account_role, ..
                                             } = &mut this.state
                                             {
                                                 *new_account_role = "admin".into();

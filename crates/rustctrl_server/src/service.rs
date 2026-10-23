@@ -307,8 +307,14 @@ impl StaffAuth for StaffAuthService {
         &self,
         request: Request<ListStaffAccountsRequest>,
     ) -> Result<Response<ListStaffAccountsReply>, Status> {
-        let _session = self.authenticate_admin(&request, "list_staff_accounts", None).await?;
-        let accounts = self.store.list_staff_accounts().await.map_err(database_error)?;
+        let _session = self
+            .authenticate_admin(&request, "list_staff_accounts", None)
+            .await?;
+        let accounts = self
+            .store
+            .list_staff_accounts()
+            .await
+            .map_err(database_error)?;
         let entries = accounts
             .into_iter()
             .map(|acc| StaffAccountEntry {
@@ -332,7 +338,9 @@ impl StaffAuth for StaffAuthService {
         let target_role: crate::store::StaffRole = match role_str.parse() {
             Ok(r) => r,
             Err(_) => {
-                return Err(Status::invalid_argument(format!("invalid role: {role_str}")));
+                return Err(Status::invalid_argument(format!(
+                    "invalid role: {role_str}"
+                )));
             }
         };
         let session = self
@@ -350,7 +358,9 @@ impl StaffAuth for StaffAuthService {
                     format!("failed to create staff account '{target_username}': password must contain at least 8 characters"),
                 )
                 .await;
-            return Err(Status::invalid_argument("temporary password must contain at least 8 characters"));
+            return Err(Status::invalid_argument(
+                "temporary password must contain at least 8 characters",
+            ));
         }
 
         match self
@@ -365,7 +375,10 @@ impl StaffAuth for StaffAuthService {
                         session.username.clone(),
                         "create_staff_account".into(),
                         "success".into(),
-                        format!("created staff account '{target_username}' with role '{}'", target_role.as_str()),
+                        format!(
+                            "created staff account '{target_username}' with role '{}'",
+                            target_role.as_str()
+                        ),
                     )
                     .await;
                 Ok(Response::new(CreateStaffAccountReply {
@@ -408,14 +421,20 @@ impl StaffAuth for StaffAuthService {
         let new_role: crate::store::StaffRole = match new_role_str.parse() {
             Ok(r) => r,
             Err(_) => {
-                return Err(Status::invalid_argument(format!("invalid role: {new_role_str}")));
+                return Err(Status::invalid_argument(format!(
+                    "invalid role: {new_role_str}"
+                )));
             }
         };
         let session = self
             .authenticate_admin(&request, "change_staff_role", Some(&target_username))
             .await?;
 
-        match self.store.change_staff_role(&target_username, new_role).await {
+        match self
+            .store
+            .change_staff_role(&target_username, new_role)
+            .await
+        {
             Ok(account) => {
                 let _ = self
                     .store
@@ -423,7 +442,10 @@ impl StaffAuth for StaffAuthService {
                         session.username.clone(),
                         "change_staff_role".into(),
                         "success".into(),
-                        format!("changed role of '{target_username}' to '{}'", new_role.as_str()),
+                        format!(
+                            "changed role of '{target_username}' to '{}'",
+                            new_role.as_str()
+                        ),
                     )
                     .await;
                 Ok(Response::new(ChangeStaffRoleReply {

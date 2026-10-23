@@ -363,7 +363,11 @@ impl DeviceStore {
         .await?
     }
 
-    pub async fn change_staff_role(&self, username: &str, new_role: StaffRole) -> Result<StaffAccount> {
+    pub async fn change_staff_role(
+        &self,
+        username: &str,
+        new_role: StaffRole,
+    ) -> Result<StaffAccount> {
         let store = self.clone();
         let username = username.to_string();
         tokio::task::spawn_blocking(move || {
