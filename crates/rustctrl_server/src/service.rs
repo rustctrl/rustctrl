@@ -2,8 +2,10 @@ use crate::{config::ServerConfig, store::DeviceStore};
 use anyhow::{Context, Result};
 use rustctrl_core::DeviceId;
 use rustctrl_protocol::auth::{
-    LoginReply, LoginRequest, LogoutReply, LogoutRequest, ReplaceTemporaryPasswordReply,
-    ReplaceTemporaryPasswordRequest, StaffStatusReply, StaffStatusRequest,
+    ChangeStaffRoleReply, ChangeStaffRoleRequest, CreateStaffAccountReply,
+    CreateStaffAccountRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
+    LoginRequest, LogoutReply, LogoutRequest, ReplaceTemporaryPasswordReply,
+    ReplaceTemporaryPasswordRequest, StaffAccountEntry, StaffStatusReply, StaffStatusRequest,
     staff_auth_server::{StaffAuth, StaffAuthServer},
 };
 use rustctrl_protocol::bootstrap::{
@@ -126,6 +128,38 @@ impl StaffAuthService {
             Ok(Some(session)) if !session.revoked => Ok(session),
             _ => Err(Status::unauthenticated("invalid or revoked staff session")),
         }
+    }
+
+    async fn authenticate_admin<T>(
+        &self,
+        request: &Request<T>,
+        action: &str,
+        target: Option<&str>,
+    ) -> Result<crate::store::StaffSession, Status> {
+        let session = self.authenticate_request(request).await?;
+        if session.must_change_password {
+            return Err(Status::permission_denied(
+                "password change required before accessing protected operations",
+            ));
+        }
+        if session.role != crate::store::StaffRole::Admin {
+            let detail = if let Some(tgt) = target {
+                format!("operator cannot perform '{action}' on target '{tgt}'")
+            } else {
+                format!("operator cannot perform '{action}'")
+            };
+            let _ = self
+                .store
+                .record_activity(
+                    session.username.clone(),
+                    action.into(),
+                    "rejected".into(),
+                    detail,
+                )
+                .await;
+            return Err(Status::permission_denied("admin role required"));
+        }
+        Ok(session)
     }
 }
 
@@ -267,6 +301,157 @@ impl StaffAuth for StaffAuthService {
             registered_devices: count,
             server_version: env!("CARGO_PKG_VERSION").into(),
         }))
+    }
+
+    async fn list_staff_accounts(
+        &self,
+        request: Request<ListStaffAccountsRequest>,
+    ) -> Result<Response<ListStaffAccountsReply>, Status> {
+        let _session = self.authenticate_admin(&request, "list_staff_accounts", None).await?;
+        let accounts = self.store.list_staff_accounts().await.map_err(database_error)?;
+        let entries = accounts
+            .into_iter()
+            .map(|acc| StaffAccountEntry {
+                username: acc.username,
+                role: acc.role.as_str().into(),
+                must_change_password: acc.must_change_password,
+                created_at_unix_ms: acc.created_at_unix_ms,
+                updated_at_unix_ms: acc.updated_at_unix_ms,
+            })
+            .collect();
+        Ok(Response::new(ListStaffAccountsReply { accounts: entries }))
+    }
+
+    async fn create_staff_account(
+        &self,
+        request: Request<CreateStaffAccountRequest>,
+    ) -> Result<Response<CreateStaffAccountReply>, Status> {
+        let body = request.get_ref();
+        let target_username = body.username.trim().to_string();
+        let role_str = body.role.trim().to_string();
+        let target_role: crate::store::StaffRole = match role_str.parse() {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(Status::invalid_argument(format!("invalid role: {role_str}")));
+            }
+        };
+        let session = self
+            .authenticate_admin(&request, "create_staff_account", Some(&target_username))
+            .await?;
+
+        let temporary_password = body.temporary_password.clone();
+        if temporary_password.len() < 8 {
+            let _ = self
+                .store
+                .record_activity(
+                    session.username.clone(),
+                    "create_staff_account".into(),
+                    "rejected".into(),
+                    format!("failed to create staff account '{target_username}': password must contain at least 8 characters"),
+                )
+                .await;
+            return Err(Status::invalid_argument("temporary password must contain at least 8 characters"));
+        }
+
+        match self
+            .store
+            .create_staff_account(target_username.clone(), target_role, temporary_password)
+            .await
+        {
+            Ok(account) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "create_staff_account".into(),
+                        "success".into(),
+                        format!("created staff account '{target_username}' with role '{}'", target_role.as_str()),
+                    )
+                    .await;
+                Ok(Response::new(CreateStaffAccountReply {
+                    account: Some(StaffAccountEntry {
+                        username: account.username,
+                        role: account.role.as_str().into(),
+                        must_change_password: account.must_change_password,
+                        created_at_unix_ms: account.created_at_unix_ms,
+                        updated_at_unix_ms: account.updated_at_unix_ms,
+                    }),
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "create_staff_account".into(),
+                        "rejected".into(),
+                        format!("failed to create staff account '{target_username}': {err_msg}"),
+                    )
+                    .await;
+                if err_msg.contains("already exists") {
+                    Err(Status::already_exists(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
+    }
+
+    async fn change_staff_role(
+        &self,
+        request: Request<ChangeStaffRoleRequest>,
+    ) -> Result<Response<ChangeStaffRoleReply>, Status> {
+        let body = request.get_ref();
+        let target_username = body.username.trim().to_string();
+        let new_role_str = body.new_role.trim().to_string();
+        let new_role: crate::store::StaffRole = match new_role_str.parse() {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(Status::invalid_argument(format!("invalid role: {new_role_str}")));
+            }
+        };
+        let session = self
+            .authenticate_admin(&request, "change_staff_role", Some(&target_username))
+            .await?;
+
+        match self.store.change_staff_role(&target_username, new_role).await {
+            Ok(account) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "change_staff_role".into(),
+                        "success".into(),
+                        format!("changed role of '{target_username}' to '{}'", new_role.as_str()),
+                    )
+                    .await;
+                Ok(Response::new(ChangeStaffRoleReply {
+                    username: account.username,
+                    role: account.role.as_str().into(),
+                    updated_at_unix_ms: account.updated_at_unix_ms,
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "change_staff_role".into(),
+                        "rejected".into(),
+                        format!("failed to change role of '{target_username}': {err_msg}"),
+                    )
+                    .await;
+                if err_msg.contains("last active admin") {
+                    Err(Status::failed_precondition(err_msg))
+                } else if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
     }
 }
 
