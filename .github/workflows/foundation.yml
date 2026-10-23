@@ -9,17 +9,118 @@ permissions:
   contents: read
 
 jobs:
+  # This lightweight job runs on every event to calculate changed paths.
+  # Platform and integration jobs are conditionally executed, and the
+  # ci-pass job aggregates their results for branch protection.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      headless: ${{ steps.filter.outputs.headless }}
+      controller: ${{ steps.filter.outputs.controller }}
+      windows: ${{ steps.filter.outputs.windows }}
+      compose: ${{ steps.filter.outputs.compose }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          rust=false
+          headless=false
+          controller=false
+          windows=false
+          compose=false
+
+          run_all=false
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            run_all=true
+          elif [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if ! git rev-parse --verify "$BASE_SHA" >/dev/null 2>&1 || ! git rev-parse --verify "$HEAD_SHA" >/dev/null 2>&1; then
+              run_all=true
+            else
+              mapfile -d '' changed < <(git diff --name-only -z "$BASE_SHA...$HEAD_SHA")
+            fi
+          else
+            if ! git rev-parse --verify "$BASE_SHA" >/dev/null 2>&1 || ! git rev-parse --verify "$HEAD_SHA" >/dev/null 2>&1; then
+              run_all=true
+            else
+              mapfile -d '' changed < <(git diff --name-only -z "$BASE_SHA" "$HEAD_SHA")
+            fi
+          fi
+
+          if [[ "$run_all" == "true" ]]; then
+            rust=true
+            headless=true
+            controller=true
+            windows=true
+            compose=true
+          else
+            for path in "${changed[@]}"; do
+              if [[ "$path" == *.rs || "$path" == *.proto ]]; then
+                rust=true
+              fi
+
+              if [[ "$path" == Cargo.toml || "$path" == Cargo.lock || "$path" == rust-toolchain.toml || "$path" == .github/* ]]; then
+                headless=true
+                controller=true
+                windows=true
+                compose=true
+              fi
+
+              if [[ "$path" =~ ^crates/rustctrl_(agent|server|controller|core|network|protocol|android|tasks|media|windows_native)/ ]]; then
+                headless=true
+              fi
+
+              if [[ "$path" =~ ^crates/rustctrl_(controller|core|network|protocol)/ ]]; then
+                controller=true
+              fi
+
+              if [[ "$path" =~ ^crates/rustctrl_(agent|server|controller|windows_native|core|network|protocol)/ ]]; then
+                windows=true
+              fi
+
+              if [[ "$path" =~ ^crates/rustctrl_(server|agent|core|network|protocol)/ || "$path" =~ ^config/server.*\.toml$ || "$path" == .env.example || "$path" == compose.yaml || "$path" == .dockerignore || "$path" == packaging/server/Dockerfile || "$path" == scripts/smoke-compose.sh ]]; then
+                compose=true
+              fi
+            done
+          fi
+
+          {
+            echo "rust=$rust"
+            echo "headless=$headless"
+            echo "controller=$controller"
+            echo "windows=$windows"
+            echo "compose=$compose"
+          } >> "$GITHUB_OUTPUT"
+
+  format:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo fmt --all --check
+
   headless:
+    needs: changes
+    if: needs.changes.outputs.headless == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup show
-      - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --exclude rustctrl_controller --all-targets -- -D warnings
       - run: cargo test --locked --workspace --exclude rustctrl_controller
       - run: cargo build --locked -p rustctrl_controller --no-default-features
 
   almalinux-controller:
+    needs: changes
+    if: needs.changes.outputs.controller == 'true'
     runs-on: ubuntu-latest
     container: almalinux:10
     steps:
@@ -36,6 +137,8 @@ jobs:
           cargo build --locked -p rustctrl_controller
 
   windows:
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -63,8 +166,33 @@ jobs:
           }
 
   compose:
+    needs: changes
+    if: needs.changes.outputs.compose == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup show
       - run: scripts/smoke-compose.sh
+
+  ci-pass:
+    needs: [changes, format, headless, almalinux-controller, windows, compose]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all gated checks passed or were legitimately skipped
+        run: |
+          statuses=(
+            "${{ needs.changes.result }}"
+            "${{ needs.format.result }}"
+            "${{ needs.headless.result }}"
+            "${{ needs.almalinux-controller.result }}"
+            "${{ needs.windows.result }}"
+            "${{ needs.compose.result }}"
+          )
+          for status in "${statuses[@]}"; do
+            if [[ "$status" == "failure" || "$status" == "cancelled" ]]; then
+              echo "A required job failed or was cancelled (status: $status)"
+              exit 1
+            fi
+          done
+          echo "All gated jobs succeeded or were legitimately skipped."

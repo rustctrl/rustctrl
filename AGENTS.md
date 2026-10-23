@@ -39,10 +39,11 @@ Write repository documentation, ADRs, context documents, specifications, and iss
 
 ## Verification and handoff
 
-Read [development](docs/development.md) for prerequisites and check commands. Keep the CI checks in [foundation.yml](.github/workflows/foundation.yml) aligned with documented commands when changing the build.
+Read [development](docs/development.md) for prerequisites and check commands. Keep the CI checks in [foundation.yml](.github/workflows/foundation.yml) aligned with documented commands when changing the build. Update its path routing when adding crates or changing which components a job validates.
 
-- Run formatting and the lint, test, or build checks relevant to the change. For behavior changes, exercise observable outcomes at the affected component boundary.
+- Match verification to the changed behavior. For documentation, comments, or metadata-only edits, inspect the diff and check relevant links or formatting; skip Cargo builds, tests, and application startup. For code changes, use the narrowest lint, test, or build that covers the edit. Run the affected application only when its runtime behavior or platform integration needs validation.
+- Run broader package or workspace checks when changes cross crate boundaries or affect shared protocol, identity, TLS, persistence, dependencies, or build configuration. Avoid rerunning checks that do not cover the change or whose result is already established for the same unchanged inputs.
 - For container changes, build the Server image and run `scripts/smoke-compose.sh`. The script uses its own temporary Compose project and removes its volumes; keep manual checks isolated from deployment data.
 - Verify Controller changes with default GUI features on the affected platform. A headless diagnostic build does not validate the desktop window. Treat Windows service lifecycle checks separately from Linux console checks.
-- Report checks actually run and their results. Distinguish Podman checks from Docker Engine checks, and builds from graphical runtime validation. Record compatibility findings in [compatibility notes](docs/compatibility.md).
+- Report checks actually run and their results. Briefly explain any relevant check skipped because the change does not affect its behavior. Distinguish Podman checks from Docker Engine checks, and builds from graphical runtime validation. Record compatibility findings in [compatibility notes](docs/compatibility.md).
 - Before committing, inspect staged paths and the diff for private material, local state, and build output. Include source changes, relevant checks, and documentation together; retain unrelated working-tree edits.
