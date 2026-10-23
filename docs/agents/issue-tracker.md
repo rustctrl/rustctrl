@@ -16,6 +16,8 @@ The setup records these conventions. Specs and tickets are created when the corr
 
 ## Issue operations
 
+Use [Git conventions](git.md) for issue titles, branch names, commit messages, and pull requests.
+
 - Create: `gh issue create --repo rustctrl/rustctrl --title "..." --body-file /path/to/body.md`.
 - Read, including comments: `gh issue view <number> --repo rustctrl/rustctrl --comments`.
 - List: `gh issue list --repo rustctrl/rustctrl --state open --json number,title,body,labels,comments`, adding label and state filters as needed.

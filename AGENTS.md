@@ -15,6 +15,10 @@ Write repository documentation, ADRs, context documents, specifications, and iss
 - Before locating specifications or operating on GitHub Issues, read [issue tracker conventions](docs/agents/issue-tracker.md). `SPEC.md` is the initial brief; published feature specs and implementation tickets define their current scope.
 - Before triaging or changing labels, read [triage label mapping](docs/agents/triage-labels.md).
 
+## Git workflow
+
+Before creating or renaming an issue or branch, writing commits, or opening or updating a pull request, read [Git conventions](docs/agents/git.md). Use the [pull request template](.github/pull_request_template.md) for PR bodies.
+
 ## Component boundaries
 
 - Keep shared identities and configuration in `rustctrl_core`, wire contracts in `rustctrl_protocol`, and shared TLS client setup in `rustctrl_network`. Keep these independent of GPUI and platform APIs.
