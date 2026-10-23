@@ -12,7 +12,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+hex = "0.4"
 rcgen.workspace = true
+ring = "0.17"
 rusqlite.workspace = true
 rustctrl_core.workspace = true
 rustctrl_protocol.workspace = true

@@ -50,6 +50,18 @@ enum Command {
         #[arg(long)]
         tls_dir: PathBuf,
     },
+    BootstrapAdmin {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        temporary_password: String,
+    },
+    ListActivity {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -94,6 +106,35 @@ async fn main() -> Result<()> {
                 "healthy version={} registered_devices={}",
                 health.version, health.registered_devices
             );
+            Ok(())
+        }
+        Command::BootstrapAdmin {
+            config,
+            username,
+            temporary_password,
+        } => {
+            let config = ServerConfig::load(&config)?;
+            let store = rustctrl_server::store::DeviceStore::open(&config.database)?;
+            store
+                .bootstrap_admin(username.clone(), temporary_password)
+                .await?;
+            println!("Admin '{username}' successfully bootstrapped with temporary password.");
+            Ok(())
+        }
+        Command::ListActivity { config } => {
+            let config = ServerConfig::load(&config)?;
+            let store = rustctrl_server::store::DeviceStore::open(&config.database)?;
+            let records = store.list_activity().await?;
+            for record in records {
+                println!(
+                    "[{}] actor={} action={} result={} detail={}",
+                    record.server_time_unix_ms,
+                    record.actor,
+                    record.action,
+                    record.result,
+                    record.detail
+                );
+            }
             Ok(())
         }
     }

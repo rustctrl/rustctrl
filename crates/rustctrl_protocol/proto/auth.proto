@@ -1,0 +1,46 @@
+syntax = "proto3";
+package rustctrl.auth.v1;
+
+service StaffAuth {
+  rpc Login(LoginRequest) returns (LoginReply);
+  rpc ReplaceTemporaryPassword(ReplaceTemporaryPasswordRequest) returns (ReplaceTemporaryPasswordReply);
+  rpc Logout(LogoutRequest) returns (LogoutReply);
+  rpc GetStaffStatus(StaffStatusRequest) returns (StaffStatusReply);
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginReply {
+  string session_token = 1;
+  string username = 2;
+  string role = 3;
+  bool must_change_password = 4;
+  int64 server_time_unix_ms = 5;
+}
+
+message ReplaceTemporaryPasswordRequest {
+  string new_password = 1;
+}
+
+message ReplaceTemporaryPasswordReply {
+  bool success = 1;
+}
+
+message LogoutRequest {}
+
+message LogoutReply {
+  bool success = 1;
+}
+
+message StaffStatusRequest {}
+
+message StaffStatusReply {
+  string username = 1;
+  string role = 2;
+  bool authenticated = 3;
+  uint64 registered_devices = 4;
+  string server_version = 5;
+}

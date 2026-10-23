@@ -5218,6 +5218,7 @@ dependencies = [
  "rustctrl_network",
  "rustctrl_protocol",
  "tokio",
+ "tonic",
  "tracing",
 ]
 
@@ -5264,7 +5265,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
  "rcgen",
+ "ring",
  "rusqlite",
  "rustctrl_core",
  "rustctrl_network",
