@@ -64,7 +64,7 @@ ci: route Controller changes to platform builds
 
 Use `!` before the colon and a `BREAKING CHANGE:` footer when compatibility actually breaks. Describe the affected configuration, wire contract, or persistent data and the required migration. Do not mark every protocol or schema addition as breaking.
 
-Keep commits focused and include the source, checks, and documentation needed for the change. Put issue references in commit bodies or footers, such as `Refs #2`, rather than making issue numbers part of the title format. Preserve unrelated working-tree changes and inspect staged content before committing.
+Keep commits focused and include the source, checks, and documentation needed for the change. Run `cargo fmt --all --check` before committing Rust changes. Put issue references in commit bodies or footers, such as `Refs #2`, rather than making issue numbers part of the title format. Preserve unrelated working-tree changes and inspect staged content before committing.
 
 ## Pull requests and merging
 
