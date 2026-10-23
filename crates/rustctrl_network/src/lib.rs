@@ -7,7 +7,7 @@ use rustctrl_protocol::bootstrap::bootstrap_client::BootstrapClient;
 use std::{fs, time::Duration};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-pub async fn connect(config: &ClientConfig) -> Result<BootstrapClient<Channel>> {
+pub async fn connect_channel(config: &ClientConfig) -> Result<Channel> {
     initialize_tls();
     config.validate()?;
     let ca = fs::read(&config.ca_certificate).context("read CA certificate")?;
@@ -24,7 +24,19 @@ pub async fn connect(config: &ClientConfig) -> Result<BootstrapClient<Channel>> 
         .connect()
         .await
         .context("connect to RustCtrl server over mutual TLS")?;
+    Ok(channel)
+}
+
+pub async fn connect(config: &ClientConfig) -> Result<BootstrapClient<Channel>> {
+    let channel = connect_channel(config).await?;
     Ok(BootstrapClient::new(channel))
+}
+
+pub async fn connect_staff_auth(
+    config: &ClientConfig,
+) -> Result<rustctrl_protocol::auth::staff_auth_client::StaffAuthClient<Channel>> {
+    let channel = connect_channel(config).await?;
+    Ok(rustctrl_protocol::auth::staff_auth_client::StaffAuthClient::new(channel))
 }
 
 pub fn initialize_tls() {

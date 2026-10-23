@@ -3,9 +3,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
     tonic_prost_build::configure().compile_with_config(
         config,
-        &["proto/bootstrap.proto"],
+        &["proto/bootstrap.proto", "proto/auth.proto"],
         &["proto"],
     )?;
     println!("cargo:rerun-if-changed=proto/bootstrap.proto");
+    println!("cargo:rerun-if-changed=proto/auth.proto");
     Ok(())
 }

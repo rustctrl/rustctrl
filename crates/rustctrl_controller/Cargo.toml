@@ -17,6 +17,7 @@ rustctrl_core.workspace = true
 rustctrl_network.workspace = true
 rustctrl_protocol.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 gpui = { workspace = true, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
