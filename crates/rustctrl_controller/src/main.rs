@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 use rustctrl_core::{ControllerConfig, init_logging};
 use rustctrl_protocol::auth::{
     ChangeOwnPasswordRequest, ChangeStaffRoleRequest, CreateStaffAccountRequest,
-    DeactivateStaffAccountRequest, ListStaffAccountsRequest, LoginRequest, LogoutRequest,
-    ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffStatusRequest,
+    DeactivateStaffAccountRequest, ListFleetDevicesRequest, ListStaffAccountsRequest, LoginRequest,
+    LogoutRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffStatusRequest,
 };
 use rustctrl_protocol::bootstrap::HealthRequest;
 use std::path::PathBuf;
@@ -99,6 +99,12 @@ enum Command {
         password: String,
         #[arg(long)]
         target_username: String,
+    },
+    ListDevices {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
     },
 }
 
@@ -501,6 +507,51 @@ fn main() -> Result<()> {
             let _ = client.logout(logout_req).await;
             Ok(())
         }),
+        Command::ListDevices { username, password } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest {
+                        username,
+                        password,
+                        remember: false,
+                    })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!("temporary password must be replaced before listing devices");
+                }
+                let mut req = tonic::Request::new(ListFleetDevicesRequest {});
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client.list_fleet_devices(req).await?.into_inner();
+                println!("Fleet Devices ({}):", reply.devices.len());
+                for device in reply.devices {
+                    println!(
+                        "  device={} name={} type={} address={} status={} last_seen_unix_ms={}",
+                        device.device_id,
+                        device.display_name,
+                        device.device_type,
+                        if device.last_address.is_empty() {
+                            "-"
+                        } else {
+                            &device.last_address
+                        },
+                        if device.online { "online" } else { "offline" },
+                        device.last_seen_unix_ms
+                    );
+                }
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
         Command::Gui => {
             #[cfg(feature = "gui")]
             {

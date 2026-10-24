@@ -63,6 +63,7 @@ impl RunningServer {
             staff_session: StaffSessionConfig {
                 remembered_lifetime_secs: lifetime_secs,
             },
+            fleet: Default::default(),
         };
         let stop = CancellationToken::new();
         let signal = stop.clone();
@@ -600,6 +601,39 @@ async fn controller_cli_saves_restores_and_clears_remembered_sessions() -> Resul
         String::from_utf8_lossy(&none.stdout)
     );
 
+    // A Server outage is distinguishable from invalid credentials: the saved
+    // credential stays on disk and the failure names the Server, not the
+    // session.
+    let remembered_again = run_controller(&[
+        "login",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--remember",
+    ])
+    .await;
+    assert!(remembered_again.status.success());
+    assert!(session_path.exists());
     server.shutdown().await?;
+    let outage = run_controller(&["restore-session"]).await;
+    assert!(
+        !outage.status.success(),
+        "restore must fail when the Server is unreachable"
+    );
+    let outage_err = String::from_utf8_lossy(&outage.stderr);
+    assert!(
+        outage_err.contains("Server unavailable"),
+        "outage must be reported as a Server problem: {outage_err}"
+    );
+    assert!(
+        !outage_err.contains("expired or was revoked"),
+        "an outage must not be mistaken for a dead credential: {outage_err}"
+    );
+    assert!(
+        session_path.exists(),
+        "an outage must keep the saved credential for the next attempt"
+    );
+
     Ok(())
 }

@@ -14,6 +14,8 @@ pub struct ServerConfig {
     pub tls: TlsConfig,
     #[serde(default)]
     pub staff_session: StaffSessionConfig,
+    #[serde(default)]
+    pub fleet: FleetConfig,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +40,23 @@ impl Default for StaffSessionConfig {
 }
 pub fn default_remembered_lifetime_secs() -> u64 {
     30 * 24 * 60 * 60
+}
+/// Heartbeat freshness window used to derive Device online status.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetConfig {
+    #[serde(default = "default_offline_after_secs")]
+    pub offline_after_secs: u64,
+}
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            offline_after_secs: default_offline_after_secs(),
+        }
+    }
+}
+pub fn default_offline_after_secs() -> u64 {
+    60
 }
 impl ServerConfig {
     pub fn load(path: &Path) -> Result<Self> {

@@ -9,6 +9,7 @@ service StaffAuth {
   rpc DeactivateStaffAccount(DeactivateStaffAccountRequest) returns (DeactivateStaffAccountReply);
   rpc Logout(LogoutRequest) returns (LogoutReply);
   rpc GetStaffStatus(StaffStatusRequest) returns (StaffStatusReply);
+  rpc ListFleetDevices(ListFleetDevicesRequest) returns (ListFleetDevicesReply);
   rpc ListStaffAccounts(ListStaffAccountsRequest) returns (ListStaffAccountsReply);
   rpc CreateStaffAccount(CreateStaffAccountRequest) returns (CreateStaffAccountReply);
   rpc ChangeStaffRole(ChangeStaffRoleRequest) returns (ChangeStaffRoleReply);
@@ -76,6 +77,21 @@ message StaffStatusReply {
   bool authenticated = 3;
   uint64 registered_devices = 4;
   string server_version = 5;
+}
+
+message ListFleetDevicesRequest {}
+
+message FleetDeviceEntry {
+  string device_id = 1;
+  string display_name = 2;
+  string device_type = 3;
+  string last_address = 4;
+  bool online = 5;
+  int64 last_seen_unix_ms = 6;
+}
+
+message ListFleetDevicesReply {
+  repeated FleetDeviceEntry devices = 1;
 }
 
 message StaffAccountEntry {
