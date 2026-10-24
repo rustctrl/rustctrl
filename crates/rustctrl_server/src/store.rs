@@ -79,6 +79,7 @@ pub struct StaffAccount {
     pub role: StaffRole,
     pub password_hash: String,
     pub must_change_password: bool,
+    pub active: bool,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
 }
@@ -127,6 +128,7 @@ impl DeviceStore {
                 role TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 must_change_password INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
                 created_at_unix_ms INTEGER NOT NULL,
                 updated_at_unix_ms INTEGER NOT NULL
             );
@@ -149,6 +151,16 @@ impl DeviceStore {
                 detail TEXT NOT NULL
             );",
         )?;
+        // Existing databases predate account deactivation; add the column in place.
+        let staff_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('staff_accounts')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        if !staff_columns.iter().any(|name| name == "active") {
+            connection.execute_batch(
+                "ALTER TABLE staff_accounts ADD COLUMN active INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
 
@@ -247,20 +259,22 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT username, role, password_hash, must_change_password, created_at_unix_ms, updated_at_unix_ms FROM staff_accounts WHERE username = ?1",
+                "SELECT username, role, password_hash, must_change_password, active, created_at_unix_ms, updated_at_unix_ms FROM staff_accounts WHERE username = ?1",
             )?;
             let mut rows = stmt.query(params![username])?;
             if let Some(row) = rows.next()? {
                 let role_str: String = row.get(1)?;
                 let role: StaffRole = role_str.parse()?;
                 let must_change: i64 = row.get(3)?;
+                let active: i64 = row.get(4)?;
                 Ok(Some(StaffAccount {
                     username: row.get(0)?,
                     role,
                     password_hash: row.get(2)?,
                     must_change_password: must_change != 0,
-                    created_at_unix_ms: row.get(4)?,
-                    updated_at_unix_ms: row.get(5)?,
+                    active: active != 0,
+                    created_at_unix_ms: row.get(5)?,
+                    updated_at_unix_ms: row.get(6)?,
                 }))
             } else {
                 Ok(None)
@@ -315,14 +329,15 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let tx = connection.transaction()?;
-            let (role, created_at_unix_ms) = {
+            let (role, active, created_at_unix_ms) = {
                 let mut stmt = tx.prepare(
-                    "SELECT role, created_at_unix_ms FROM staff_accounts WHERE username = ?1",
+                    "SELECT role, active, created_at_unix_ms FROM staff_accounts WHERE username = ?1",
                 )?;
                 let mut rows = stmt.query(params![username])?;
                 if let Some(row) = rows.next()? {
                     let role_str: String = row.get(0)?;
-                    (role_str.parse()?, row.get(1)?)
+                    let active: i64 = row.get(1)?;
+                    (role_str.parse()?, active != 0, row.get(2)?)
                 } else {
                     anyhow::bail!("account '{username}' not found");
                 }
@@ -334,6 +349,7 @@ impl DeviceStore {
                 role,
                 password_hash: hash,
                 must_change_password: true,
+                active,
                 created_at_unix_ms,
                 updated_at_unix_ms: now,
             })
@@ -441,7 +457,7 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT username, role, password_hash, must_change_password, created_at_unix_ms, updated_at_unix_ms FROM staff_accounts ORDER BY username ASC",
+                "SELECT username, role, password_hash, must_change_password, active, created_at_unix_ms, updated_at_unix_ms FROM staff_accounts ORDER BY username ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 let role_str: String = row.get(1)?;
@@ -453,13 +469,15 @@ impl DeviceStore {
                     )
                 })?;
                 let must_change: i64 = row.get(3)?;
+                let active: i64 = row.get(4)?;
                 Ok(StaffAccount {
                     username: row.get(0)?,
                     role,
                     password_hash: row.get(2)?,
                     must_change_password: must_change != 0,
-                    created_at_unix_ms: row.get(4)?,
-                    updated_at_unix_ms: row.get(5)?,
+                    active: active != 0,
+                    created_at_unix_ms: row.get(5)?,
+                    updated_at_unix_ms: row.get(6)?,
                 })
             })?;
             let mut accounts = Vec::new();
@@ -495,7 +513,7 @@ impl DeviceStore {
                 anyhow::bail!("staff account '{username}' already exists");
             }
             connection.execute(
-                "INSERT INTO staff_accounts (username, role, password_hash, must_change_password, created_at_unix_ms, updated_at_unix_ms) VALUES (?1, ?2, ?3, 1, ?4, ?4)",
+                "INSERT INTO staff_accounts (username, role, password_hash, must_change_password, active, created_at_unix_ms, updated_at_unix_ms) VALUES (?1, ?2, ?3, 1, 1, ?4, ?4)",
                 params![username, role.as_str(), hash, now],
             )?;
             Ok(StaffAccount {
@@ -503,6 +521,7 @@ impl DeviceStore {
                 role,
                 password_hash: hash,
                 must_change_password: true,
+                active: true,
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
             })
@@ -524,24 +543,25 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let tx = connection.transaction()?;
-            let (current_role, password_hash, must_change_password, created_at_unix_ms) = {
+            let (current_role, password_hash, must_change_password, active, created_at_unix_ms) = {
                 let mut stmt = tx.prepare(
-                    "SELECT role, password_hash, must_change_password, created_at_unix_ms FROM staff_accounts WHERE username = ?1",
+                    "SELECT role, password_hash, must_change_password, active, created_at_unix_ms FROM staff_accounts WHERE username = ?1",
                 )?;
                 let mut rows = stmt.query(params![username])?;
                 if let Some(row) = rows.next()? {
                     let role_str: String = row.get(0)?;
                     let role: StaffRole = role_str.parse()?;
                     let must_change: i64 = row.get(2)?;
-                    (role, row.get(1)?, must_change != 0, row.get(3)?)
+                    let active: i64 = row.get(3)?;
+                    (role, row.get(1)?, must_change != 0, active != 0, row.get(4)?)
                 } else {
                     anyhow::bail!("account '{username}' not found");
                 }
             };
 
-            if current_role == StaffRole::Admin && new_role == StaffRole::Operator {
+            if current_role == StaffRole::Admin && new_role == StaffRole::Operator && active {
                 let admin_count: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM staff_accounts WHERE role = 'admin'",
+                    "SELECT COUNT(*) FROM staff_accounts WHERE role = 'admin' AND active = 1",
                     [],
                     |row| row.get(0),
                 )?;
@@ -567,6 +587,72 @@ impl DeviceStore {
                 role: new_role,
                 password_hash,
                 must_change_password,
+                active,
+                created_at_unix_ms,
+                updated_at_unix_ms: now,
+            })
+        })
+        .await?
+    }
+
+    pub async fn deactivate_staff_account(&self, username: &str) -> Result<StaffAccount> {
+        let store = self.clone();
+        let username = username.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let tx = connection.transaction()?;
+            let (role, password_hash, must_change_password, active, created_at_unix_ms) = {
+                let mut stmt = tx.prepare(
+                    "SELECT role, password_hash, must_change_password, active, created_at_unix_ms FROM staff_accounts WHERE username = ?1",
+                )?;
+                let mut rows = stmt.query(params![username])?;
+                if let Some(row) = rows.next()? {
+                    let role_str: String = row.get(0)?;
+                    let role: StaffRole = role_str.parse()?;
+                    let must_change: i64 = row.get(2)?;
+                    let active: i64 = row.get(3)?;
+                    (
+                        role,
+                        row.get(1)?,
+                        must_change != 0,
+                        active != 0,
+                        row.get(4)?,
+                    )
+                } else {
+                    anyhow::bail!("account '{username}' not found");
+                }
+            };
+            anyhow::ensure!(active, "account '{username}' is already deactivated");
+            if role == StaffRole::Admin {
+                let admin_count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM staff_accounts WHERE role = 'admin' AND active = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    admin_count > 1,
+                    "cannot deactivate the last active admin"
+                );
+            }
+            tx.execute(
+                "UPDATE staff_accounts SET active = 0, updated_at_unix_ms = ?1 WHERE username = ?2",
+                params![now, username],
+            )?;
+            tx.execute(
+                "UPDATE staff_sessions SET revoked = 1 WHERE username = ?1 AND revoked = 0",
+                params![username],
+            )?;
+            tx.commit()?;
+            Ok(StaffAccount {
+                username,
+                role,
+                password_hash,
+                must_change_password,
+                active: false,
                 created_at_unix_ms,
                 updated_at_unix_ms: now,
             })
@@ -592,18 +678,23 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let tx = connection.transaction()?;
-            let (password_hash, role_str, must_change): (String, String, bool) = {
+            let (password_hash, role_str, must_change, active): (String, String, bool, bool) = {
                 let mut stmt = tx.prepare(
-                    "SELECT password_hash, role, must_change_password FROM staff_accounts WHERE username = ?1",
+                    "SELECT password_hash, role, must_change_password, active FROM staff_accounts WHERE username = ?1",
                 )?;
                 let mut rows = stmt.query(params![username])?;
                 if let Some(row) = rows.next()? {
                     let must_change: i64 = row.get(2)?;
-                    (row.get(0)?, row.get(1)?, must_change != 0)
+                    let active: i64 = row.get(3)?;
+                    (row.get(0)?, row.get(1)?, must_change != 0, active != 0)
                 } else {
                     return Ok(None);
                 }
             };
+            // Deactivated accounts never start sessions, even with valid credentials.
+            if !active {
+                return Ok(None);
+            }
             if password_hash != verified_password_hash {
                 return Ok(None);
             }
@@ -636,7 +727,7 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT s.session_id, s.username, a.role, s.must_change_password, s.created_at_unix_ms, s.last_seen_unix_ms, s.revoked FROM staff_sessions s JOIN staff_accounts a ON s.username = a.username WHERE s.session_id = ?1",
+                "SELECT s.session_id, s.username, a.role, s.must_change_password, s.created_at_unix_ms, s.last_seen_unix_ms, s.revoked, a.active FROM staff_sessions s JOIN staff_accounts a ON s.username = a.username WHERE s.session_id = ?1",
             )?;
             let mut rows = stmt.query(params![session_id])?;
             if let Some(row) = rows.next()? {
@@ -644,6 +735,7 @@ impl DeviceStore {
                 let role: StaffRole = role_str.parse()?;
                 let must_change: i64 = row.get(3)?;
                 let revoked: i64 = row.get(6)?;
+                let active: i64 = row.get(7)?;
                 let session = StaffSession {
                     session_id: row.get(0)?,
                     username: row.get(1)?,
@@ -651,7 +743,7 @@ impl DeviceStore {
                     must_change_password: must_change != 0,
                     created_at_unix_ms: row.get(4)?,
                     last_seen_unix_ms: row.get(5)?,
-                    revoked: revoked != 0,
+                    revoked: revoked != 0 || active == 0,
                 };
                 if !session.revoked {
                     let _ = connection.execute(

@@ -3,10 +3,11 @@ use anyhow::{Context, Result};
 use rustctrl_core::DeviceId;
 use rustctrl_protocol::auth::{
     ChangeOwnPasswordReply, ChangeOwnPasswordRequest, ChangeStaffRoleReply, ChangeStaffRoleRequest,
-    CreateStaffAccountReply, CreateStaffAccountRequest, ListStaffAccountsReply,
-    ListStaffAccountsRequest, LoginReply, LoginRequest, LogoutReply, LogoutRequest,
-    ReplaceTemporaryPasswordReply, ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply,
-    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusReply, StaffStatusRequest,
+    CreateStaffAccountReply, CreateStaffAccountRequest, DeactivateStaffAccountReply,
+    DeactivateStaffAccountRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
+    LoginRequest, LogoutReply, LogoutRequest, ReplaceTemporaryPasswordReply,
+    ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply, ResetStaffPasswordRequest,
+    StaffAccountEntry, StaffStatusReply, StaffStatusRequest,
     staff_auth_server::{StaffAuth, StaffAuthServer},
 };
 use rustctrl_protocol::bootstrap::{
@@ -393,6 +394,7 @@ impl StaffAuth for StaffAuthService {
                         must_change_password: account.must_change_password,
                         created_at_unix_ms: account.created_at_unix_ms,
                         updated_at_unix_ms: account.updated_at_unix_ms,
+                        active: account.active,
                     }),
                 }))
             }
@@ -409,6 +411,66 @@ impl StaffAuth for StaffAuthService {
                     .await;
                 if err_msg.contains("not found") {
                     Err(Status::not_found(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
+    }
+
+    async fn deactivate_staff_account(
+        &self,
+        request: Request<DeactivateStaffAccountRequest>,
+    ) -> Result<Response<DeactivateStaffAccountReply>, Status> {
+        let body = request.get_ref();
+        let target_username = body.username.trim().to_string();
+        let session = self
+            .authenticate_admin(&request, "deactivate_staff_account", Some(&target_username))
+            .await?;
+
+        match self.store.deactivate_staff_account(&target_username).await {
+            Ok(account) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "deactivate_staff_account".into(),
+                        "success".into(),
+                        format!(
+                            "deactivated staff account '{target_username}' and revoked its staff sessions"
+                        ),
+                    )
+                    .await;
+                Ok(Response::new(DeactivateStaffAccountReply {
+                    account: Some(StaffAccountEntry {
+                        username: account.username,
+                        role: account.role.as_str().into(),
+                        must_change_password: account.must_change_password,
+                        created_at_unix_ms: account.created_at_unix_ms,
+                        updated_at_unix_ms: account.updated_at_unix_ms,
+                        active: account.active,
+                    }),
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "deactivate_staff_account".into(),
+                        "rejected".into(),
+                        format!(
+                            "failed to deactivate staff account '{target_username}': {err_msg}"
+                        ),
+                    )
+                    .await;
+                if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else if err_msg.contains("already deactivated")
+                    || err_msg.contains("last active admin")
+                {
+                    Err(Status::failed_precondition(err_msg))
                 } else {
                     Err(Status::invalid_argument(err_msg))
                 }
@@ -480,6 +542,7 @@ impl StaffAuth for StaffAuthService {
                 must_change_password: acc.must_change_password,
                 created_at_unix_ms: acc.created_at_unix_ms,
                 updated_at_unix_ms: acc.updated_at_unix_ms,
+                active: acc.active,
             })
             .collect();
         Ok(Response::new(ListStaffAccountsReply { accounts: entries }))
@@ -545,6 +608,7 @@ impl StaffAuth for StaffAuthService {
                         must_change_password: account.must_change_password,
                         created_at_unix_ms: account.created_at_unix_ms,
                         updated_at_unix_ms: account.updated_at_unix_ms,
+                        active: account.active,
                     }),
                 }))
             }

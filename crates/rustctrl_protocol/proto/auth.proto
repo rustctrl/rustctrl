@@ -6,6 +6,7 @@ service StaffAuth {
   rpc ReplaceTemporaryPassword(ReplaceTemporaryPasswordRequest) returns (ReplaceTemporaryPasswordReply);
   rpc ChangeOwnPassword(ChangeOwnPasswordRequest) returns (ChangeOwnPasswordReply);
   rpc ResetStaffPassword(ResetStaffPasswordRequest) returns (ResetStaffPasswordReply);
+  rpc DeactivateStaffAccount(DeactivateStaffAccountRequest) returns (DeactivateStaffAccountReply);
   rpc Logout(LogoutRequest) returns (LogoutReply);
   rpc GetStaffStatus(StaffStatusRequest) returns (StaffStatusReply);
   rpc ListStaffAccounts(ListStaffAccountsRequest) returns (ListStaffAccountsReply);
@@ -52,6 +53,14 @@ message ResetStaffPasswordReply {
   StaffAccountEntry account = 1;
 }
 
+message DeactivateStaffAccountRequest {
+  string username = 1;
+}
+
+message DeactivateStaffAccountReply {
+  StaffAccountEntry account = 1;
+}
+
 message LogoutRequest {}
 
 message LogoutReply {
@@ -74,6 +83,7 @@ message StaffAccountEntry {
   bool must_change_password = 3;
   int64 created_at_unix_ms = 4;
   int64 updated_at_unix_ms = 5;
+  bool active = 6;
 }
 
 message ListStaffAccountsRequest {}
