@@ -50,6 +50,7 @@ enum ScreenState {
         password: String,
         error: Option<String>,
         notice: Option<String>,
+        remember: bool,
         in_flight: bool,
     },
     MustChangePassword {
@@ -77,19 +78,27 @@ enum ScreenState {
     },
 }
 
+enum RestoreFailure {
+    ExpiredOrRevoked,
+    ServerUnavailable(String),
+}
+
 struct ControllerApp {
     config: ControllerConfig,
+    config_path: std::path::PathBuf,
     state: ScreenState,
     overlay: Overlay,
     active_field: ActiveField,
     focus_handle: FocusHandle,
     tokio_handle: tokio::runtime::Handle,
     _refresh: Task<()>,
+    _restore: Option<Task<()>>,
 }
 
 impl ControllerApp {
     fn new(
         config: ControllerConfig,
+        config_path: std::path::PathBuf,
         tokio_handle: tokio::runtime::Handle,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -116,13 +125,115 @@ impl ControllerApp {
             }
         });
 
+        // Restore a remembered Staff Session before asking for credentials.
+        let restore_cfg = config.clone();
+        let restore_path = config_path.clone();
+        let restore_handle = tokio_handle.clone();
+        let restore = cx.spawn(async move |this, cx| {
+            let session_path = crate::session::session_file_path(&restore_path);
+            let saved = match restore_handle
+                .spawn(async move { crate::session::load(&session_path) })
+                .await
+            {
+                Ok(Ok(Some(saved))) => Some(saved),
+                _ => None,
+            };
+            let Some(saved) = saved else {
+                return;
+            };
+            if !saved.matches_deployment(&restore_cfg.server) {
+                return;
+            }
+            let client_cfg = restore_cfg.server.clone();
+            let token = saved.session_token.clone();
+            let outcome = restore_handle
+                .spawn(async move {
+                    let mut client = match rustctrl_network::connect_staff_auth(&client_cfg).await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            return Err(RestoreFailure::ServerUnavailable(error.to_string()));
+                        }
+                    };
+                    let auth = match format!("Bearer {token}").parse() {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Err(RestoreFailure::ServerUnavailable(format!(
+                                "invalid session token encoding: {error}"
+                            )));
+                        }
+                    };
+                    let mut req = tonic::Request::new(StaffStatusRequest {});
+                    req.metadata_mut().insert("authorization", auth);
+                    match client.get_staff_status(req).await {
+                        Ok(reply) => Ok(reply.into_inner()),
+                        Err(status)
+                            if status.code() == tonic::Code::Unauthenticated
+                                || status.code() == tonic::Code::PermissionDenied =>
+                        {
+                            Err(RestoreFailure::ExpiredOrRevoked)
+                        }
+                        Err(status) => Err(RestoreFailure::ServerUnavailable(status.to_string())),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                let session_path = crate::session::session_file_path(&view.config_path);
+                if let ScreenState::Login { .. } = view.state {
+                    match outcome {
+                        Ok(Ok(reply)) => {
+                            view.state = ScreenState::Connected {
+                                session_token: saved.session_token.clone(),
+                                username: reply.username,
+                                role: reply.role,
+                                server_version: reply.server_version,
+                                registered_devices: reply.registered_devices,
+                                accounts: Vec::new(),
+                                new_account_username: String::new(),
+                                new_account_role: "operator".into(),
+                                new_account_password: String::new(),
+                                error: None,
+                                notice: Some("Signed in with your remembered session.".into()),
+                                in_flight: false,
+                            };
+                            if let ScreenState::Connected { session_token, .. } = &view.state {
+                                let token = session_token.clone();
+                                view.fetch_status(token, cx);
+                            }
+                        }
+                        Ok(Err(RestoreFailure::ExpiredOrRevoked)) => {
+                            // Dead credential: stop restoring it on later launches.
+                            let _ = crate::session::clear(&session_path);
+                            if let ScreenState::Login { notice, .. } = &mut view.state {
+                                *notice =
+                                    Some("Saved session expired or was revoked. Sign in.".into());
+                            }
+                        }
+                        Ok(Err(RestoreFailure::ServerUnavailable(reason))) => {
+                            tracing::warn!(%reason, "saved session could not be validated");
+                            if let ScreenState::Login { notice, .. } = &mut view.state {
+                                *notice = Some("Server unavailable. Sign in to reconnect.".into());
+                            }
+                        }
+                        Err(_) => {
+                            if let ScreenState::Login { notice, .. } = &mut view.state {
+                                *notice = Some("Server unavailable. Sign in to reconnect.".into());
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        });
+
         Self {
             config,
+            config_path,
             state: ScreenState::Login {
                 username: String::new(),
                 password: String::new(),
                 error: None,
                 notice: None,
+                remember: false,
                 in_flight: false,
             },
             overlay: Overlay::None,
@@ -130,14 +241,16 @@ impl ControllerApp {
             focus_handle,
             tokio_handle,
             _refresh: refresh,
+            _restore: Some(restore),
         }
     }
 
     fn submit_login(&mut self, cx: &mut Context<Self>) {
-        let (username, password) = match &self.state {
+        let (username, password, remember) = match &self.state {
             ScreenState::Login {
                 username,
                 password,
+                remember,
                 in_flight: false,
                 ..
             } => {
@@ -147,12 +260,13 @@ impl ControllerApp {
                         password: password.clone(),
                         error: Some("Username and password are required.".into()),
                         notice: None,
+                        remember: *remember,
                         in_flight: false,
                     };
                     cx.notify();
                     return;
                 }
-                (username.clone(), password.clone())
+                (username.clone(), password.clone(), *remember)
             }
             _ => return,
         };
@@ -162,6 +276,7 @@ impl ControllerApp {
             password: password.clone(),
             error: None,
             notice: None,
+            remember,
             in_flight: true,
         };
         cx.notify();
@@ -176,6 +291,7 @@ impl ControllerApp {
                         .login(LoginRequest {
                             username: username.clone(),
                             password,
+                            remember,
                         })
                         .await?
                         .into_inner();
@@ -186,6 +302,22 @@ impl ControllerApp {
             let _ = this.update(cx, |view, cx| {
                 match res {
                     Ok(Ok(reply)) => {
+                        // The saved credential reflects the latest explicit
+                        // login choice; the staff password is never stored.
+                        let session_path = crate::session::session_file_path(&view.config_path);
+                        if remember {
+                            let _ = crate::session::save(
+                                &session_path,
+                                &crate::session::SavedStaffSession {
+                                    endpoint: view.config.server.endpoint.clone(),
+                                    domain_name: view.config.server.domain_name.clone(),
+                                    username: reply.username.clone(),
+                                    session_token: reply.session_token.clone(),
+                                },
+                            );
+                        } else {
+                            let _ = crate::session::clear(&session_path);
+                        }
                         if reply.must_change_password {
                             view.state = ScreenState::MustChangePassword {
                                 session_token: reply.session_token,
@@ -218,7 +350,10 @@ impl ControllerApp {
                     }
                     Ok(Err(err)) => {
                         if let ScreenState::Login {
-                            username, password, ..
+                            username,
+                            password,
+                            remember,
+                            ..
                         } = &view.state
                         {
                             view.state = ScreenState::Login {
@@ -226,13 +361,17 @@ impl ControllerApp {
                                 password: password.clone(),
                                 error: Some(err.to_string()),
                                 notice: None,
+                                remember: *remember,
                                 in_flight: false,
                             };
                         }
                     }
                     Err(join_err) => {
                         if let ScreenState::Login {
-                            username, password, ..
+                            username,
+                            password,
+                            remember,
+                            ..
                         } = &view.state
                         {
                             view.state = ScreenState::Login {
@@ -240,6 +379,7 @@ impl ControllerApp {
                                 password: password.clone(),
                                 error: Some(join_err.to_string()),
                                 notice: None,
+                                remember: *remember,
                                 in_flight: false,
                             };
                         }
@@ -405,6 +545,7 @@ impl ControllerApp {
             password: String::new(),
             error: None,
             notice: None,
+            remember: false,
             in_flight: false,
         };
         // Any open password form belongs to the session being left behind.
@@ -413,6 +554,7 @@ impl ControllerApp {
         cx.notify();
 
         let client_cfg = self.config.server.clone();
+        let session_path = crate::session::session_file_path(&self.config_path);
         let handle = self.tokio_handle.clone();
         cx.spawn(async move |_this, _cx| {
             let _ = handle
@@ -424,6 +566,13 @@ impl ControllerApp {
                             req.metadata_mut().insert("authorization", val);
                             let _ = client.logout(req).await;
                         }
+                    }
+                    // Drop the remembered credential only when it is this
+                    // session; other Controllers keep their own sessions.
+                    if let Ok(Some(saved)) = crate::session::load(&session_path)
+                        && saved.session_token == session_token
+                    {
+                        let _ = crate::session::clear(&session_path);
                     }
                 })
                 .await;
@@ -690,6 +839,12 @@ impl ControllerApp {
                     );
                     if self_deactivate {
                         // Deactivating the own account revokes this session.
+                        let session_path = crate::session::session_file_path(&view.config_path);
+                        if let Ok(Some(saved)) = crate::session::load(&session_path)
+                            && saved.username == target_label
+                        {
+                            let _ = crate::session::clear(&session_path);
+                        }
                         view.state = ScreenState::Login {
                             username: target_label,
                             password: String::new(),
@@ -698,6 +853,7 @@ impl ControllerApp {
                                 "Account deactivated and this session was revoked.".into(),
                             ),
                             in_flight: false,
+                            remember: false,
                         };
                         view.active_field = ActiveField::Username;
                     } else if let ScreenState::Connected {
@@ -986,6 +1142,13 @@ impl ControllerApp {
                             view.active_field = ActiveField::Username;
                             if self_reset {
                                 // Resetting the own account revokes this session by design.
+                                let session_path =
+                                    crate::session::session_file_path(&view.config_path);
+                                if let Ok(Some(saved)) = crate::session::load(&session_path)
+                                    && saved.username == target_label
+                                {
+                                    let _ = crate::session::clear(&session_path);
+                                }
                                 view.state = ScreenState::Login {
                                     username: target_label,
                                     password: String::new(),
@@ -995,6 +1158,7 @@ impl ControllerApp {
                                             .into(),
                                     ),
                                     in_flight: false,
+                                        remember: false,
                                 };
                             } else {
                                 if let ScreenState::Connected {
@@ -1629,11 +1793,17 @@ impl Render for ControllerApp {
                 password,
                 error,
                 notice,
+                remember,
                 in_flight,
             } => {
                 let user_active = self.active_field == ActiveField::Username;
                 let pass_active = self.active_field == ActiveField::Password;
                 let masked_pass = "•".repeat(password.len());
+                let remember_label = if *remember {
+                    "✓ Remember on this computer"
+                } else {
+                    "Remember on this computer"
+                };
 
                 container
                     .child(div().text_3xl().child("RustCtrl"))
@@ -1700,6 +1870,29 @@ impl Render for ControllerApp {
                                     } else {
                                         masked_pass
                                     }),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(if *remember {
+                                        rgb(0x2d5a88)
+                                    } else {
+                                        rgb(0x223344)
+                                    })
+                                    .text_color(rgb(0xe8eef2))
+                                    .text_sm()
+                                    .id("remember-toggle")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let ScreenState::Login { remember, .. } = &mut this.state
+                                        {
+                                            *remember = !*remember;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(remember_label),
                             )
                             .children(error.as_ref().map(|err| {
                                 div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
@@ -2263,7 +2456,7 @@ impl Render for ControllerApp {
     }
 }
 
-pub fn open(config: ControllerConfig) -> Result<()> {
+pub fn open(config: ControllerConfig, config_path: std::path::PathBuf) -> Result<()> {
     #[cfg(target_os = "linux")]
     anyhow::ensure!(
         ["DISPLAY", "WAYLAND_DISPLAY"]
@@ -2276,7 +2469,7 @@ pub fn open(config: ControllerConfig) -> Result<()> {
 
     gpui_platform::application().run(move |cx: &mut App| {
         cx.open_window(WindowOptions::default(), |_, cx| {
-            cx.new(|cx| ControllerApp::new(config, handle, cx))
+            cx.new(|cx| ControllerApp::new(config, config_path, handle, cx))
         })
         .expect("open RustCtrl window");
         cx.activate(true);

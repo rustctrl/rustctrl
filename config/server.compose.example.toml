@@ -5,3 +5,7 @@ database = "/data/rustctrl.db"
 certificate = "/tls/cert.pem"
 private_key = "/tls/key.pem"
 client_ca = "/tls/ca.pem"
+
+[staff_session]
+# Finite lifetime for remembered staff logins, enforced by the Server.
+remembered_lifetime_secs = 2592000

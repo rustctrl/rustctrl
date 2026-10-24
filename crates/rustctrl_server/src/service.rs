@@ -97,11 +97,15 @@ impl Bootstrap for BootstrapService {
 
 pub struct StaffAuthService {
     store: DeviceStore,
+    remembered_lifetime_secs: u64,
 }
 
 impl StaffAuthService {
-    pub fn new(store: DeviceStore) -> Self {
-        Self { store }
+    pub fn new(store: DeviceStore, remembered_lifetime_secs: u64) -> Self {
+        Self {
+            store,
+            remembered_lifetime_secs,
+        }
     }
 
     async fn authenticate_request<T>(
@@ -202,12 +206,24 @@ impl StaffAuth for StaffAuthService {
 
         let account = account.unwrap();
         let session_id = uuid::Uuid::new_v4().to_string();
+        let expires_at_unix_ms = if body.remember {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_default();
+            let lifetime_ms = i64::try_from(self.remembered_lifetime_secs.saturating_mul(1000))
+                .unwrap_or(i64::MAX);
+            Some(now_ms.saturating_add(lifetime_ms))
+        } else {
+            None
+        };
         let session = self
             .store
             .create_login_session(
                 session_id,
                 account.username.clone(),
                 account.password_hash.clone(),
+                expires_at_unix_ms,
             )
             .await
             .map_err(database_error)?;
@@ -235,7 +251,11 @@ impl StaffAuth for StaffAuthService {
                 session.username.clone(),
                 "login".into(),
                 "success".into(),
-                format!("staff session started for role {}", session.role.as_str()),
+                format!(
+                    "staff session started for role {}{}",
+                    session.role.as_str(),
+                    if body.remember { " (remembered)" } else { "" }
+                ),
             )
             .await;
 
@@ -730,7 +750,10 @@ pub async fn serve_on(
     Server::builder()
         .tls_config(tls)?
         .add_service(BootstrapServer::new(BootstrapService::new(store.clone())))
-        .add_service(StaffAuthServer::new(StaffAuthService::new(store)))
+        .add_service(StaffAuthServer::new(StaffAuthService::new(
+            store,
+            config.staff_session.remembered_lifetime_secs,
+        )))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             shutdown,

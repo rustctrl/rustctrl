@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 #[cfg(feature = "gui")]
 mod gui;
+mod session;
 
 #[derive(Parser)]
 #[command(
@@ -40,8 +41,11 @@ enum Command {
         #[arg(long)]
         replace_password: Option<String>,
         #[arg(long)]
+        remember: bool,
+        #[arg(long)]
         logout: bool,
     },
+    RestoreSession,
     ListAccounts {
         #[arg(long)]
         username: String,
@@ -119,6 +123,7 @@ fn main() -> Result<()> {
             username,
             password,
             replace_password,
+            remember,
             logout,
         } => tokio::runtime::Runtime::new()?.block_on(async {
             let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
@@ -126,6 +131,7 @@ fn main() -> Result<()> {
                 .login(LoginRequest {
                     username: username.clone(),
                     password,
+                    remember,
                 })
                 .await?
                 .into_inner();
@@ -156,6 +162,24 @@ fn main() -> Result<()> {
                 }
             }
 
+            // The saved credential reflects the latest explicit choice: stored
+            // only for remembered logins, removed otherwise. Never the password.
+            let session_path = session::session_file_path(&cli.config);
+            if remember {
+                session::save(
+                    &session_path,
+                    &session::SavedStaffSession {
+                        endpoint: config.server.endpoint.clone(),
+                        domain_name: config.server.domain_name.clone(),
+                        username: reply.username,
+                        session_token: session_token.clone(),
+                    },
+                )?;
+                println!("Login remembered on this computer.");
+            } else if session::load(&session_path).is_ok_and(|saved| saved.is_some()) {
+                session::clear(&session_path)?;
+            }
+
             let mut status_req = tonic::Request::new(StaffStatusRequest {});
             status_req.metadata_mut().insert(
                 "authorization",
@@ -175,15 +199,71 @@ fn main() -> Result<()> {
                 );
                 client.logout(logout_req).await?;
                 println!("Logout success.");
+                // Clear the stored credential only when it belongs to this session.
+                let matches_saved = session::load(&session_path)?
+                    .is_some_and(|saved| saved.session_token == session_token);
+                if matches_saved {
+                    session::clear(&session_path)?;
+                }
             }
 
             Ok(())
+        }),
+        Command::RestoreSession => tokio::runtime::Runtime::new()?.block_on(async {
+            let session_path = session::session_file_path(&cli.config);
+            let Some(saved) = session::load(&session_path)? else {
+                println!("No saved session.");
+                return Ok(());
+            };
+            if !saved.matches_deployment(&config.server) {
+                println!("Saved session belongs to a different deployment.");
+                return Ok(());
+            }
+            let mut client =
+                match rustctrl_network::connect_staff_auth(&config.server).await {
+                    Ok(client) => client,
+                    Err(error) => anyhow::bail!(
+                        "Server unavailable. Saved session could not be validated: {error}"
+                    ),
+                };
+            let mut status_req = tonic::Request::new(StaffStatusRequest {});
+            status_req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", saved.session_token).parse()?,
+            );
+            match client.get_staff_status(status_req).await {
+                Ok(status) => {
+                    let status = status.into_inner();
+                    println!(
+                        "Restored session: username={} role={} authenticated={}",
+                        status.username, status.role, status.authenticated
+                    );
+                    Ok(())
+                }
+                Err(status) if status.code() == tonic::Code::Unauthenticated => {
+                    // The saved credential is dead: remove it so reopening
+                    // cannot keep retrying revoked access.
+                    session::clear(&session_path)?;
+                    anyhow::bail!("Saved session expired or was revoked. Sign in again.")
+                }
+                Err(status) if status.code() == tonic::Code::PermissionDenied => {
+                    session::clear(&session_path)?;
+                    anyhow::bail!(
+                        "Saved session requires replacing a temporary password. Sign in again."
+                    )
+                }
+                Err(status) => anyhow::bail!("Staff session check failed: {status}"),
+            }
         }),
         Command::ListAccounts { username, password } => {
             tokio::runtime::Runtime::new()?.block_on(async {
                 let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
                 let login_reply = client
-                    .login(LoginRequest { username, password })
+                    .login(LoginRequest {
+                username,
+                password,
+                remember: false,
+            })
                     .await?
                     .into_inner();
                 if login_reply.must_change_password {
@@ -220,7 +300,11 @@ fn main() -> Result<()> {
         } => tokio::runtime::Runtime::new()?.block_on(async {
             let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
             let login_reply = client
-                .login(LoginRequest { username, password })
+                .login(LoginRequest {
+                username,
+                password,
+                remember: false,
+            })
                 .await?
                 .into_inner();
             if login_reply.must_change_password {
@@ -258,7 +342,11 @@ fn main() -> Result<()> {
         } => tokio::runtime::Runtime::new()?.block_on(async {
             let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
             let login_reply = client
-                .login(LoginRequest { username, password })
+                .login(LoginRequest {
+                username,
+                password,
+                remember: false,
+            })
                 .await?
                 .into_inner();
             if login_reply.must_change_password {
@@ -295,6 +383,7 @@ fn main() -> Result<()> {
                 .login(LoginRequest {
                     username,
                     password: password.clone(),
+                    remember: false,
                 })
                 .await?
                 .into_inner();
@@ -339,7 +428,11 @@ fn main() -> Result<()> {
         } => tokio::runtime::Runtime::new()?.block_on(async {
             let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
             let login_reply = client
-                .login(LoginRequest { username, password })
+                .login(LoginRequest {
+                username,
+                password,
+                remember: false,
+            })
                 .await?
                 .into_inner();
             if login_reply.must_change_password {
@@ -376,7 +469,11 @@ fn main() -> Result<()> {
         } => tokio::runtime::Runtime::new()?.block_on(async {
             let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
             let login_reply = client
-                .login(LoginRequest { username, password })
+                .login(LoginRequest {
+                username,
+                password,
+                remember: false,
+            })
                 .await?
                 .into_inner();
             if login_reply.must_change_password {
@@ -407,11 +504,11 @@ fn main() -> Result<()> {
         Command::Gui => {
             #[cfg(feature = "gui")]
             {
-                gui::open(config)
+                gui::open(config, cli.config)
             }
             #[cfg(not(feature = "gui"))]
             {
-                let _ = config;
+                let _ = (config, cli.config);
                 anyhow::bail!(
                     "GUI support is disabled in this diagnostic build; rebuild with default features"
                 )

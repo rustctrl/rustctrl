@@ -59,6 +59,7 @@ impl RunningServer {
                 private_key: tls.join("key.pem"),
                 client_ca: tls.join("ca.pem"),
             },
+            staff_session: Default::default(),
         };
         let stop = CancellationToken::new();
         let signal = stop.clone();
@@ -114,6 +115,7 @@ async fn login(
         .login(LoginRequest {
             username: username.into(),
             password: password.into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -186,6 +188,7 @@ async fn staff_change_own_password_verifies_current_and_keeps_sessions() -> Resu
         .login(LoginRequest {
             username: "alice".into(),
             password: "AliceTemp123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -249,6 +252,7 @@ async fn staff_change_own_password_verifies_current_and_keeps_sessions() -> Resu
         .login(LoginRequest {
             username: "alice".into(),
             password: "AlicePermanent123!".into(),
+            remember: false,
         })
         .await
         .unwrap_err();
@@ -272,6 +276,7 @@ async fn staff_change_own_password_verifies_current_and_keeps_sessions() -> Resu
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobTemp12345!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -351,6 +356,7 @@ async fn admin_reset_ends_all_target_sessions_and_forces_replacement() -> Result
         .login(LoginRequest {
             username: "alice".into(),
             password: "AliceTemp123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -378,6 +384,7 @@ async fn admin_reset_ends_all_target_sessions_and_forces_replacement() -> Result
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobTemp12345!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -456,6 +463,7 @@ async fn admin_reset_ends_all_target_sessions_and_forces_replacement() -> Result
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobPermanent123!".into(),
+            remember: false,
         })
         .await
         .unwrap_err();
@@ -465,6 +473,7 @@ async fn admin_reset_ends_all_target_sessions_and_forces_replacement() -> Result
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobResetTemp123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -527,6 +536,7 @@ async fn admin_reset_ends_all_target_sessions_and_forces_replacement() -> Result
         .login(LoginRequest {
             username: "alice".into(),
             password: "AliceResetTemp123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -536,6 +546,7 @@ async fn admin_reset_ends_all_target_sessions_and_forces_replacement() -> Result
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobRenewed123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -574,6 +585,7 @@ async fn local_recover_admin_resets_existing_admin_without_bootstrap_bypass() ->
         .login(LoginRequest {
             username: "root".into(),
             password: "RootTemp1234!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -695,6 +707,7 @@ async fn local_recover_admin_resets_existing_admin_without_bootstrap_bypass() ->
         .login(LoginRequest {
             username: "root".into(),
             password: "RootPermanent123!".into(),
+            remember: false,
         })
         .await
         .unwrap_err();
@@ -705,6 +718,7 @@ async fn local_recover_admin_resets_existing_admin_without_bootstrap_bypass() ->
         .login(LoginRequest {
             username: "root".into(),
             password: "RootRecovery123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();

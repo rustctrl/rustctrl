@@ -57,6 +57,7 @@ impl RunningServer {
                 private_key: tls.join("key.pem"),
                 client_ca: tls.join("ca.pem"),
             },
+            staff_session: Default::default(),
         };
         let stop = CancellationToken::new();
         let signal = stop.clone();
