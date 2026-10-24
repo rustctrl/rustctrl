@@ -4,6 +4,8 @@ package rustctrl.auth.v1;
 service StaffAuth {
   rpc Login(LoginRequest) returns (LoginReply);
   rpc ReplaceTemporaryPassword(ReplaceTemporaryPasswordRequest) returns (ReplaceTemporaryPasswordReply);
+  rpc ChangeOwnPassword(ChangeOwnPasswordRequest) returns (ChangeOwnPasswordReply);
+  rpc ResetStaffPassword(ResetStaffPasswordRequest) returns (ResetStaffPasswordReply);
   rpc Logout(LogoutRequest) returns (LogoutReply);
   rpc GetStaffStatus(StaffStatusRequest) returns (StaffStatusReply);
   rpc ListStaffAccounts(ListStaffAccountsRequest) returns (ListStaffAccountsReply);
@@ -30,6 +32,24 @@ message ReplaceTemporaryPasswordRequest {
 
 message ReplaceTemporaryPasswordReply {
   bool success = 1;
+}
+
+message ChangeOwnPasswordRequest {
+  string current_password = 1;
+  string new_password = 2;
+}
+
+message ChangeOwnPasswordReply {
+  bool success = 1;
+}
+
+message ResetStaffPasswordRequest {
+  string username = 1;
+  string temporary_password = 2;
+}
+
+message ResetStaffPasswordReply {
+  StaffAccountEntry account = 1;
 }
 
 message LogoutRequest {}

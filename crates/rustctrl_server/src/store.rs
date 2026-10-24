@@ -13,6 +13,40 @@ fn current_time_ms() -> Result<i64> {
     )?)
 }
 
+fn validate_username(username: &str) -> Result<String> {
+    let username = username.trim().to_string();
+    anyhow::ensure!(
+        !username.is_empty() && username.len() <= 64,
+        "username must contain 1 to 64 characters"
+    );
+    anyhow::ensure!(
+        username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'),
+        "username may only contain alphanumeric characters, '.', '_', or '-'"
+    );
+    Ok(username)
+}
+
+// Caller keeps the transaction open so reset and its activity record commit together.
+fn reset_account_password_to_temporary(
+    tx: &rusqlite::Transaction<'_>,
+    username: &str,
+    password_hash: &str,
+    now: i64,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE staff_accounts SET password_hash = ?1, must_change_password = 1, updated_at_unix_ms = ?2 WHERE username = ?3",
+        params![password_hash, now, username],
+    )?;
+    anyhow::ensure!(changed == 1, "account '{username}' not found");
+    tx.execute(
+        "UPDATE staff_sessions SET revoked = 1 WHERE username = ?1 AND revoked = 0",
+        params![username],
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaffRole {
     Admin,
@@ -158,17 +192,7 @@ impl DeviceStore {
         username: String,
         temporary_password: String,
     ) -> Result<()> {
-        let username = username.trim().to_string();
-        anyhow::ensure!(
-            !username.is_empty() && username.len() <= 64,
-            "username must contain 1 to 64 characters"
-        );
-        anyhow::ensure!(
-            username
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'),
-            "username may only contain alphanumeric characters, '.', '_', or '-'"
-        );
+        let username = validate_username(&username)?;
         let hash = crate::password::hash_password(&temporary_password)?;
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -276,6 +300,139 @@ impl DeviceStore {
         .await?
     }
 
+    pub async fn reset_staff_password(
+        &self,
+        username: &str,
+        temporary_password: String,
+    ) -> Result<StaffAccount> {
+        let hash = crate::password::hash_password(&temporary_password)?;
+        let store = self.clone();
+        let username = username.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let tx = connection.transaction()?;
+            let (role, created_at_unix_ms) = {
+                let mut stmt = tx.prepare(
+                    "SELECT role, created_at_unix_ms FROM staff_accounts WHERE username = ?1",
+                )?;
+                let mut rows = stmt.query(params![username])?;
+                if let Some(row) = rows.next()? {
+                    let role_str: String = row.get(0)?;
+                    (role_str.parse()?, row.get(1)?)
+                } else {
+                    anyhow::bail!("account '{username}' not found");
+                }
+            };
+            reset_account_password_to_temporary(&tx, &username, &hash, now)?;
+            tx.commit()?;
+            Ok(StaffAccount {
+                username,
+                role,
+                password_hash: hash,
+                must_change_password: true,
+                created_at_unix_ms,
+                updated_at_unix_ms: now,
+            })
+        })
+        .await?
+    }
+
+    pub async fn change_own_password(
+        &self,
+        username: &str,
+        current_password: String,
+        new_password_hash: String,
+    ) -> Result<()> {
+        let store = self.clone();
+        let username = username.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let tx = connection.transaction()?;
+            let stored_hash: String = {
+                let mut stmt =
+                    tx.prepare("SELECT password_hash FROM staff_accounts WHERE username = ?1")?;
+                let mut rows = stmt.query(params![username])?;
+                if let Some(row) = rows.next()? {
+                    row.get(0)?
+                } else {
+                    anyhow::bail!("account '{username}' not found");
+                }
+            };
+            anyhow::ensure!(
+                crate::password::verify_password(&current_password, &stored_hash),
+                "current password is incorrect"
+            );
+            // Guard on the verified hash so a concurrent reset that already committed
+            // cannot be silently overwritten by this change.
+            let changed = tx.execute(
+                "UPDATE staff_accounts SET password_hash = ?1, must_change_password = 0, updated_at_unix_ms = ?2 WHERE username = ?3 AND password_hash = ?4",
+                params![new_password_hash, now, username, stored_hash],
+            )?;
+            anyhow::ensure!(
+                changed == 1,
+                "password was reset concurrently; sign in again"
+            );
+            tx.execute(
+                "UPDATE staff_sessions SET must_change_password = 0 WHERE username = ?1 AND revoked = 0",
+                params![username],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    pub async fn recover_admin(&self, username: String, temporary_password: String) -> Result<()> {
+        let username = validate_username(&username)?;
+        let hash = crate::password::hash_password(&temporary_password)?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let tx = connection.transaction()?;
+            let role: String = {
+                let mut stmt = tx.prepare(
+                    "SELECT role FROM staff_accounts WHERE username = ?1",
+                )?;
+                let mut rows = stmt.query(params![username])?;
+                if let Some(row) = rows.next()? {
+                    row.get(0)?
+                } else {
+                    anyhow::bail!("account '{username}' not found");
+                }
+            };
+            anyhow::ensure!(
+                role == StaffRole::Admin.as_str(),
+                "account '{username}' is not an admin account; local recovery applies to existing admin accounts only"
+            );
+            reset_account_password_to_temporary(&tx, &username, &hash, now)?;
+            tx.execute(
+                "INSERT INTO activity_log (server_time_unix_ms, actor, action, result, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    now,
+                    "local",
+                    "recover_admin",
+                    "success",
+                    format!("admin account '{username}' reset to a temporary password and its staff sessions revoked")
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
     pub async fn list_staff_accounts(&self) -> Result<Vec<StaffAccount>> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -320,17 +477,7 @@ impl DeviceStore {
         role: StaffRole,
         temporary_password: String,
     ) -> Result<StaffAccount> {
-        let username = username.trim().to_string();
-        anyhow::ensure!(
-            !username.is_empty() && username.len() <= 64,
-            "username must contain 1 to 64 characters"
-        );
-        anyhow::ensure!(
-            username
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'),
-            "username may only contain alphanumeric characters, '.', '_', or '-'"
-        );
+        let username = validate_username(&username)?;
         let hash = crate::password::hash_password(&temporary_password)?;
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -427,33 +574,54 @@ impl DeviceStore {
         .await?
     }
 
-    pub async fn create_session(
+    // Creates the login session only when the password hash the caller verified is
+    // still the account's current hash, atomically with the insert. A reset or
+    // self-change that commits first either fails this check or, when it commits
+    // after, revokes the freshly inserted session.
+    pub async fn create_login_session(
         &self,
         session_id: String,
         username: String,
-        role: StaffRole,
-        must_change_password: bool,
-    ) -> Result<StaffSession> {
+        verified_password_hash: String,
+    ) -> Result<Option<StaffSession>> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             let now = current_time_ms()?;
-            let connection = store
+            let mut connection = store
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-            connection.execute(
+            let tx = connection.transaction()?;
+            let (password_hash, role_str, must_change): (String, String, bool) = {
+                let mut stmt = tx.prepare(
+                    "SELECT password_hash, role, must_change_password FROM staff_accounts WHERE username = ?1",
+                )?;
+                let mut rows = stmt.query(params![username])?;
+                if let Some(row) = rows.next()? {
+                    let must_change: i64 = row.get(2)?;
+                    (row.get(0)?, row.get(1)?, must_change != 0)
+                } else {
+                    return Ok(None);
+                }
+            };
+            if password_hash != verified_password_hash {
+                return Ok(None);
+            }
+            let role: StaffRole = role_str.parse()?;
+            tx.execute(
                 "INSERT INTO staff_sessions (session_id, username, role, must_change_password, created_at_unix_ms, last_seen_unix_ms, revoked) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0)",
-                params![session_id, username, role.as_str(), if must_change_password { 1 } else { 0 }, now],
+                params![session_id, username, role.as_str(), if must_change { 1 } else { 0 }, now],
             )?;
-            Ok(StaffSession {
+            tx.commit()?;
+            Ok(Some(StaffSession {
                 session_id,
                 username,
                 role,
-                must_change_password,
+                must_change_password: must_change,
                 created_at_unix_ms: now,
                 last_seen_unix_ms: now,
                 revoked: false,
-            })
+            }))
         })
         .await?
     }
@@ -566,5 +734,56 @@ impl DeviceStore {
             Ok(list)
         })
         .await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn login_session_rejects_credentials_superseded_by_a_password_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = DeviceStore::open(&temp.path().join("store.db"))?;
+        store
+            .bootstrap_admin("alice".into(), "TempPass1234!".into())
+            .await?;
+
+        let account = store
+            .get_staff_account("alice")
+            .await?
+            .expect("bootstrapped account");
+        let session = store
+            .create_login_session("s1".into(), "alice".into(), account.password_hash.clone())
+            .await?;
+        let session = session.expect("current hash yields a session");
+        assert!(session.must_change_password);
+        assert_eq!(session.role, StaffRole::Admin);
+
+        // A password change supersedes the verified hash; a login that verified
+        // the old hash must not produce a session.
+        let new_hash = crate::password::hash_password("NewPermanent123!")?;
+        store
+            .update_password("alice", new_hash.clone(), false)
+            .await?;
+        let stale = store
+            .create_login_session("s2".into(), "alice".into(), account.password_hash)
+            .await?;
+        assert!(stale.is_none(), "stale hash must not create a session");
+
+        // The new hash still yields one, reflecting the fresh account state.
+        let fresh = store
+            .create_login_session("s3".into(), "alice".into(), new_hash)
+            .await?
+            .expect("current hash yields a session");
+        assert!(!fresh.must_change_password);
+
+        // Unknown accounts never yield a session.
+        let unknown = store
+            .create_login_session("s4".into(), "ghost".into(), "irrelevant".into())
+            .await?;
+        assert!(unknown.is_none());
+
+        Ok(())
     }
 }

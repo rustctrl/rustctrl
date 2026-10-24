@@ -5,8 +5,9 @@ use gpui::{
 };
 use rustctrl_core::ControllerConfig;
 use rustctrl_protocol::auth::{
-    ChangeStaffRoleRequest, CreateStaffAccountRequest, ListStaffAccountsRequest, LoginRequest,
-    LogoutRequest, ReplaceTemporaryPasswordRequest, StaffAccountEntry, StaffStatusRequest,
+    ChangeOwnPasswordRequest, ChangeStaffRoleRequest, CreateStaffAccountRequest,
+    ListStaffAccountsRequest, LoginRequest, LogoutRequest, ReplaceTemporaryPasswordRequest,
+    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusRequest,
 };
 use std::time::Duration;
 
@@ -16,8 +17,29 @@ enum ActiveField {
     Password,
     NewPassword,
     ConfirmPassword,
+    CurrentPassword,
+    TemporaryPassword,
     NewAccountUsername,
     NewAccountPassword,
+}
+
+#[derive(Clone)]
+enum Overlay {
+    None,
+    ChangePassword {
+        current_password: String,
+        new_password: String,
+        confirm_password: String,
+        error: Option<String>,
+        in_flight: bool,
+    },
+    ResetPassword {
+        target_username: String,
+        temporary_password: String,
+        confirm_password: String,
+        error: Option<String>,
+        in_flight: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -26,6 +48,7 @@ enum ScreenState {
         username: String,
         password: String,
         error: Option<String>,
+        notice: Option<String>,
         in_flight: bool,
     },
     MustChangePassword {
@@ -48,6 +71,7 @@ enum ScreenState {
         new_account_role: String,
         new_account_password: String,
         error: Option<String>,
+        notice: Option<String>,
         in_flight: bool,
     },
 }
@@ -55,6 +79,7 @@ enum ScreenState {
 struct ControllerApp {
     config: ControllerConfig,
     state: ScreenState,
+    overlay: Overlay,
     active_field: ActiveField,
     focus_handle: FocusHandle,
     tokio_handle: tokio::runtime::Handle,
@@ -96,8 +121,10 @@ impl ControllerApp {
                 username: String::new(),
                 password: String::new(),
                 error: None,
+                notice: None,
                 in_flight: false,
             },
+            overlay: Overlay::None,
             active_field: ActiveField::Username,
             focus_handle,
             tokio_handle,
@@ -118,6 +145,7 @@ impl ControllerApp {
                         username: username.clone(),
                         password: password.clone(),
                         error: Some("Username and password are required.".into()),
+                        notice: None,
                         in_flight: false,
                     };
                     cx.notify();
@@ -132,6 +160,7 @@ impl ControllerApp {
             username: username.clone(),
             password: password.clone(),
             error: None,
+            notice: None,
             in_flight: true,
         };
         cx.notify();
@@ -180,6 +209,7 @@ impl ControllerApp {
                                 new_account_role: "operator".into(),
                                 new_account_password: String::new(),
                                 error: None,
+                                notice: None,
                                 in_flight: false,
                             };
                             view.fetch_status(token, cx);
@@ -194,6 +224,7 @@ impl ControllerApp {
                                 username: username.clone(),
                                 password: password.clone(),
                                 error: Some(err.to_string()),
+                                notice: None,
                                 in_flight: false,
                             };
                         }
@@ -207,6 +238,7 @@ impl ControllerApp {
                                 username: username.clone(),
                                 password: password.clone(),
                                 error: Some(join_err.to_string()),
+                                notice: None,
                                 in_flight: false,
                             };
                         }
@@ -306,6 +338,7 @@ impl ControllerApp {
                             new_account_role: "operator".into(),
                             new_account_password: String::new(),
                             error: None,
+                            notice: None,
                             in_flight: false,
                         };
                         view.fetch_status(session_token, cx);
@@ -370,8 +403,11 @@ impl ControllerApp {
             username: String::new(),
             password: String::new(),
             error: None,
+            notice: None,
             in_flight: false,
         };
+        // Any open password form belongs to the session being left behind.
+        self.overlay = Overlay::None;
         self.active_field = ActiveField::Username;
         cx.notify();
 
@@ -437,6 +473,7 @@ impl ControllerApp {
                     new_account_password,
                     in_flight,
                     error,
+                    notice,
                     ..
                 } = &mut view.state
                     && *tok == tok_for_update
@@ -449,6 +486,7 @@ impl ControllerApp {
                                 Vec::new()
                             };
                             let keep_error = error.clone();
+                            let keep_notice = notice.clone();
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
                                 username: reply.username,
@@ -460,6 +498,7 @@ impl ControllerApp {
                                 new_account_role: new_account_role.clone(),
                                 new_account_password: new_account_password.clone(),
                                 error: keep_error,
+                                notice: keep_notice,
                                 in_flight: *in_flight,
                             };
                         }
@@ -475,6 +514,7 @@ impl ControllerApp {
                                 new_account_role: new_account_role.clone(),
                                 new_account_password: new_account_password.clone(),
                                 error: Some(err.to_string()),
+                                notice: notice.clone(),
                                 in_flight: false,
                             };
                         }
@@ -490,6 +530,7 @@ impl ControllerApp {
                                 new_account_role: new_account_role.clone(),
                                 new_account_password: new_account_password.clone(),
                                 error: Some(e.to_string()),
+                                notice: notice.clone(),
                                 in_flight: false,
                             };
                         }
@@ -658,7 +699,669 @@ impl ControllerApp {
         .detach();
     }
 
+    fn open_change_password(&mut self, cx: &mut Context<Self>) {
+        if let ScreenState::Connected { .. } = &self.state {
+            self.overlay = Overlay::ChangePassword {
+                current_password: String::new(),
+                new_password: String::new(),
+                confirm_password: String::new(),
+                error: None,
+                in_flight: false,
+            };
+            self.active_field = ActiveField::CurrentPassword;
+            cx.notify();
+        }
+    }
+
+    fn open_reset_password(&mut self, target_username: String, cx: &mut Context<Self>) {
+        if let ScreenState::Connected { role, .. } = &self.state
+            && role == "admin"
+        {
+            self.overlay = Overlay::ResetPassword {
+                target_username,
+                temporary_password: String::new(),
+                confirm_password: String::new(),
+                error: None,
+                in_flight: false,
+            };
+            self.active_field = ActiveField::TemporaryPassword;
+            cx.notify();
+        }
+    }
+
+    fn close_overlay(&mut self, cx: &mut Context<Self>) {
+        self.overlay = Overlay::None;
+        self.active_field = ActiveField::NewAccountUsername;
+        cx.notify();
+    }
+
+    fn submit_change_password(&mut self, cx: &mut Context<Self>) {
+        let (session_token, current, new_password) = match &mut self.overlay {
+            Overlay::ChangePassword {
+                current_password,
+                new_password,
+                confirm_password,
+                error,
+                in_flight,
+            } if !*in_flight => {
+                if current_password.is_empty() {
+                    *error = Some("Current password is required.".into());
+                    cx.notify();
+                    return;
+                }
+                if new_password.len() < 8 {
+                    *error = Some("New password must contain at least 8 characters.".into());
+                    cx.notify();
+                    return;
+                }
+                if new_password != confirm_password {
+                    *error = Some("Passwords do not match.".into());
+                    cx.notify();
+                    return;
+                }
+                let token = match &self.state {
+                    ScreenState::Connected { session_token, .. } => session_token.clone(),
+                    _ => return,
+                };
+                *in_flight = true;
+                *error = None;
+                (token, current_password.clone(), new_password.clone())
+            }
+            _ => return,
+        };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(ChangeOwnPasswordRequest {
+                        current_password: current,
+                        new_password,
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    client.change_own_password(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(Ok(())) => {
+                        // Ignore the result if the user left this session meanwhile.
+                        if matches!(
+                            &view.state,
+                            ScreenState::Connected { session_token, .. } if *session_token == tok_check
+                        ) {
+                            view.overlay = Overlay::None;
+                            view.active_field = ActiveField::NewAccountUsername;
+                            if let ScreenState::Connected { notice, .. } = &mut view.state {
+                                *notice = Some("Password changed successfully.".into());
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if let Overlay::ChangePassword {
+                            error, in_flight, ..
+                        } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(err.to_string());
+                        }
+                    }
+                    Err(join_err) => {
+                        if let Overlay::ChangePassword {
+                            error, in_flight, ..
+                        } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(join_err.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_reset_password(&mut self, cx: &mut Context<Self>) {
+        let (session_token, target, temporary) = match &mut self.overlay {
+            Overlay::ResetPassword {
+                target_username,
+                temporary_password,
+                confirm_password,
+                error,
+                in_flight,
+            } if !*in_flight => {
+                if temporary_password.len() < 8 {
+                    *error = Some("Temporary password must contain at least 8 characters.".into());
+                    cx.notify();
+                    return;
+                }
+                if temporary_password != confirm_password {
+                    *error = Some("Passwords do not match.".into());
+                    cx.notify();
+                    return;
+                }
+                let token = match &self.state {
+                    ScreenState::Connected { session_token, .. } => session_token.clone(),
+                    _ => return,
+                };
+                *in_flight = true;
+                *error = None;
+                (token, target_username.clone(), temporary_password.clone())
+            }
+            _ => return,
+        };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let target_label = target.clone();
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(ResetStaffPasswordRequest {
+                        username: target,
+                        temporary_password: temporary,
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    client.reset_staff_password(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(Ok(())) => {
+                        // Ignore the result if the user left this session meanwhile.
+                        if matches!(
+                            &view.state,
+                            ScreenState::Connected { session_token, .. } if *session_token == tok_check
+                        ) {
+                            let self_reset = matches!(
+                                &view.state,
+                                ScreenState::Connected { username, .. } if *username == target_label
+                            );
+                            view.overlay = Overlay::None;
+                            view.active_field = ActiveField::Username;
+                            if self_reset {
+                                // Resetting the own account revokes this session by design.
+                                view.state = ScreenState::Login {
+                                    username: target_label,
+                                    password: String::new(),
+                                    error: None,
+                                    notice: Some(
+                                        "Account reset to a temporary password and this session was revoked. Sign in with the temporary password."
+                                            .into(),
+                                    ),
+                                    in_flight: false,
+                                };
+                            } else {
+                                if let ScreenState::Connected {
+                                    notice,
+                                    session_token,
+                                    ..
+                                } = &mut view.state
+                                {
+                                    *notice = Some(
+                                        "Temporary password set; all target sessions revoked."
+                                            .into(),
+                                    );
+                                    let token = session_token.clone();
+                                    view.fetch_status(token, cx);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if let Overlay::ResetPassword {
+                            error, in_flight, ..
+                        } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(err.to_string());
+                        }
+                    }
+                    Err(join_err) => {
+                        if let Overlay::ResetPassword {
+                            error, in_flight, ..
+                        } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(join_err.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_overlay_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        match &self.overlay {
+            Overlay::ChangePassword {
+                current_password,
+                new_password,
+                confirm_password,
+                error,
+                in_flight,
+            } => {
+                let current_active = self.active_field == ActiveField::CurrentPassword;
+                let new_active = self.active_field == ActiveField::NewPassword;
+                let conf_active = self.active_field == ActiveField::ConfirmPassword;
+                let masked_current = "•".repeat(current_password.len());
+                let masked_new = "•".repeat(new_password.len());
+                let masked_conf = "•".repeat(confirm_password.len());
+
+                div()
+                    .mt_4()
+                    .p_4()
+                    .bg(rgb(0x16212e))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x2a3b4c))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(gpui::px(450.0))
+                    .child(div().text_lg().child("Change My Password"))
+                    .child("Current Password:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if current_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("cp-current-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::CurrentPassword;
+                                cx.notify();
+                            }))
+                            .child(if current_password.is_empty() {
+                                "Enter current password...".to_string()
+                            } else {
+                                masked_current
+                            }),
+                    )
+                    .child("New Password:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if new_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("cp-new-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::NewPassword;
+                                cx.notify();
+                            }))
+                            .child(if new_password.is_empty() {
+                                "Minimum 8 characters...".to_string()
+                            } else {
+                                masked_new
+                            }),
+                    )
+                    .child("Confirm New Password:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if conf_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("cp-confirm-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::ConfirmPassword;
+                                cx.notify();
+                            }))
+                            .child(if confirm_password.is_empty() {
+                                "Re-enter new password...".to_string()
+                            } else {
+                                masked_conf
+                            }),
+                    )
+                    .children(
+                        error.as_ref().map(|err| {
+                            div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(if *in_flight {
+                                        rgb(0x556677)
+                                    } else {
+                                        rgb(0x2d884d)
+                                    })
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("cp-submit-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_change_password(cx);
+                                    }))
+                                    .child(if *in_flight {
+                                        "Updating..."
+                                    } else {
+                                        "Update Password"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(rgb(0x445566))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("cp-cancel-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_overlay(cx);
+                                    }))
+                                    .child("Cancel"),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            Overlay::ResetPassword {
+                target_username,
+                temporary_password,
+                confirm_password,
+                error,
+                in_flight,
+            } => {
+                let temp_active = self.active_field == ActiveField::TemporaryPassword;
+                let conf_active = self.active_field == ActiveField::ConfirmPassword;
+                let masked_temp = "•".repeat(temporary_password.len());
+                let masked_conf = "•".repeat(confirm_password.len());
+
+                div()
+                    .mt_4()
+                    .p_4()
+                    .bg(rgb(0x16212e))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x2a3b4c))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(gpui::px(450.0))
+                    .child(div().text_lg().child(format!(
+                        "Reset Password for '{target_username}'"
+                    )))
+                    .child(
+                        div().text_sm().text_color(rgb(0xffcc00)).child(
+                            "The account receives a temporary password, must replace it at next login, and all of its staff sessions are revoked.",
+                        ),
+                    )
+                    .child("Temporary Password:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if temp_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("rp-temp-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::TemporaryPassword;
+                                cx.notify();
+                            }))
+                            .child(if temporary_password.is_empty() {
+                                "Minimum 8 characters...".to_string()
+                            } else {
+                                masked_temp
+                            }),
+                    )
+                    .child("Confirm Temporary Password:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if conf_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("rp-confirm-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::ConfirmPassword;
+                                cx.notify();
+                            }))
+                            .child(if confirm_password.is_empty() {
+                                "Re-enter temporary password...".to_string()
+                            } else {
+                                masked_conf
+                            }),
+                    )
+                    .children(error.as_ref().map(|err| {
+                        div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(if *in_flight {
+                                        rgb(0x556677)
+                                    } else {
+                                        rgb(0xaa5533)
+                                    })
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("rp-submit-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_reset_password(cx);
+                                    }))
+                                    .child(if *in_flight {
+                                        "Resetting..."
+                                    } else {
+                                        "Reset to Temporary Password"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(rgb(0x445566))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("rp-cancel-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_overlay(cx);
+                                    }))
+                                    .child("Cancel"),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            Overlay::None => div().into_any_element(),
+        }
+    }
+
+    fn handle_overlay_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = &event.keystroke.key;
+        let change_active = matches!(
+            (&self.overlay, self.active_field),
+            (Overlay::ChangePassword { .. }, ActiveField::CurrentPassword)
+                | (
+                    Overlay::ResetPassword { .. },
+                    ActiveField::TemporaryPassword
+                )
+        );
+        let is_change = matches!(self.overlay, Overlay::ChangePassword { .. });
+        let in_flight = match &self.overlay {
+            Overlay::ChangePassword { in_flight, .. }
+            | Overlay::ResetPassword { in_flight, .. } => *in_flight,
+            Overlay::None => false,
+        };
+        if in_flight {
+            return;
+        }
+        match key.as_str() {
+            "enter" => {
+                if is_change {
+                    self.submit_change_password(cx);
+                } else {
+                    self.submit_reset_password(cx);
+                }
+            }
+            "tab" => {
+                self.active_field = match (is_change, change_active) {
+                    (true, true) => ActiveField::NewPassword,
+                    (true, _) if self.active_field == ActiveField::NewPassword => {
+                        ActiveField::ConfirmPassword
+                    }
+                    (true, _) => ActiveField::CurrentPassword,
+                    (false, true) => ActiveField::ConfirmPassword,
+                    (false, _) => ActiveField::TemporaryPassword,
+                };
+                cx.notify();
+            }
+            "backspace" => {
+                match (&mut self.overlay, self.active_field) {
+                    (
+                        Overlay::ChangePassword {
+                            current_password, ..
+                        },
+                        ActiveField::CurrentPassword,
+                    ) => {
+                        current_password.pop();
+                    }
+                    (Overlay::ChangePassword { new_password, .. }, ActiveField::NewPassword) => {
+                        new_password.pop();
+                    }
+                    (
+                        Overlay::ChangePassword {
+                            confirm_password, ..
+                        },
+                        ActiveField::ConfirmPassword,
+                    ) => {
+                        confirm_password.pop();
+                    }
+                    (
+                        Overlay::ResetPassword {
+                            temporary_password, ..
+                        },
+                        ActiveField::TemporaryPassword,
+                    ) => {
+                        temporary_password.pop();
+                    }
+                    (
+                        Overlay::ResetPassword {
+                            confirm_password, ..
+                        },
+                        ActiveField::ConfirmPassword,
+                    ) => {
+                        confirm_password.pop();
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            }
+            k if k.chars().count() == 1 => {
+                let c = k.chars().next().unwrap();
+                if !c.is_control() {
+                    match (&mut self.overlay, self.active_field) {
+                        (
+                            Overlay::ChangePassword {
+                                current_password, ..
+                            },
+                            ActiveField::CurrentPassword,
+                        ) => {
+                            current_password.push(c);
+                        }
+                        (
+                            Overlay::ChangePassword { new_password, .. },
+                            ActiveField::NewPassword,
+                        ) => {
+                            new_password.push(c);
+                        }
+                        (
+                            Overlay::ChangePassword {
+                                confirm_password, ..
+                            },
+                            ActiveField::ConfirmPassword,
+                        ) => {
+                            confirm_password.push(c);
+                        }
+                        (
+                            Overlay::ResetPassword {
+                                temporary_password, ..
+                            },
+                            ActiveField::TemporaryPassword,
+                        ) => {
+                            temporary_password.push(c);
+                        }
+                        (
+                            Overlay::ResetPassword {
+                                confirm_password, ..
+                            },
+                            ActiveField::ConfirmPassword,
+                        ) => {
+                            confirm_password.push(c);
+                        }
+                        _ => {}
+                    }
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !matches!(self.overlay, Overlay::None) {
+            self.handle_overlay_key_down(event, cx);
+            return;
+        }
         let key = &event.keystroke.key;
         match &mut self.state {
             ScreenState::Login {
@@ -836,6 +1539,7 @@ impl Render for ControllerApp {
                 username,
                 password,
                 error,
+                notice,
                 in_flight,
             } => {
                 let user_active = self.active_field == ActiveField::Username;
@@ -846,6 +1550,14 @@ impl Render for ControllerApp {
                     .child(div().text_3xl().child("RustCtrl"))
                     .child("Staff Access · Please Sign In")
                     .child(format!("Server: {}", self.config.server.endpoint))
+                    .children(notice.as_ref().map(|note| {
+                        div()
+                            .id("login-notice")
+                            .text_color(rgb(0x44cc44))
+                            .text_sm()
+                            .max_w(gpui::px(400.0))
+                            .child(note.clone())
+                    }))
                     .child(
                         div()
                             .flex()
@@ -1058,6 +1770,7 @@ impl Render for ControllerApp {
                 new_account_role,
                 new_account_password,
                 error,
+                notice,
                 in_flight,
                 ..
             } => {
@@ -1082,17 +1795,36 @@ impl Render for ControllerApp {
                         )
                         .child(
                             div()
-                                .px_4()
-                                .py_2()
-                                .bg(rgb(0x883333))
-                                .text_color(rgb(0xffffff))
-                                .rounded_md()
-                                .cursor_pointer()
-                                .id("signout-btn")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.submit_logout(cx);
-                                }))
-                                .child("Sign Out"),
+                                .flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .px_4()
+                                        .py_2()
+                                        .bg(rgb(0x2d5a88))
+                                        .text_color(rgb(0xffffff))
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .id("change-password-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_change_password(cx);
+                                        }))
+                                        .child("Change Password"),
+                                )
+                                .child(
+                                    div()
+                                        .px_4()
+                                        .py_2()
+                                        .bg(rgb(0x883333))
+                                        .text_color(rgb(0xffffff))
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .id("signout-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.submit_logout(cx);
+                                        }))
+                                        .child("Sign Out"),
+                                ),
                         ),
                 );
 
@@ -1106,7 +1838,19 @@ impl Render for ControllerApp {
                     );
                 }
 
-                if is_admin {
+                if let Some(note) = notice {
+                    content = content.child(
+                        div()
+                            .id("connected-notice")
+                            .text_color(rgb(0x44cc44))
+                            .text_sm()
+                            .child(note.clone()),
+                    );
+                }
+
+                if !matches!(self.overlay, Overlay::None) {
+                    content = content.child(self.render_overlay_form(cx));
+                } else if is_admin {
                     let user_active = self.active_field == ActiveField::NewAccountUsername;
                     let pass_active = self.active_field == ActiveField::NewAccountPassword;
                     let masked_new_pass = "•".repeat(new_account_password.len());
@@ -1136,7 +1880,7 @@ impl Render for ControllerApp {
                             .child(div().w(gpui::px(140.0)).child("Username"))
                             .child(div().w(gpui::px(100.0)).child("Role"))
                             .child(div().w(gpui::px(160.0)).child("Status"))
-                            .child(div().w(gpui::px(160.0)).child("Action"));
+                            .child(div().w(gpui::px(310.0)).child("Actions"));
                         accounts_list = accounts_list.child(header_row);
 
                         for acc in accounts {
@@ -1157,6 +1901,7 @@ impl Render for ControllerApp {
                             };
 
                             let target_user_clone = acc_username.clone();
+                            let reset_target_clone = acc_username.clone();
                             let new_target_role_str = new_target_role.to_string();
 
                             let row = div()
@@ -1190,25 +1935,51 @@ impl Render for ControllerApp {
                                         }),
                                 )
                                 .child(
-                                    div().w(gpui::px(160.0)).child(
-                                        div()
-                                            .px_2()
-                                            .py_1()
-                                            .bg(if *in_flight { rgb(0x556677) } else { btn_bg })
-                                            .text_color(rgb(0xffffff))
-                                            .rounded_md()
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .id(format!("role-btn-{}", acc_username))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.submit_change_role(
-                                                    target_user_clone.clone(),
-                                                    new_target_role_str.clone(),
-                                                    cx,
-                                                );
-                                            }))
-                                            .child(btn_label),
-                                    ),
+                                    div()
+                                        .w(gpui::px(310.0))
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .bg(if *in_flight { rgb(0x556677) } else { btn_bg })
+                                                .text_color(rgb(0xffffff))
+                                                .rounded_md()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .id(format!("role-btn-{}", acc_username))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.submit_change_role(
+                                                        target_user_clone.clone(),
+                                                        new_target_role_str.clone(),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child(btn_label),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .bg(if *in_flight {
+                                                    rgb(0x556677)
+                                                } else {
+                                                    rgb(0x883333)
+                                                })
+                                                .text_color(rgb(0xffffff))
+                                                .rounded_md()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .id(format!("reset-btn-{}", acc_username))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.open_reset_password(
+                                                        reset_target_clone.clone(),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child("Reset Password"),
+                                        ),
                                 );
                             accounts_list = accounts_list.child(row);
                         }
