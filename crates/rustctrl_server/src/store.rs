@@ -589,10 +589,11 @@ impl DeviceStore {
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-            let count: i64 =
-                connection.query_row("SELECT COUNT(*) FROM bootstrap_devices", [], |row| {
-                    row.get(0)
-                })?;
+            let count: i64 = connection.query_row(
+                "SELECT (SELECT COUNT(*) FROM bootstrap_devices) + (SELECT COUNT(*) FROM connection_targets)",
+                [],
+                |row| row.get(0),
+            )?;
             Ok(u64::try_from(count)?)
         })
         .await?

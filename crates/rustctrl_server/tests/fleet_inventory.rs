@@ -1041,6 +1041,15 @@ async fn admin_manages_android_tv_connection_targets_as_unverified_inventory_ent
     assert_eq!(admin_view.devices[0].device_id, target_id);
     assert_eq!(admin_view.devices[0].status, "unverified");
 
+    let status_after_target = admin_client
+        .get_staff_status(authorized(&alice_session, StaffStatusRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_after_target.registered_devices, 1,
+        "fleet count must include connection targets"
+    );
+
     // Connect a Windows agent: now inventory contains both Windows and Android TV target.
     agent_heartbeat(&pki_dir, &server.endpoint, win_device_id).await?;
 
@@ -1049,6 +1058,14 @@ async fn admin_manages_android_tv_connection_targets_as_unverified_inventory_ent
         .await?
         .into_inner();
     assert_eq!(multi_view.devices.len(), 2);
+    let status_multi = admin_client
+        .get_staff_status(authorized(&alice_session, StaffStatusRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_multi.registered_devices, 2,
+        "fleet count must include both bootstrap devices and connection targets"
+    );
     let win_entry = multi_view
         .devices
         .iter()
@@ -1174,6 +1191,14 @@ async fn admin_manages_android_tv_connection_targets_as_unverified_inventory_ent
         .into_inner();
     assert_eq!(after_removal_view.devices.len(), 1);
     assert_eq!(after_removal_view.devices[0].device_type, "windows");
+    let status_after_removal = client
+        .get_staff_status(authorized(&alice_restarted, StaffStatusRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_after_removal.registered_devices, 1,
+        "fleet count must decrease when a target is removed"
+    );
 
     // Removing non-existent target returns NotFound.
     let remove_nonexistent_err = client
