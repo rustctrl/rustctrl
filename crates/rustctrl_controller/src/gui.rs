@@ -303,9 +303,10 @@ impl ControllerApp {
                         .into_inner();
                     // The saved credential reflects the latest explicit login
                     // choice; the staff password is never stored. File work
-                    // stays off the UI thread.
-                    if remember {
-                        let _ = crate::session::save(
+                    // stays off the UI thread and failures are surfaced
+                    // instead of silently leaving a stale credential.
+                    let persistence_warning = if remember {
+                        crate::session::save(
                             &session_path,
                             &crate::session::SavedStaffSession {
                                 endpoint: scope_endpoint,
@@ -313,17 +314,24 @@ impl ControllerApp {
                                 username: reply.username.clone(),
                                 session_token: reply.session_token.clone(),
                             },
-                        );
+                        )
+                        .err()
+                        .map(|error| format!("could not save the remembered login: {error}"))
+                    } else if session_path.exists() {
+                        crate::session::clear(&session_path).err().map(|error| {
+                            format!("could not remove the previous remembered login: {error}")
+                        })
                     } else {
-                        let _ = crate::session::clear(&session_path);
-                    }
-                    Ok::<_, anyhow::Error>(reply)
+                        None
+                    };
+                    Ok::<_, anyhow::Error>((reply, persistence_warning))
                 })
                 .await;
 
             let _ = this.update(cx, |view, cx| {
                 match res {
-                    Ok(Ok(reply)) => {
+                    Ok(Ok((reply, persistence_warning))) => {
+                        let warning = persistence_warning.map(|text| format!("Warning: {text}."));
                         if reply.must_change_password {
                             view.state = ScreenState::MustChangePassword {
                                 session_token: reply.session_token,
@@ -331,7 +339,7 @@ impl ControllerApp {
                                 role: reply.role,
                                 new_password: String::new(),
                                 confirm_password: String::new(),
-                                error: None,
+                                error: warning,
                                 in_flight: false,
                             };
                             view.active_field = ActiveField::NewPassword;
@@ -348,7 +356,7 @@ impl ControllerApp {
                                 new_account_role: "operator".into(),
                                 new_account_password: String::new(),
                                 error: None,
-                                notice: None,
+                                notice: warning,
                                 in_flight: false,
                             };
                             view.fetch_status(token, cx);
@@ -847,7 +855,10 @@ impl ControllerApp {
                         *error = Some(text);
                     }
                 }
-                if res.is_ok() {
+                // Only a successful RPC justifies the deactivation effects; a
+                // rejected request (for example the last active Admin) keeps
+                // the session and shows the Server's error above.
+                if matches!(res, Ok(Ok(()))) {
                     let self_deactivate = matches!(
                         &view.state,
                         ScreenState::Connected { username, session_token, .. }

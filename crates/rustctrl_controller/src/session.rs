@@ -32,9 +32,28 @@ pub fn session_file_path(config_path: &Path) -> PathBuf {
 
 pub fn save(path: &Path, session: &SavedStaffSession) -> Result<()> {
     let body = toml::to_string_pretty(session).context("serialize saved staff session")?;
-    std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
-    restrict_permissions(path);
-    Ok(())
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Create with mode 0600 so no credential byte is ever observable
+        // through a more permissive file, regardless of the process umask.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("create {}", path.display()))?;
+        file.write_all(body.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, &body).with_context(|| format!("write {}", path.display()))?;
+    }
+    // Tighten a pre-existing file that may carry looser permissions.
+    restrict_permissions(path)
 }
 
 pub fn load(path: &Path) -> Result<Option<SavedStaffSession>> {
@@ -59,10 +78,16 @@ pub fn clear(path: &Path) -> Result<()> {
     }
 }
 
-fn restrict_permissions(path: &Path) {
+fn restrict_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restrict permissions on {}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
