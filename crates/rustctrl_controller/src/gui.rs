@@ -172,8 +172,14 @@ impl ControllerApp {
                                 || status.code() == tonic::Code::PermissionDenied =>
                         {
                             // Dead credential: stop restoring it on later
-                            // launches; file work stays off the UI thread.
-                            let _ = crate::session::clear(&clear_path);
+                            // launches — but only when the file still holds
+                            // the rejected token, so a fresh remembered login
+                            // that raced this slow check is preserved.
+                            if let Ok(Some(stored)) = crate::session::load(&clear_path)
+                                && stored.session_token == token
+                            {
+                                let _ = crate::session::clear(&clear_path);
+                            }
                             Err(RestoreFailure::ExpiredOrRevoked)
                         }
                         Err(status) => Err(RestoreFailure::ServerUnavailable(status.to_string())),
@@ -573,6 +579,15 @@ impl ControllerApp {
         cx.spawn(async move |_this, _cx| {
             let _ = handle
                 .spawn(async move {
+                    // Remove the remembered credential for this session first,
+                    // independent of the logout RPC: a slow or unreachable
+                    // Server must not leave a still-restorable credential
+                    // behind after the user explicitly signed out.
+                    if let Ok(Some(saved)) = crate::session::load(&session_path)
+                        && saved.session_token == session_token
+                    {
+                        let _ = crate::session::clear(&session_path);
+                    }
                     if let Ok(mut client) = rustctrl_network::connect_staff_auth(&client_cfg).await
                     {
                         let mut req = tonic::Request::new(LogoutRequest {});
@@ -580,13 +595,6 @@ impl ControllerApp {
                             req.metadata_mut().insert("authorization", val);
                             let _ = client.logout(req).await;
                         }
-                    }
-                    // Drop the remembered credential only when it is this
-                    // session; other Controllers keep their own sessions.
-                    if let Ok(Some(saved)) = crate::session::load(&session_path)
-                        && saved.session_token == session_token
-                    {
-                        let _ = crate::session::clear(&session_path);
                     }
                 })
                 .await;
