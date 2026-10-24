@@ -44,6 +44,7 @@ enum Overlay {
         in_flight: bool,
     },
     EditDevice {
+        request_id: u64,
         device_id: String,
         display_name: String,
         location: String,
@@ -101,8 +102,31 @@ struct ControllerApp {
     active_field: ActiveField,
     focus_handle: FocusHandle,
     tokio_handle: tokio::runtime::Handle,
+    next_edit_device_request_id: u64,
     _refresh: Task<()>,
     _restore: Option<Task<()>>,
+}
+
+fn resolve_typed_text(keystroke: &gpui::Keystroke) -> Option<&str> {
+    if keystroke.modifiers.control || keystroke.modifiers.platform {
+        return None;
+    }
+    if let Some(kc) = keystroke.key_char.as_deref()
+        && !kc.is_empty()
+        && !kc.chars().any(|c| c.is_control())
+    {
+        return Some(kc);
+    }
+    if keystroke.key == "space" {
+        return Some(" ");
+    }
+    if keystroke.key.chars().count() == 1 {
+        let c = keystroke.key.chars().next().unwrap();
+        if !c.is_control() {
+            return Some(&keystroke.key);
+        }
+    }
+    None
 }
 
 impl ControllerApp {
@@ -260,6 +284,7 @@ impl ControllerApp {
             active_field: ActiveField::Username,
             focus_handle,
             tokio_handle,
+            next_edit_device_request_id: 0,
             _refresh: refresh,
             _restore: Some(restore),
         }
@@ -1039,10 +1064,19 @@ impl ControllerApp {
         location: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if let Overlay::EditDevice {
+            in_flight: true, ..
+        } = self.overlay
+        {
+            return;
+        }
         if let ScreenState::Connected { role, .. } = &self.state
             && role == "admin"
         {
+            self.next_edit_device_request_id = self.next_edit_device_request_id.wrapping_add(1);
+            let request_id = self.next_edit_device_request_id;
             self.overlay = Overlay::EditDevice {
+                request_id,
                 device_id,
                 display_name,
                 location: location.unwrap_or_default(),
@@ -1286,50 +1320,53 @@ impl ControllerApp {
     }
 
     fn submit_edit_device(&mut self, cx: &mut Context<Self>) {
-        let (session_token, target_id, target_name, target_location) = match &mut self.overlay {
-            Overlay::EditDevice {
-                device_id,
-                display_name,
-                location,
-                error,
-                in_flight,
-            } if !*in_flight => {
-                let trimmed_name = display_name.trim();
-                if trimmed_name.is_empty() {
-                    *error = Some("Display name cannot be empty.".into());
-                    cx.notify();
-                    return;
+        let (request_id, session_token, target_id, target_name, target_location) =
+            match &mut self.overlay {
+                Overlay::EditDevice {
+                    request_id,
+                    device_id,
+                    display_name,
+                    location,
+                    error,
+                    in_flight,
+                } if !*in_flight => {
+                    let trimmed_name = display_name.trim();
+                    if trimmed_name.is_empty() {
+                        *error = Some("Display name cannot be empty.".into());
+                        cx.notify();
+                        return;
+                    }
+                    if trimmed_name.len() > 128 {
+                        *error = Some("Display name must not exceed 128 characters.".into());
+                        cx.notify();
+                        return;
+                    }
+                    let trimmed_loc = location.trim();
+                    if trimmed_loc.len() > 128 {
+                        *error = Some("Location must not exceed 128 characters.".into());
+                        cx.notify();
+                        return;
+                    }
+                    let token = match &self.state {
+                        ScreenState::Connected { session_token, .. } => session_token.clone(),
+                        _ => return,
+                    };
+                    *in_flight = true;
+                    *error = None;
+                    (
+                        *request_id,
+                        token,
+                        device_id.clone(),
+                        trimmed_name.to_string(),
+                        if trimmed_loc.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed_loc.to_string())
+                        },
+                    )
                 }
-                if trimmed_name.len() > 128 {
-                    *error = Some("Display name must not exceed 128 characters.".into());
-                    cx.notify();
-                    return;
-                }
-                let trimmed_loc = location.trim();
-                if trimmed_loc.len() > 128 {
-                    *error = Some("Location must not exceed 128 characters.".into());
-                    cx.notify();
-                    return;
-                }
-                let token = match &self.state {
-                    ScreenState::Connected { session_token, .. } => session_token.clone(),
-                    _ => return,
-                };
-                *in_flight = true;
-                *error = None;
-                (
-                    token,
-                    device_id.clone(),
-                    trimmed_name.to_string(),
-                    if trimmed_loc.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed_loc.to_string())
-                    },
-                )
-            }
-            _ => return,
-        };
+                _ => return,
+            };
         cx.notify();
 
         let client_cfg = self.config.server.clone();
@@ -1354,9 +1391,28 @@ impl ControllerApp {
                 .await;
 
             let _ = this.update(cx, |view, cx| {
+                let is_same_session = match &view.state {
+                    ScreenState::Connected { session_token, .. } => session_token == &tok_check,
+                    _ => false,
+                };
+                if !is_same_session {
+                    return;
+                }
+
+                let is_matching_form = match &view.overlay {
+                    Overlay::EditDevice {
+                        request_id: current_req_id,
+                        device_id: current_dev_id,
+                        ..
+                    } => *current_req_id == request_id && current_dev_id == &device_id_label,
+                    _ => false,
+                };
+
                 match res {
                     Ok(Ok(())) => {
-                        view.close_overlay(cx);
+                        if is_matching_form {
+                            view.close_overlay(cx);
+                        }
                         if let ScreenState::Connected { notice, .. } = &mut view.state {
                             *notice = Some(format!("Updated device '{device_id_label}'."));
                             let token = tok_check.clone();
@@ -1364,18 +1420,20 @@ impl ControllerApp {
                         }
                     }
                     Ok(Err(err)) => {
-                        if let Overlay::EditDevice {
-                            error, in_flight, ..
-                        } = &mut view.overlay
+                        if is_matching_form
+                            && let Overlay::EditDevice {
+                                error, in_flight, ..
+                            } = &mut view.overlay
                         {
                             *in_flight = false;
                             *error = Some(err.to_string());
                         }
                     }
                     Err(join_err) => {
-                        if let Overlay::EditDevice {
-                            error, in_flight, ..
-                        } = &mut view.overlay
+                        if is_matching_form
+                            && let Overlay::EditDevice {
+                                error, in_flight, ..
+                            } = &mut view.overlay
                         {
                             *in_flight = false;
                             *error = Some(join_err.to_string());
@@ -1667,6 +1725,7 @@ impl ControllerApp {
                 location,
                 error,
                 in_flight,
+                ..
             } => {
                 let name_active = self.active_field == ActiveField::EditDeviceDisplayName;
                 let loc_active = self.active_field == ActiveField::EditDeviceLocation;
@@ -1876,9 +1935,8 @@ impl ControllerApp {
                 }
                 cx.notify();
             }
-            k if k.chars().count() == 1 => {
-                let c = k.chars().next().unwrap();
-                if !c.is_control() {
+            _ => {
+                if let Some(text) = resolve_typed_text(&event.keystroke) {
                     match (&mut self.overlay, self.active_field) {
                         (
                             Overlay::ChangePassword {
@@ -1886,13 +1944,13 @@ impl ControllerApp {
                             },
                             ActiveField::CurrentPassword,
                         ) => {
-                            current_password.push(c);
+                            current_password.push_str(text);
                         }
                         (
                             Overlay::ChangePassword { new_password, .. },
                             ActiveField::NewPassword,
                         ) => {
-                            new_password.push(c);
+                            new_password.push_str(text);
                         }
                         (
                             Overlay::ChangePassword {
@@ -1900,7 +1958,7 @@ impl ControllerApp {
                             },
                             ActiveField::ConfirmPassword,
                         ) => {
-                            confirm_password.push(c);
+                            confirm_password.push_str(text);
                         }
                         (
                             Overlay::ResetPassword {
@@ -1908,7 +1966,7 @@ impl ControllerApp {
                             },
                             ActiveField::TemporaryPassword,
                         ) => {
-                            temporary_password.push(c);
+                            temporary_password.push_str(text);
                         }
                         (
                             Overlay::ResetPassword {
@@ -1916,23 +1974,24 @@ impl ControllerApp {
                             },
                             ActiveField::ConfirmPassword,
                         ) => {
-                            confirm_password.push(c);
+                            confirm_password.push_str(text);
                         }
                         (
                             Overlay::EditDevice { display_name, .. },
                             ActiveField::EditDeviceDisplayName,
-                        ) => {
-                            display_name.push(c);
+                        ) if display_name.len() + text.len() <= 128 => {
+                            display_name.push_str(text);
                         }
-                        (Overlay::EditDevice { location, .. }, ActiveField::EditDeviceLocation) => {
-                            location.push(c);
+                        (Overlay::EditDevice { location, .. }, ActiveField::EditDeviceLocation)
+                            if location.len() + text.len() <= 128 =>
+                        {
+                            location.push_str(text);
                         }
                         _ => {}
                     }
                     cx.notify();
                 }
             }
-            _ => {}
         }
     }
 
@@ -2941,4 +3000,126 @@ pub fn open(config: ControllerConfig, config_path: std::path::PathBuf) -> Result
     });
     runtime.shutdown_background();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Keystroke, Modifiers};
+
+    #[test]
+    fn resolve_typed_text_handles_spaces_characters_and_key_char() {
+        // Space key with no key_char
+        let space_key = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "space".into(),
+            key_char: None,
+        };
+        assert_eq!(resolve_typed_text(&space_key), Some(" "));
+
+        // Key with key_char payload (e.g. non-ASCII or multi-word)
+        let thai_key = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "q".into(),
+            key_char: Some("ๆ".into()),
+        };
+        assert_eq!(resolve_typed_text(&thai_key), Some("ๆ"));
+
+        // Normal ASCII letter
+        let ascii_key = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "a".into(),
+            key_char: Some("a".into()),
+        };
+        assert_eq!(resolve_typed_text(&ascii_key), Some("a"));
+
+        // Control or command modifier should be ignored
+        let mut ctrl_s = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "s".into(),
+            key_char: Some("s".into()),
+        };
+        ctrl_s.modifiers.control = true;
+        assert_eq!(resolve_typed_text(&ctrl_s), None);
+
+        // Control character should be ignored
+        let enter_key = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "enter".into(),
+            key_char: Some("\n".into()),
+        };
+        assert_eq!(resolve_typed_text(&enter_key), None);
+    }
+
+    #[test]
+    fn typing_multiword_values_accumulates_correctly() {
+        let mut display_name = String::new();
+        let words = ["Reception", " ", "Front", " ", "Desk"];
+        for word in words {
+            for ch in word.chars() {
+                let ks = if ch == ' ' {
+                    Keystroke {
+                        modifiers: Modifiers::default(),
+                        key: "space".into(),
+                        key_char: None,
+                    }
+                } else {
+                    Keystroke {
+                        modifiers: Modifiers::default(),
+                        key: ch.to_string(),
+                        key_char: Some(ch.to_string()),
+                    }
+                };
+                if let Some(text) = resolve_typed_text(&ks) {
+                    display_name.push_str(text);
+                }
+            }
+        }
+        assert_eq!(display_name, "Reception Front Desk");
+    }
+
+    #[test]
+    fn edit_device_overlay_form_matching_checks_request_id_and_device_id() {
+        let overlay = Overlay::EditDevice {
+            request_id: 42,
+            device_id: "dev-abc".into(),
+            display_name: "Original Name".into(),
+            location: "Room 101".into(),
+            error: None,
+            in_flight: true,
+        };
+
+        // Matching request id and device id
+        let is_match = match &overlay {
+            Overlay::EditDevice {
+                request_id,
+                device_id,
+                ..
+            } => *request_id == 42 && device_id == "dev-abc",
+            _ => false,
+        };
+        assert!(is_match);
+
+        // Different request id (new form opened)
+        let is_stale = match &overlay {
+            Overlay::EditDevice {
+                request_id,
+                device_id,
+                ..
+            } => *request_id == 43 && device_id == "dev-abc",
+            _ => false,
+        };
+        assert!(!is_stale);
+
+        // Different device id
+        let is_diff_dev = match &overlay {
+            Overlay::EditDevice {
+                request_id,
+                device_id,
+                ..
+            } => *request_id == 42 && device_id == "dev-xyz",
+            _ => false,
+        };
+        assert!(!is_diff_dev);
+    }
 }
