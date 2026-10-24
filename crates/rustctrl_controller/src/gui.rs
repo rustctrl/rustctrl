@@ -130,9 +130,10 @@ impl ControllerApp {
         let restore_path = config_path.clone();
         let restore_handle = tokio_handle.clone();
         let restore = cx.spawn(async move |this, cx| {
-            let session_path = crate::session::session_file_path(&restore_path);
+            let load_path = crate::session::session_file_path(&restore_path);
+            let clear_path = load_path.clone();
             let saved = match restore_handle
-                .spawn(async move { crate::session::load(&session_path) })
+                .spawn(async move { crate::session::load(&load_path) })
                 .await
             {
                 Ok(Ok(Some(saved))) => Some(saved),
@@ -170,6 +171,9 @@ impl ControllerApp {
                             if status.code() == tonic::Code::Unauthenticated
                                 || status.code() == tonic::Code::PermissionDenied =>
                         {
+                            // Dead credential: stop restoring it on later
+                            // launches; file work stays off the UI thread.
+                            let _ = crate::session::clear(&clear_path);
                             Err(RestoreFailure::ExpiredOrRevoked)
                         }
                         Err(status) => Err(RestoreFailure::ServerUnavailable(status.to_string())),
@@ -177,7 +181,6 @@ impl ControllerApp {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                let session_path = crate::session::session_file_path(&view.config_path);
                 if let ScreenState::Login { .. } = view.state {
                     match outcome {
                         Ok(Ok(reply)) => {
@@ -201,8 +204,8 @@ impl ControllerApp {
                             }
                         }
                         Ok(Err(RestoreFailure::ExpiredOrRevoked)) => {
-                            // Dead credential: stop restoring it on later launches.
-                            let _ = crate::session::clear(&session_path);
+                            // The credential file was already cleared off the
+                            // UI thread when the outcome was produced.
                             if let ScreenState::Login { notice, .. } = &mut view.state {
                                 *notice =
                                     Some("Saved session expired or was revoked. Sign in.".into());
@@ -282,6 +285,9 @@ impl ControllerApp {
         cx.notify();
 
         let client_cfg = self.config.server.clone();
+        let session_path = crate::session::session_file_path(&self.config_path);
+        let scope_endpoint = self.config.server.endpoint.clone();
+        let scope_domain = self.config.server.domain_name.clone();
         let handle = self.tokio_handle.clone();
         cx.spawn(async move |this, cx| {
             let res = handle
@@ -295,6 +301,22 @@ impl ControllerApp {
                         })
                         .await?
                         .into_inner();
+                    // The saved credential reflects the latest explicit login
+                    // choice; the staff password is never stored. File work
+                    // stays off the UI thread.
+                    if remember {
+                        let _ = crate::session::save(
+                            &session_path,
+                            &crate::session::SavedStaffSession {
+                                endpoint: scope_endpoint,
+                                domain_name: scope_domain,
+                                username: reply.username.clone(),
+                                session_token: reply.session_token.clone(),
+                            },
+                        );
+                    } else {
+                        let _ = crate::session::clear(&session_path);
+                    }
                     Ok::<_, anyhow::Error>(reply)
                 })
                 .await;
@@ -302,22 +324,6 @@ impl ControllerApp {
             let _ = this.update(cx, |view, cx| {
                 match res {
                     Ok(Ok(reply)) => {
-                        // The saved credential reflects the latest explicit
-                        // login choice; the staff password is never stored.
-                        let session_path = crate::session::session_file_path(&view.config_path);
-                        if remember {
-                            let _ = crate::session::save(
-                                &session_path,
-                                &crate::session::SavedStaffSession {
-                                    endpoint: view.config.server.endpoint.clone(),
-                                    domain_name: view.config.server.domain_name.clone(),
-                                    username: reply.username.clone(),
-                                    session_token: reply.session_token.clone(),
-                                },
-                            );
-                        } else {
-                            let _ = crate::session::clear(&session_path);
-                        }
                         if reply.must_change_password {
                             view.state = ScreenState::MustChangePassword {
                                 session_token: reply.session_token,
@@ -802,6 +808,8 @@ impl ControllerApp {
         let tok = session_token.clone();
         let tok_check = session_token;
         let target_label = target_username.clone();
+        let session_path = crate::session::session_file_path(&self.config_path);
+        let deactivate_target = target_label.clone();
         cx.spawn(async move |this, cx| {
             let res = handle
                 .spawn(async move {
@@ -812,6 +820,14 @@ impl ControllerApp {
                     req.metadata_mut()
                         .insert("authorization", format!("Bearer {tok}").parse()?);
                     client.deactivate_staff_account(req).await?.into_inner();
+                    // Deactivating an account kills every session of that
+                    // account, so any saved credential for it is dead; file
+                    // work stays off the UI thread.
+                    if let Ok(Some(saved)) = crate::session::load(&session_path)
+                        && saved.username == deactivate_target
+                    {
+                        let _ = crate::session::clear(&session_path);
+                    }
                     Ok::<_, anyhow::Error>(())
                 })
                 .await;
@@ -839,12 +855,6 @@ impl ControllerApp {
                     );
                     if self_deactivate {
                         // Deactivating the own account revokes this session.
-                        let session_path = crate::session::session_file_path(&view.config_path);
-                        if let Ok(Some(saved)) = crate::session::load(&session_path)
-                            && saved.username == target_label
-                        {
-                            let _ = crate::session::clear(&session_path);
-                        }
                         view.state = ScreenState::Login {
                             username: target_label,
                             password: String::new(),
@@ -1111,6 +1121,8 @@ impl ControllerApp {
         let tok = session_token.clone();
         let tok_check = session_token;
         let target_label = target.clone();
+        let session_path = crate::session::session_file_path(&self.config_path);
+        let reset_target = target_label.clone();
         cx.spawn(async move |this, cx| {
             let res = handle
                 .spawn(async move {
@@ -1122,6 +1134,14 @@ impl ControllerApp {
                     req.metadata_mut()
                         .insert("authorization", format!("Bearer {tok}").parse()?);
                     client.reset_staff_password(req).await?.into_inner();
+                    // A self-reset kills every session of the account, so any
+                    // saved credential for it is dead; file work stays off the
+                    // UI thread.
+                    if let Ok(Some(saved)) = crate::session::load(&session_path)
+                        && saved.username == reset_target
+                    {
+                        let _ = crate::session::clear(&session_path);
+                    }
                     Ok::<_, anyhow::Error>(())
                 })
                 .await;
@@ -1142,13 +1162,6 @@ impl ControllerApp {
                             view.active_field = ActiveField::Username;
                             if self_reset {
                                 // Resetting the own account revokes this session by design.
-                                let session_path =
-                                    crate::session::session_file_path(&view.config_path);
-                                if let Ok(Some(saved)) = crate::session::load(&session_path)
-                                    && saved.username == target_label
-                                {
-                                    let _ = crate::session::clear(&session_path);
-                                }
                                 view.state = ScreenState::Login {
                                     username: target_label,
                                     password: String::new(),
