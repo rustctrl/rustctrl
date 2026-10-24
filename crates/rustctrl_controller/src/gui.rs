@@ -2034,22 +2034,20 @@ impl ControllerApp {
                         }
                         cx.notify();
                     }
-                    k if k.chars().count() == 1 => {
-                        let c = k.chars().next().unwrap();
-                        if !c.is_control() {
+                    _ => {
+                        if let Some(text) = resolve_typed_text(&event.keystroke) {
                             match self.active_field {
                                 ActiveField::Username => {
-                                    username.push(c);
+                                    username.push_str(text);
                                 }
                                 ActiveField::Password => {
-                                    password.push(c);
+                                    password.push_str(text);
                                 }
                                 _ => {}
                             }
                             cx.notify();
                         }
                     }
-                    _ => {}
                 }
             }
             ScreenState::MustChangePassword {
@@ -2084,22 +2082,20 @@ impl ControllerApp {
                         }
                         cx.notify();
                     }
-                    k if k.chars().count() == 1 => {
-                        let c = k.chars().next().unwrap();
-                        if !c.is_control() {
+                    _ => {
+                        if let Some(text) = resolve_typed_text(&event.keystroke) {
                             match self.active_field {
                                 ActiveField::NewPassword => {
-                                    new_password.push(c);
+                                    new_password.push_str(text);
                                 }
                                 ActiveField::ConfirmPassword => {
-                                    confirm_password.push(c);
+                                    confirm_password.push_str(text);
                                 }
                                 _ => {}
                             }
                             cx.notify();
                         }
                     }
-                    _ => {}
                 }
             }
             ScreenState::Connected {
@@ -2135,22 +2131,20 @@ impl ControllerApp {
                         }
                         cx.notify();
                     }
-                    k if k.chars().count() == 1 => {
-                        let c = k.chars().next().unwrap();
-                        if !c.is_control() {
+                    _ => {
+                        if let Some(text) = resolve_typed_text(&event.keystroke) {
                             match self.active_field {
                                 ActiveField::NewAccountUsername => {
-                                    new_account_username.push(c);
+                                    new_account_username.push_str(text);
                                 }
                                 ActiveField::NewAccountPassword => {
-                                    new_account_password.push(c);
+                                    new_account_password.push_str(text);
                                 }
                                 _ => {}
                             }
                             cx.notify();
                         }
                     }
-                    _ => {}
                 }
             }
         }
