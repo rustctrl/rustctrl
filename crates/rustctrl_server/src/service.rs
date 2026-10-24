@@ -203,30 +203,46 @@ impl StaffAuth for StaffAuthService {
         let session_id = uuid::Uuid::new_v4().to_string();
         let session = self
             .store
-            .create_session(
+            .create_login_session(
                 session_id,
                 account.username.clone(),
-                account.role,
-                account.must_change_password,
+                account.password_hash.clone(),
             )
             .await
             .map_err(database_error)?;
+        let session = match session {
+            Some(session) => session,
+            None => {
+                // The password was reset or changed after verification; the
+                // credentials this login verified are no longer current.
+                let _ = self
+                    .store
+                    .record_activity(
+                        username.to_string(),
+                        "login".into(),
+                        "failed".into(),
+                        "invalid username or password".into(),
+                    )
+                    .await;
+                return Err(Status::unauthenticated("invalid username or password"));
+            }
+        };
 
         let _ = self
             .store
             .record_activity(
-                account.username.clone(),
+                session.username.clone(),
                 "login".into(),
                 "success".into(),
-                format!("staff session started for role {}", account.role.as_str()),
+                format!("staff session started for role {}", session.role.as_str()),
             )
             .await;
 
         Ok(Response::new(LoginReply {
-            session_token: session.session_id,
-            username: account.username,
-            role: account.role.as_str().into(),
-            must_change_password: account.must_change_password,
+            session_token: session.session_id.clone(),
+            username: session.username,
+            role: session.role.as_str().into(),
+            must_change_password: session.must_change_password,
             server_time_unix_ms: session.created_at_unix_ms,
         }))
     }

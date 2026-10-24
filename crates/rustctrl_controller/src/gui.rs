@@ -406,6 +406,8 @@ impl ControllerApp {
             notice: None,
             in_flight: false,
         };
+        // Any open password form belongs to the session being left behind.
+        self.overlay = Overlay::None;
         self.active_field = ActiveField::Username;
         cx.notify();
 
@@ -772,6 +774,7 @@ impl ControllerApp {
         let client_cfg = self.config.server.clone();
         let handle = self.tokio_handle.clone();
         let tok = session_token.clone();
+        let tok_check = session_token;
         cx.spawn(async move |this, cx| {
             let res = handle
                 .spawn(async move {
@@ -790,10 +793,16 @@ impl ControllerApp {
             let _ = this.update(cx, |view, cx| {
                 match res {
                     Ok(Ok(())) => {
-                        view.overlay = Overlay::None;
-                        view.active_field = ActiveField::NewAccountUsername;
-                        if let ScreenState::Connected { notice, .. } = &mut view.state {
-                            *notice = Some("Password changed successfully.".into());
+                        // Ignore the result if the user left this session meanwhile.
+                        if matches!(
+                            &view.state,
+                            ScreenState::Connected { session_token, .. } if *session_token == tok_check
+                        ) {
+                            view.overlay = Overlay::None;
+                            view.active_field = ActiveField::NewAccountUsername;
+                            if let ScreenState::Connected { notice, .. } = &mut view.state {
+                                *notice = Some("Password changed successfully.".into());
+                            }
                         }
                     }
                     Ok(Err(err)) => {
@@ -855,6 +864,7 @@ impl ControllerApp {
         let client_cfg = self.config.server.clone();
         let handle = self.tokio_handle.clone();
         let tok = session_token.clone();
+        let tok_check = session_token;
         let target_label = target.clone();
         cx.spawn(async move |this, cx| {
             let res = handle
@@ -874,36 +884,43 @@ impl ControllerApp {
             let _ = this.update(cx, |view, cx| {
                 match res {
                     Ok(Ok(())) => {
-                        let self_reset = matches!(
+                        // Ignore the result if the user left this session meanwhile.
+                        if matches!(
                             &view.state,
-                            ScreenState::Connected { username, .. } if *username == target_label
-                        );
-                        view.overlay = Overlay::None;
-                        view.active_field = ActiveField::Username;
-                        if self_reset {
-                            // Resetting the own account revokes this session by design.
-                            view.state = ScreenState::Login {
-                                username: target_label,
-                                password: String::new(),
-                                error: None,
-                                notice: Some(
-                                    "Account reset to a temporary password and this session was revoked. Sign in with the temporary password."
-                                        .into(),
-                                ),
-                                in_flight: false,
-                            };
-                        } else {
-                            if let ScreenState::Connected {
-                                notice,
-                                session_token,
-                                ..
-                            } = &mut view.state
-                            {
-                                *notice = Some(
-                                    "Temporary password set; all target sessions revoked.".into(),
-                                );
-                                let token = session_token.clone();
-                                view.fetch_status(token, cx);
+                            ScreenState::Connected { session_token, .. } if *session_token == tok_check
+                        ) {
+                            let self_reset = matches!(
+                                &view.state,
+                                ScreenState::Connected { username, .. } if *username == target_label
+                            );
+                            view.overlay = Overlay::None;
+                            view.active_field = ActiveField::Username;
+                            if self_reset {
+                                // Resetting the own account revokes this session by design.
+                                view.state = ScreenState::Login {
+                                    username: target_label,
+                                    password: String::new(),
+                                    error: None,
+                                    notice: Some(
+                                        "Account reset to a temporary password and this session was revoked. Sign in with the temporary password."
+                                            .into(),
+                                    ),
+                                    in_flight: false,
+                                };
+                            } else {
+                                if let ScreenState::Connected {
+                                    notice,
+                                    session_token,
+                                    ..
+                                } = &mut view.state
+                                {
+                                    *notice = Some(
+                                        "Temporary password set; all target sessions revoked."
+                                            .into(),
+                                    );
+                                    let token = session_token.clone();
+                                    view.fetch_status(token, cx);
+                                }
                             }
                         }
                     }

@@ -574,33 +574,54 @@ impl DeviceStore {
         .await?
     }
 
-    pub async fn create_session(
+    // Creates the login session only when the password hash the caller verified is
+    // still the account's current hash, atomically with the insert. A reset or
+    // self-change that commits first either fails this check or, when it commits
+    // after, revokes the freshly inserted session.
+    pub async fn create_login_session(
         &self,
         session_id: String,
         username: String,
-        role: StaffRole,
-        must_change_password: bool,
-    ) -> Result<StaffSession> {
+        verified_password_hash: String,
+    ) -> Result<Option<StaffSession>> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             let now = current_time_ms()?;
-            let connection = store
+            let mut connection = store
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-            connection.execute(
+            let tx = connection.transaction()?;
+            let (password_hash, role_str, must_change): (String, String, bool) = {
+                let mut stmt = tx.prepare(
+                    "SELECT password_hash, role, must_change_password FROM staff_accounts WHERE username = ?1",
+                )?;
+                let mut rows = stmt.query(params![username])?;
+                if let Some(row) = rows.next()? {
+                    let must_change: i64 = row.get(2)?;
+                    (row.get(0)?, row.get(1)?, must_change != 0)
+                } else {
+                    return Ok(None);
+                }
+            };
+            if password_hash != verified_password_hash {
+                return Ok(None);
+            }
+            let role: StaffRole = role_str.parse()?;
+            tx.execute(
                 "INSERT INTO staff_sessions (session_id, username, role, must_change_password, created_at_unix_ms, last_seen_unix_ms, revoked) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0)",
-                params![session_id, username, role.as_str(), if must_change_password { 1 } else { 0 }, now],
+                params![session_id, username, role.as_str(), if must_change { 1 } else { 0 }, now],
             )?;
-            Ok(StaffSession {
+            tx.commit()?;
+            Ok(Some(StaffSession {
                 session_id,
                 username,
                 role,
-                must_change_password,
+                must_change_password: must_change,
                 created_at_unix_ms: now,
                 last_seen_unix_ms: now,
                 revoked: false,
-            })
+            }))
         })
         .await?
     }
@@ -713,5 +734,56 @@ impl DeviceStore {
             Ok(list)
         })
         .await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn login_session_rejects_credentials_superseded_by_a_password_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = DeviceStore::open(&temp.path().join("store.db"))?;
+        store
+            .bootstrap_admin("alice".into(), "TempPass1234!".into())
+            .await?;
+
+        let account = store
+            .get_staff_account("alice")
+            .await?
+            .expect("bootstrapped account");
+        let session = store
+            .create_login_session("s1".into(), "alice".into(), account.password_hash.clone())
+            .await?;
+        let session = session.expect("current hash yields a session");
+        assert!(session.must_change_password);
+        assert_eq!(session.role, StaffRole::Admin);
+
+        // A password change supersedes the verified hash; a login that verified
+        // the old hash must not produce a session.
+        let new_hash = crate::password::hash_password("NewPermanent123!")?;
+        store
+            .update_password("alice", new_hash.clone(), false)
+            .await?;
+        let stale = store
+            .create_login_session("s2".into(), "alice".into(), account.password_hash)
+            .await?;
+        assert!(stale.is_none(), "stale hash must not create a session");
+
+        // The new hash still yields one, reflecting the fresh account state.
+        let fresh = store
+            .create_login_session("s3".into(), "alice".into(), new_hash)
+            .await?
+            .expect("current hash yields a session");
+        assert!(!fresh.must_change_password);
+
+        // Unknown accounts never yield a session.
+        let unknown = store
+            .create_login_session("s4".into(), "ghost".into(), "irrelevant".into())
+            .await?;
+        assert!(unknown.is_none());
+
+        Ok(())
     }
 }
