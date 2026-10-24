@@ -2,10 +2,11 @@ use crate::{config::ServerConfig, store::DeviceStore};
 use anyhow::{Context, Result};
 use rustctrl_core::DeviceId;
 use rustctrl_protocol::auth::{
-    ChangeStaffRoleReply, ChangeStaffRoleRequest, CreateStaffAccountReply,
-    CreateStaffAccountRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
-    LoginRequest, LogoutReply, LogoutRequest, ReplaceTemporaryPasswordReply,
-    ReplaceTemporaryPasswordRequest, StaffAccountEntry, StaffStatusReply, StaffStatusRequest,
+    ChangeOwnPasswordReply, ChangeOwnPasswordRequest, ChangeStaffRoleReply, ChangeStaffRoleRequest,
+    CreateStaffAccountReply, CreateStaffAccountRequest, ListStaffAccountsReply,
+    ListStaffAccountsRequest, LoginReply, LoginRequest, LogoutReply, LogoutRequest,
+    ReplaceTemporaryPasswordReply, ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply,
+    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusReply, StaffStatusRequest,
     staff_auth_server::{StaffAuth, StaffAuthServer},
 };
 use rustctrl_protocol::bootstrap::{
@@ -257,6 +258,146 @@ impl StaffAuth for StaffAuthService {
         Ok(Response::new(ReplaceTemporaryPasswordReply {
             success: true,
         }))
+    }
+
+    async fn change_own_password(
+        &self,
+        request: Request<ChangeOwnPasswordRequest>,
+    ) -> Result<Response<ChangeOwnPasswordReply>, Status> {
+        let session = self.authenticate_request(&request).await?;
+        if session.must_change_password {
+            return Err(Status::permission_denied(
+                "password change required: replace the temporary password first",
+            ));
+        }
+        let body = request.into_inner();
+        if body.current_password.is_empty() || body.new_password.is_empty() {
+            return Err(Status::invalid_argument(
+                "current and new passwords are required",
+            ));
+        }
+        let new_hash = crate::password::hash_password(&body.new_password)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        if let Err(e) = self
+            .store
+            .change_own_password(&session.username, body.current_password, new_hash)
+            .await
+        {
+            let err_msg = e.to_string();
+            let recognized = err_msg.contains("current password")
+                || err_msg.contains("concurrently")
+                || err_msg.contains("not found");
+            let _ = self
+                .store
+                .record_activity(
+                    session.username.clone(),
+                    "change_own_password".into(),
+                    "rejected".into(),
+                    if recognized {
+                        err_msg.clone()
+                    } else {
+                        "password change failed".into()
+                    },
+                )
+                .await;
+            if err_msg.contains("current password") {
+                return Err(Status::invalid_argument(err_msg));
+            }
+            if err_msg.contains("concurrently") {
+                return Err(Status::aborted(
+                    "password was reset concurrently; sign in again",
+                ));
+            }
+            if err_msg.contains("not found") {
+                return Err(Status::not_found(err_msg));
+            }
+            return Err(database_error(e));
+        }
+
+        let _ = self
+            .store
+            .record_activity(
+                session.username.clone(),
+                "change_own_password".into(),
+                "success".into(),
+                "staff member changed their own password".into(),
+            )
+            .await;
+
+        Ok(Response::new(ChangeOwnPasswordReply { success: true }))
+    }
+
+    async fn reset_staff_password(
+        &self,
+        request: Request<ResetStaffPasswordRequest>,
+    ) -> Result<Response<ResetStaffPasswordReply>, Status> {
+        let body = request.get_ref();
+        let target_username = body.username.trim().to_string();
+        let session = self
+            .authenticate_admin(&request, "reset_staff_password", Some(&target_username))
+            .await?;
+
+        if body.temporary_password.len() < 8 {
+            let _ = self
+                .store
+                .record_activity(
+                    session.username.clone(),
+                    "reset_staff_password".into(),
+                    "rejected".into(),
+                    format!("failed to reset password of '{target_username}': password must contain at least 8 characters"),
+                )
+                .await;
+            return Err(Status::invalid_argument(
+                "temporary password must contain at least 8 characters",
+            ));
+        }
+
+        match self
+            .store
+            .reset_staff_password(&target_username, body.temporary_password.clone())
+            .await
+        {
+            Ok(account) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "reset_staff_password".into(),
+                        "success".into(),
+                        format!(
+                            "reset password of '{target_username}' to a temporary password and revoked its staff sessions"
+                        ),
+                    )
+                    .await;
+                Ok(Response::new(ResetStaffPasswordReply {
+                    account: Some(StaffAccountEntry {
+                        username: account.username,
+                        role: account.role.as_str().into(),
+                        must_change_password: account.must_change_password,
+                        created_at_unix_ms: account.created_at_unix_ms,
+                        updated_at_unix_ms: account.updated_at_unix_ms,
+                    }),
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "reset_staff_password".into(),
+                        "rejected".into(),
+                        format!("failed to reset password of '{target_username}': {err_msg}"),
+                    )
+                    .await;
+                if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
     }
 
     async fn logout(

@@ -2,8 +2,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rustctrl_core::{ControllerConfig, init_logging};
 use rustctrl_protocol::auth::{
-    ChangeStaffRoleRequest, CreateStaffAccountRequest, ListStaffAccountsRequest, LoginRequest,
-    LogoutRequest, ReplaceTemporaryPasswordRequest, StaffStatusRequest,
+    ChangeOwnPasswordRequest, ChangeStaffRoleRequest, CreateStaffAccountRequest,
+    ListStaffAccountsRequest, LoginRequest, LogoutRequest, ReplaceTemporaryPasswordRequest,
+    ResetStaffPasswordRequest, StaffStatusRequest,
 };
 use rustctrl_protocol::bootstrap::HealthRequest;
 use std::path::PathBuf;
@@ -68,6 +69,24 @@ enum Command {
         target_username: String,
         #[arg(long)]
         new_role: String,
+    },
+    ChangePassword {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        new_password: String,
+    },
+    ResetPassword {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        target_username: String,
+        #[arg(long)]
+        temporary_password: String,
     },
 }
 
@@ -250,6 +269,90 @@ fn main() -> Result<()> {
                 "Role changed: username={} role={}",
                 reply.username, reply.role
             );
+            let mut logout_req = tonic::Request::new(LogoutRequest {});
+            logout_req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let _ = client.logout(logout_req).await;
+            Ok(())
+        }),
+        Command::ChangePassword {
+            username,
+            password,
+            new_password,
+        } => tokio::runtime::Runtime::new()?.block_on(async {
+            let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+            let login_reply = client
+                .login(LoginRequest {
+                    username,
+                    password: password.clone(),
+                })
+                .await?
+                .into_inner();
+            if login_reply.must_change_password {
+                anyhow::bail!("temporary password must be replaced before changing passwords");
+            }
+            let mut req = tonic::Request::new(ChangeOwnPasswordRequest {
+                current_password: password,
+                new_password,
+            });
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            client.change_own_password(req).await?;
+            println!("Password changed successfully.");
+
+            let mut status_req = tonic::Request::new(StaffStatusRequest {});
+            status_req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let status = client.get_staff_status(status_req).await?.into_inner();
+            println!(
+                "Protected status: authenticated={} registered_devices={} server_version={}",
+                status.authenticated, status.registered_devices, status.server_version
+            );
+
+            let mut logout_req = tonic::Request::new(LogoutRequest {});
+            logout_req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let _ = client.logout(logout_req).await;
+            Ok(())
+        }),
+        Command::ResetPassword {
+            username,
+            password,
+            target_username,
+            temporary_password,
+        } => tokio::runtime::Runtime::new()?.block_on(async {
+            let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+            let login_reply = client
+                .login(LoginRequest { username, password })
+                .await?
+                .into_inner();
+            if login_reply.must_change_password {
+                anyhow::bail!("temporary password must be replaced before resetting passwords");
+            }
+            let mut req = tonic::Request::new(ResetStaffPasswordRequest {
+                username: target_username,
+                temporary_password,
+            });
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let reply = client.reset_staff_password(req).await?.into_inner();
+            if let Some(acc) = reply.account {
+                println!(
+                    "Password reset: username={} role={} temporary={}",
+                    acc.username, acc.role, acc.must_change_password
+                );
+                println!("All staff sessions of this account were revoked.");
+            }
             let mut logout_req = tonic::Request::new(LogoutRequest {});
             logout_req.metadata_mut().insert(
                 "authorization",

@@ -58,6 +58,14 @@ enum Command {
         #[arg(long)]
         temporary_password: String,
     },
+    RecoverAdmin {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        temporary_password: String,
+    },
     ListActivity {
         #[arg(long)]
         config: PathBuf,
@@ -119,6 +127,21 @@ async fn main() -> Result<()> {
                 .bootstrap_admin(username.clone(), temporary_password)
                 .await?;
             println!("Admin '{username}' successfully bootstrapped with temporary password.");
+            Ok(())
+        }
+        Command::RecoverAdmin {
+            config,
+            username,
+            temporary_password,
+        } => {
+            let config = ServerConfig::load(&config)?;
+            let store = rustctrl_server::store::DeviceStore::open(&config.database)?;
+            store
+                .recover_admin(username.clone(), temporary_password)
+                .await?;
+            println!(
+                "Admin '{username}' successfully recovered with a temporary password; existing staff sessions were revoked."
+            );
             Ok(())
         }
         Command::ListActivity { config } => {
