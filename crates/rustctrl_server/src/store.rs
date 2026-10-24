@@ -140,6 +140,7 @@ impl DeviceStore {
                 created_at_unix_ms INTEGER NOT NULL,
                 last_seen_unix_ms INTEGER NOT NULL,
                 revoked INTEGER NOT NULL DEFAULT 0,
+                expires_at_unix_ms INTEGER,
                 FOREIGN KEY(username) REFERENCES staff_accounts(username)
             );
             CREATE TABLE IF NOT EXISTS activity_log (
@@ -151,7 +152,8 @@ impl DeviceStore {
                 detail TEXT NOT NULL
             );",
         )?;
-        // Existing databases predate account deactivation; add the column in place.
+        // Existing databases predate account deactivation and remembered-session
+        // expiry; add missing columns in place.
         let staff_columns: Vec<String> = connection
             .prepare("SELECT name FROM pragma_table_info('staff_accounts')")?
             .query_map([], |row| row.get(0))?
@@ -159,6 +161,18 @@ impl DeviceStore {
         if !staff_columns.iter().any(|name| name == "active") {
             connection.execute_batch(
                 "ALTER TABLE staff_accounts ADD COLUMN active INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
+        let session_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('staff_sessions')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        if !session_columns
+            .iter()
+            .any(|name| name == "expires_at_unix_ms")
+        {
+            connection.execute_batch(
+                "ALTER TABLE staff_sessions ADD COLUMN expires_at_unix_ms INTEGER;",
             )?;
         }
         Ok(Self(Arc::new(Mutex::new(connection))))
@@ -663,12 +677,14 @@ impl DeviceStore {
     // Creates the login session only when the password hash the caller verified is
     // still the account's current hash, atomically with the insert. A reset or
     // self-change that commits first either fails this check or, when it commits
-    // after, revokes the freshly inserted session.
+    // after, revokes the freshly inserted session. Remembered sessions carry a
+    // finite expiry that get_session enforces on every validation.
     pub async fn create_login_session(
         &self,
         session_id: String,
         username: String,
         verified_password_hash: String,
+        expires_at_unix_ms: Option<i64>,
     ) -> Result<Option<StaffSession>> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -700,8 +716,15 @@ impl DeviceStore {
             }
             let role: StaffRole = role_str.parse()?;
             tx.execute(
-                "INSERT INTO staff_sessions (session_id, username, role, must_change_password, created_at_unix_ms, last_seen_unix_ms, revoked) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0)",
-                params![session_id, username, role.as_str(), if must_change { 1 } else { 0 }, now],
+                "INSERT INTO staff_sessions (session_id, username, role, must_change_password, created_at_unix_ms, last_seen_unix_ms, revoked, expires_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, ?6)",
+                params![
+                    session_id,
+                    username,
+                    role.as_str(),
+                    if must_change { 1 } else { 0 },
+                    now,
+                    expires_at_unix_ms
+                ],
             )?;
             tx.commit()?;
             Ok(Some(StaffSession {
@@ -727,7 +750,7 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT s.session_id, s.username, a.role, s.must_change_password, s.created_at_unix_ms, s.last_seen_unix_ms, s.revoked, a.active FROM staff_sessions s JOIN staff_accounts a ON s.username = a.username WHERE s.session_id = ?1",
+                "SELECT s.session_id, s.username, a.role, s.must_change_password, s.created_at_unix_ms, s.last_seen_unix_ms, s.revoked, a.active, s.expires_at_unix_ms FROM staff_sessions s JOIN staff_accounts a ON s.username = a.username WHERE s.session_id = ?1",
             )?;
             let mut rows = stmt.query(params![session_id])?;
             if let Some(row) = rows.next()? {
@@ -736,6 +759,7 @@ impl DeviceStore {
                 let must_change: i64 = row.get(3)?;
                 let revoked: i64 = row.get(6)?;
                 let active: i64 = row.get(7)?;
+                let expires_at: Option<i64> = row.get(8)?;
                 let session = StaffSession {
                     session_id: row.get(0)?,
                     username: row.get(1)?,
@@ -743,7 +767,9 @@ impl DeviceStore {
                     must_change_password: must_change != 0,
                     created_at_unix_ms: row.get(4)?,
                     last_seen_unix_ms: row.get(5)?,
-                    revoked: revoked != 0 || active == 0,
+                    revoked: revoked != 0
+                        || active == 0
+                        || expires_at.is_some_and(|deadline| deadline <= now),
                 };
                 if !session.revoked {
                     let _ = connection.execute(
@@ -846,7 +872,12 @@ mod tests {
             .await?
             .expect("bootstrapped account");
         let session = store
-            .create_login_session("s1".into(), "alice".into(), account.password_hash.clone())
+            .create_login_session(
+                "s1".into(),
+                "alice".into(),
+                account.password_hash.clone(),
+                None,
+            )
             .await?;
         let session = session.expect("current hash yields a session");
         assert!(session.must_change_password);
@@ -859,22 +890,43 @@ mod tests {
             .update_password("alice", new_hash.clone(), false)
             .await?;
         let stale = store
-            .create_login_session("s2".into(), "alice".into(), account.password_hash)
+            .create_login_session("s2".into(), "alice".into(), account.password_hash, None)
             .await?;
         assert!(stale.is_none(), "stale hash must not create a session");
 
         // The new hash still yields one, reflecting the fresh account state.
         let fresh = store
-            .create_login_session("s3".into(), "alice".into(), new_hash)
+            .create_login_session("s3".into(), "alice".into(), new_hash, None)
             .await?
             .expect("current hash yields a session");
         assert!(!fresh.must_change_password);
 
         // Unknown accounts never yield a session.
         let unknown = store
-            .create_login_session("s4".into(), "ghost".into(), "irrelevant".into())
+            .create_login_session("s4".into(), "ghost".into(), "irrelevant".into(), None)
             .await?;
         assert!(unknown.is_none());
+
+        // A remembered session with a past deadline is treated as revoked.
+        let past = store
+            .create_login_session(
+                "s5".into(),
+                "alice".into(),
+                store
+                    .get_staff_account("alice")
+                    .await?
+                    .expect("account")
+                    .password_hash,
+                Some(1),
+            )
+            .await?
+            .expect("session created");
+        assert!(past.created_at_unix_ms > 1);
+        let expired = store.get_session("s5").await?.expect("row exists");
+        assert!(
+            expired.revoked,
+            "expired remembered session must be invalid"
+        );
 
         Ok(())
     }

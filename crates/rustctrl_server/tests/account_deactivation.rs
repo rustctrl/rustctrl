@@ -59,6 +59,7 @@ impl RunningServer {
                 private_key: tls.join("key.pem"),
                 client_ca: tls.join("ca.pem"),
             },
+            staff_session: Default::default(),
         };
         let stop = CancellationToken::new();
         let signal = stop.clone();
@@ -114,6 +115,7 @@ async fn login(
         .login(LoginRequest {
             username: username.into(),
             password: password.into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -200,6 +202,7 @@ async fn deactivation_ends_sessions_blocks_login_and_survives_restart() -> Resul
         .login(LoginRequest {
             username: "alice".into(),
             password: "AliceTemp123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -220,6 +223,7 @@ async fn deactivation_ends_sessions_blocks_login_and_survives_restart() -> Resul
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobTemp12345!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -285,6 +289,7 @@ async fn deactivation_ends_sessions_blocks_login_and_survives_restart() -> Resul
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobPermanent123!".into(),
+            remember: false,
         })
         .await
         .unwrap_err();
@@ -314,6 +319,7 @@ async fn deactivation_ends_sessions_blocks_login_and_survives_restart() -> Resul
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobPermanent123!".into(),
+            remember: false,
         })
         .await
         .unwrap_err();
@@ -380,6 +386,7 @@ async fn mixed_concurrent_demotion_and_deactivation_keep_one_active_admin() -> R
         .login(LoginRequest {
             username: "admin1".into(),
             password: "Admin1Temp123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -443,6 +450,7 @@ async fn mixed_concurrent_demotion_and_deactivation_keep_one_active_admin() -> R
             .login(LoginRequest {
                 username: "admin2".into(),
                 password: "Admin2Temp12345!".into(),
+                remember: false,
             })
             .await?
             .into_inner();
@@ -487,6 +495,7 @@ async fn mixed_concurrent_demotion_and_deactivation_keep_one_active_admin() -> R
             .login(LoginRequest {
                 username: "admin2".into(),
                 password: "Admin2Permanent123!".into(),
+                remember: false,
             })
             .await?
             .into_inner();

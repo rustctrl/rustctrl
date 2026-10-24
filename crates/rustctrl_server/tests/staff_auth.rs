@@ -60,6 +60,7 @@ impl RunningServer {
                 private_key: tls.join("key.pem"),
                 client_ca: tls.join("ca.pem"),
             },
+            staff_session: Default::default(),
         };
         let stop = CancellationToken::new();
         let signal = stop.clone();
@@ -273,6 +274,7 @@ async fn staff_login_enforces_temporary_password_restrictions_and_records_activi
         .login(LoginRequest {
             username: "alice".into(),
             password: "WrongPassword!".into(),
+            remember: false,
         })
         .await
         .unwrap_err();
@@ -303,6 +305,7 @@ async fn staff_login_enforces_temporary_password_restrictions_and_records_activi
         .login(LoginRequest {
             username: "alice".into(),
             password: "TempSecret123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -377,6 +380,7 @@ async fn replace_temporary_password_unblocks_protected_operations_and_updates_cr
         .login(LoginRequest {
             username: "alice".into(),
             password: "InitialTempPass1!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -447,6 +451,7 @@ async fn replace_temporary_password_unblocks_protected_operations_and_updates_cr
         .login(LoginRequest {
             username: "alice".into(),
             password: "InitialTempPass1!".into(),
+            remember: false,
         })
         .await
         .unwrap_err();
@@ -457,6 +462,7 @@ async fn replace_temporary_password_unblocks_protected_operations_and_updates_cr
         .login(LoginRequest {
             username: "alice".into(),
             password: new_pass.into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -521,6 +527,7 @@ async fn logout_invalidates_session_on_open_channel_and_state_survives_server_re
         .login(LoginRequest {
             username: "admin".into(),
             password: "InitPass123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -540,6 +547,7 @@ async fn logout_invalidates_session_on_open_channel_and_state_survives_server_re
         .login(LoginRequest {
             username: "admin".into(),
             password: "PermanentPass123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -617,6 +625,7 @@ async fn logout_invalidates_session_on_open_channel_and_state_survives_server_re
         .login(LoginRequest {
             username: "admin".into(),
             password: "PermanentPass123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -975,6 +984,7 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         .login(LoginRequest {
             username: "alice".into(),
             password: "AliceTemp123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -991,6 +1001,7 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         .login(LoginRequest {
             username: "alice".into(),
             password: "AlicePermanent123!".into(),
+            remember: false,
         })
         .await?
         .into_inner()
@@ -1066,6 +1077,7 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobTempPassword123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -1096,6 +1108,7 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         .login(LoginRequest {
             username: "bob".into(),
             password: "BobPermanentPassword123!".into(),
+            remember: false,
         })
         .await?
         .into_inner()
@@ -1146,6 +1159,7 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         .login(LoginRequest {
             username: "charlie".into(),
             password: "CharlieTempPass123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -1162,6 +1176,7 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         .login(LoginRequest {
             username: "charlie".into(),
             password: "CharliePermanentPass123!".into(),
+            remember: false,
         })
         .await?
         .into_inner()
@@ -1239,6 +1254,7 @@ async fn admin_manages_staff_accounts_and_roles_with_operator_and_last_admin_pro
         .login(LoginRequest {
             username: "alice".into(),
             password: "AlicePermanent123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -1323,6 +1339,7 @@ async fn concurrent_demotions_cannot_leave_zero_active_admins() -> Result<()> {
         .login(LoginRequest {
             username: "admin1".into(),
             password: "Admin1TempPass123!".into(),
+            remember: false,
         })
         .await?
         .into_inner();
@@ -1339,6 +1356,7 @@ async fn concurrent_demotions_cannot_leave_zero_active_admins() -> Result<()> {
         .login(LoginRequest {
             username: "admin1".into(),
             password: "Admin1PermanentPass123!".into(),
+            remember: false,
         })
         .await?
         .into_inner()
@@ -1414,6 +1432,7 @@ async fn concurrent_demotions_cannot_leave_zero_active_admins() -> Result<()> {
                 .login(LoginRequest {
                     username: "admin2".into(),
                     password: "Admin2TempPass123!".into(),
+                    remember: false,
                 })
                 .await?
                 .into_inner();
@@ -1429,6 +1448,7 @@ async fn concurrent_demotions_cannot_leave_zero_active_admins() -> Result<()> {
                 .login(LoginRequest {
                     username: "admin2".into(),
                     password: "Admin2PermanentPass123!".into(),
+                    remember: false,
                 })
                 .await?
                 .into_inner()

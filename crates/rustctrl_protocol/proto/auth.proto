@@ -17,6 +17,7 @@ service StaffAuth {
 message LoginRequest {
   string username = 1;
   string password = 2;
+  bool remember = 3;
 }
 
 message LoginReply {
