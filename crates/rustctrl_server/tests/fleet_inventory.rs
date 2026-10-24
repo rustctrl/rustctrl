@@ -2,7 +2,8 @@ use anyhow::Result;
 use rustctrl_core::{ClientConfig, DeviceId};
 use rustctrl_protocol::auth::{
     CreateStaffAccountRequest, ListFleetDevicesRequest, LoginRequest,
-    ReplaceTemporaryPasswordRequest, StaffStatusRequest, staff_auth_client::StaffAuthClient,
+    ReplaceTemporaryPasswordRequest, StaffStatusRequest, UpdateFleetDeviceRequest,
+    staff_auth_client::StaffAuthClient,
 };
 use rustctrl_protocol::bootstrap::HeartbeatRequest;
 use rustctrl_server::{
@@ -143,15 +144,48 @@ async fn bootstrap_admin(exe: &str, config: &Path, username: &str, temp: &str) {
 }
 
 async fn agent_heartbeat(root: &Path, endpoint: &str, device_id: DeviceId) -> Result<()> {
+    agent_heartbeat_with_name(root, endpoint, device_id, "Test Windows PC", "0.1.0").await
+}
+
+async fn agent_heartbeat_with_name(
+    root: &Path,
+    endpoint: &str,
+    device_id: DeviceId,
+    name: &str,
+    version: &str,
+) -> Result<()> {
     let mut agent = rustctrl_network::connect(&client_config(root, endpoint, "agent")).await?;
     agent
         .send_heartbeat(HeartbeatRequest {
             device_id: device_id.to_string(),
-            name: "Test Windows PC".into(),
-            agent_version: "0.1.0".into(),
+            name: name.into(),
+            agent_version: version.into(),
         })
         .await?;
     Ok(())
+}
+
+async fn list_activity(exe: &str, config: &Path) -> String {
+    let output = tokio::task::spawn_blocking({
+        let exe = exe.to_string();
+        let config = config.to_path_buf();
+        move || {
+            Command::new(&exe)
+                .arg("list-activity")
+                .arg("--config")
+                .arg(&config)
+                .output()
+                .expect("run rustctrl-server list-activity CLI")
+        }
+    })
+    .await
+    .expect("join list-activity");
+    assert!(
+        output.status.success(),
+        "list-activity failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 #[tokio::test]
@@ -478,6 +512,62 @@ async fn controller_cli_lists_fleet_devices() -> Result<()> {
         "must show the stable identity: {out}"
     );
 
+    // Admin edits device display name and location via Controller CLI.
+    let edit_res = run_controller(&[
+        "edit-device",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+        "--display-name",
+        "Office Workstation 42",
+        "--location",
+        "Room 101",
+    ])
+    .await;
+    assert!(
+        edit_res.status.success(),
+        "admin edit-device must succeed: {}",
+        String::from_utf8_lossy(&edit_res.stderr)
+    );
+
+    // Operator observes the edited name and location via Controller CLI.
+    let listed_after_edit = run_controller(&[
+        "list-devices",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(listed_after_edit.status.success());
+    let edited_out = String::from_utf8_lossy(&listed_after_edit.stdout);
+    assert!(
+        edited_out.contains("name=Office Workstation 42")
+            && edited_out.contains("location=Room 101"),
+        "operator must see edited name and location: {edited_out}"
+    );
+
+    // Operator cannot edit device: CLI fails with permission denial.
+    let op_edit_res = run_controller(&[
+        "edit-device",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+        "--display-name",
+        "Unauthorized Edit",
+    ])
+    .await;
+    assert!(
+        !op_edit_res.status.success(),
+        "operator edit-device must fail"
+    );
+
     // After the freshness window the same Device reports offline.
     tokio::time::sleep(Duration::from_millis(1_600)).await;
     let stale = run_controller(&[
@@ -496,5 +586,274 @@ async fn controller_cli_lists_fleet_devices() -> Result<()> {
     );
 
     server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_edit_device_display_name_and_location_and_survives_heartbeats_and_restart()
+-> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pki_dir = temp.path().join("pki");
+    let device_id = DeviceId::new();
+    initialize(&PkiOptions {
+        output: pki_dir.clone(),
+        server_output: None,
+        server_names: vec!["localhost".into()],
+        server_ips: vec!["127.0.0.1".parse().unwrap()],
+        endpoint: "https://localhost:9876".into(),
+        domain_name: "localhost".into(),
+        device_id,
+    })?;
+    let config_path = pki_dir.join("server.toml");
+    let db_path = temp.path().join("rustctrl.db");
+    let exe = env!("CARGO_BIN_EXE_rustctrl-server");
+
+    bootstrap_admin(exe, &config_path, "alice", "AliceTemp123!").await;
+
+    let server = RunningServer::start(&pki_dir, db_path.clone()).await?;
+    let mut admin_client = connect(&pki_dir, &server.endpoint).await?;
+
+    let boot = admin_client
+        .login(LoginRequest {
+            username: "alice".into(),
+            password: "AliceTemp123!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    admin_client
+        .replace_temporary_password(authorized(
+            &boot.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "AlicePermanent123!".into(),
+            },
+        ))
+        .await?;
+    let alice_session = login(&mut admin_client, "alice", "AlicePermanent123!").await?;
+
+    // Create an Operator account for Bob.
+    admin_client
+        .create_staff_account(authorized(
+            &alice_session,
+            CreateStaffAccountRequest {
+                username: "bob".into(),
+                role: "operator".into(),
+                temporary_password: "BobTemp12345!".into(),
+            },
+        ))
+        .await?;
+    let mut operator_client = connect(&pki_dir, &server.endpoint).await?;
+    let bob_boot = operator_client
+        .login(LoginRequest {
+            username: "bob".into(),
+            password: "BobTemp12345!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    operator_client
+        .replace_temporary_password(authorized(
+            &bob_boot.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "BobPermanent123!".into(),
+            },
+        ))
+        .await?;
+    let bob_session = login(&mut operator_client, "bob", "BobPermanent123!").await?;
+
+    // Newly seen Windows device starts with its reported hostname and no location.
+    agent_heartbeat_with_name(
+        &pki_dir,
+        &server.endpoint,
+        device_id,
+        "ORIGINAL-HOSTNAME-1234",
+        "1.0.0",
+    )
+    .await?;
+
+    let initial_view = admin_client
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(initial_view.devices.len(), 1);
+    let dev = &initial_view.devices[0];
+    assert_eq!(dev.device_id, device_id.to_string());
+    assert_eq!(dev.display_name, "ORIGINAL-HOSTNAME-1234");
+    assert_eq!(dev.location, None);
+
+    // Operator cannot edit device metadata: denied with PermissionDenied.
+    let op_err = operator_client
+        .update_fleet_device(authorized(
+            &bob_session,
+            UpdateFleetDeviceRequest {
+                device_id: device_id.to_string(),
+                display_name: "Operator Attempt".into(),
+                location: Some("Secret Room".into()),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        op_err.code(),
+        Code::PermissionDenied,
+        "operator must be denied editing device metadata: {op_err}"
+    );
+
+    // Validation: empty display name rejected.
+    let empty_name_err = admin_client
+        .update_fleet_device(authorized(
+            &alice_session,
+            UpdateFleetDeviceRequest {
+                device_id: device_id.to_string(),
+                display_name: "   ".into(),
+                location: Some("Room 101".into()),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(empty_name_err.code(), Code::InvalidArgument);
+
+    // Validation: non-existent device returns NotFound.
+    let fake_id = DeviceId::new();
+    let not_found_err = admin_client
+        .update_fleet_device(authorized(
+            &alice_session,
+            UpdateFleetDeviceRequest {
+                device_id: fake_id.to_string(),
+                display_name: "Ghost Device".into(),
+                location: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(not_found_err.code(), Code::NotFound);
+
+    // Admin edits display name and adds optional location.
+    let update_reply = admin_client
+        .update_fleet_device(authorized(
+            &alice_session,
+            UpdateFleetDeviceRequest {
+                device_id: device_id.to_string(),
+                display_name: "Reception Front Desk".into(),
+                location: Some("Building A - Floor 1".into()),
+            },
+        ))
+        .await?
+        .into_inner();
+    let updated_dev = update_reply.device.expect("device in reply");
+    assert_eq!(updated_dev.device_id, device_id.to_string());
+    assert_eq!(updated_dev.display_name, "Reception Front Desk");
+    assert_eq!(updated_dev.location, Some("Building A - Floor 1".into()));
+
+    // Other Controllers (like Bob's operator client) observe the saved metadata.
+    let bob_view = operator_client
+        .list_fleet_devices(authorized(&bob_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(bob_view.devices.len(), 1);
+    assert_eq!(bob_view.devices[0].display_name, "Reception Front Desk");
+    assert_eq!(
+        bob_view.devices[0].location,
+        Some("Building A - Floor 1".into())
+    );
+
+    // Subsequent Agent heartbeats with a different reported hostname, newer version,
+    // and new IP do NOT overwrite Admin-curated display name and location!
+    agent_heartbeat_with_name(
+        &pki_dir,
+        &server.endpoint,
+        device_id,
+        "REPORTED-HOSTNAME-OVERWRITE-ATTEMPT",
+        "1.1.0",
+    )
+    .await?;
+
+    let after_heartbeat_view = admin_client
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(after_heartbeat_view.devices.len(), 1);
+    assert_eq!(
+        after_heartbeat_view.devices[0].display_name, "Reception Front Desk",
+        "heartbeat must not overwrite curated display name"
+    );
+    assert_eq!(
+        after_heartbeat_view.devices[0].location,
+        Some("Building A - Floor 1".into()),
+        "heartbeat must not overwrite curated location"
+    );
+
+    // Admin can clear the location (None or empty).
+    let cleared_loc_reply = admin_client
+        .update_fleet_device(authorized(
+            &alice_session,
+            UpdateFleetDeviceRequest {
+                device_id: device_id.to_string(),
+                display_name: "Reception Front Desk".into(),
+                location: None,
+            },
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        cleared_loc_reply.device.unwrap().location,
+        None,
+        "clearing location must set it to None"
+    );
+
+    // Set location to Room 204.
+    admin_client
+        .update_fleet_device(authorized(
+            &alice_session,
+            UpdateFleetDeviceRequest {
+                device_id: device_id.to_string(),
+                display_name: "Reception Front Desk".into(),
+                location: Some("Room 204".into()),
+            },
+        ))
+        .await?;
+
+    // Verify activity recording through the operator-supported observation boundary:
+    let activity = list_activity(exe, &config_path).await;
+    assert!(
+        activity.contains("action=update_fleet_device")
+            && activity.contains("actor=alice")
+            && activity.contains("result=success")
+            && activity.contains(&device_id.to_string()),
+        "must record successful update_fleet_device with actor, device identity, outcome: {activity}"
+    );
+    assert!(
+        activity.contains("action=update_fleet_device")
+            && activity.contains("actor=bob")
+            && activity.contains("result=rejected")
+            && activity.contains(&device_id.to_string()),
+        "must record rejected unauthorized update_fleet_device with actor, device identity, outcome: {activity}"
+    );
+
+    // Saved metadata survives Server restart.
+    drop(operator_client);
+    drop(admin_client);
+    server.shutdown().await?;
+
+    let restarted = RunningServer::start(&pki_dir, db_path).await?;
+    let mut client = connect(&pki_dir, &restarted.endpoint).await?;
+    let alice_restarted = login(&mut client, "alice", "AlicePermanent123!").await?;
+
+    let restored_view = client
+        .list_fleet_devices(authorized(&alice_restarted, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(restored_view.devices.len(), 1);
+    assert_eq!(
+        restored_view.devices[0].display_name, "Reception Front Desk",
+        "display name must survive restart"
+    );
+    assert_eq!(
+        restored_view.devices[0].location,
+        Some("Room 204".into()),
+        "location must survive restart"
+    );
+
+    restarted.shutdown().await?;
     Ok(())
 }

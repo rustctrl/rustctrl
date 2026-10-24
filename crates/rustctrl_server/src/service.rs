@@ -8,7 +8,8 @@ use rustctrl_protocol::auth::{
     ListFleetDevicesRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
     LoginRequest, LogoutReply, LogoutRequest, ReplaceTemporaryPasswordReply,
     ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply, ResetStaffPasswordRequest,
-    StaffAccountEntry, StaffStatusReply, StaffStatusRequest,
+    StaffAccountEntry, StaffStatusReply, StaffStatusRequest, UpdateFleetDeviceReply,
+    UpdateFleetDeviceRequest,
     staff_auth_server::{StaffAuth, StaffAuthServer},
 };
 use rustctrl_protocol::bootstrap::{
@@ -578,9 +579,83 @@ impl StaffAuth for StaffAuthService {
                 last_address: device.last_address.unwrap_or_default(),
                 online: now_ms.saturating_sub(device.last_seen_unix_ms) <= window_ms,
                 last_seen_unix_ms: device.last_seen_unix_ms,
+                location: device.location,
             })
             .collect();
         Ok(Response::new(ListFleetDevicesReply { devices: entries }))
+    }
+
+    async fn update_fleet_device(
+        &self,
+        request: Request<UpdateFleetDeviceRequest>,
+    ) -> Result<Response<UpdateFleetDeviceReply>, Status> {
+        let body = request.get_ref();
+        let target_device_id = body.device_id.trim().to_string();
+        let session = self
+            .authenticate_admin(&request, "update_fleet_device", Some(&target_device_id))
+            .await?;
+
+        let display_name = body.display_name.trim();
+        let location = body.location.as_deref();
+
+        match self
+            .store
+            .update_device_metadata(&target_device_id, display_name, location)
+            .await
+        {
+            Ok(updated) => {
+                let location_desc = match &updated.location {
+                    Some(loc) => format!("'{loc}'"),
+                    None => "none".into(),
+                };
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "update_fleet_device".into(),
+                        "success".into(),
+                        format!(
+                            "updated device '{target_device_id}' display name to '{}' and location to {location_desc}",
+                            updated.name
+                        ),
+                    )
+                    .await;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_default();
+                let window_ms =
+                    i64::try_from(self.offline_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+                Ok(Response::new(UpdateFleetDeviceReply {
+                    device: Some(FleetDeviceEntry {
+                        device_id: updated.device_id,
+                        display_name: updated.name,
+                        device_type: "windows".into(),
+                        last_address: updated.last_address.unwrap_or_default(),
+                        online: now_ms.saturating_sub(updated.last_seen_unix_ms) <= window_ms,
+                        last_seen_unix_ms: updated.last_seen_unix_ms,
+                        location: updated.location,
+                    }),
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "update_fleet_device".into(),
+                        "rejected".into(),
+                        format!("failed to update device '{target_device_id}' metadata: {err_msg}"),
+                    )
+                    .await;
+                if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
     }
 
     async fn list_staff_accounts(

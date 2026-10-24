@@ -5,6 +5,7 @@ use rustctrl_protocol::auth::{
     ChangeOwnPasswordRequest, ChangeStaffRoleRequest, CreateStaffAccountRequest,
     DeactivateStaffAccountRequest, ListFleetDevicesRequest, ListStaffAccountsRequest, LoginRequest,
     LogoutRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffStatusRequest,
+    UpdateFleetDeviceRequest,
 };
 use rustctrl_protocol::bootstrap::HealthRequest;
 use std::path::PathBuf;
@@ -105,6 +106,18 @@ enum Command {
         username: String,
         #[arg(long)]
         password: String,
+    },
+    EditDevice {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        device_id: String,
+        #[arg(long)]
+        display_name: String,
+        #[arg(long)]
+        location: Option<String>,
     },
 }
 
@@ -530,10 +543,11 @@ fn main() -> Result<()> {
                 println!("Fleet Devices ({}):", reply.devices.len());
                 for device in reply.devices {
                     println!(
-                        "  device={} name={} type={} address={} status={} last_seen_unix_ms={}",
+                        "  device={} name={} type={} location={} address={} status={} last_seen_unix_ms={}",
                         device.device_id,
                         device.display_name,
                         device.device_type,
+                        device.location.as_deref().unwrap_or("-"),
                         if device.last_address.is_empty() {
                             "-"
                         } else {
@@ -541,6 +555,59 @@ fn main() -> Result<()> {
                         },
                         if device.online { "online" } else { "offline" },
                         device.last_seen_unix_ms
+                    );
+                }
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
+        Command::EditDevice {
+            username,
+            password,
+            device_id,
+            display_name,
+            location,
+        } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest {
+                        username,
+                        password,
+                        remember: false,
+                    })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!("temporary password must be replaced before editing device");
+                }
+                let mut req = tonic::Request::new(UpdateFleetDeviceRequest {
+                    device_id,
+                    display_name,
+                    location,
+                });
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client.update_fleet_device(req).await?.into_inner();
+                if let Some(device) = reply.device {
+                    println!(
+                        "Updated device {}: name={} location={} address={} status={}",
+                        device.device_id,
+                        device.display_name,
+                        device.location.as_deref().unwrap_or("-"),
+                        if device.last_address.is_empty() {
+                            "-"
+                        } else {
+                            &device.last_address
+                        },
+                        if device.online { "online" } else { "offline" }
                     );
                 }
                 let mut logout_req = tonic::Request::new(LogoutRequest {});

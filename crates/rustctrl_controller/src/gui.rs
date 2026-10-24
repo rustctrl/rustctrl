@@ -8,7 +8,7 @@ use rustctrl_protocol::auth::{
     ChangeOwnPasswordRequest, ChangeStaffRoleRequest, CreateStaffAccountRequest,
     DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesRequest,
     ListStaffAccountsRequest, LoginRequest, LogoutRequest, ReplaceTemporaryPasswordRequest,
-    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusRequest,
+    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusRequest, UpdateFleetDeviceRequest,
 };
 use std::time::Duration;
 
@@ -22,6 +22,8 @@ enum ActiveField {
     TemporaryPassword,
     NewAccountUsername,
     NewAccountPassword,
+    EditDeviceDisplayName,
+    EditDeviceLocation,
 }
 
 #[derive(Clone)]
@@ -38,6 +40,13 @@ enum Overlay {
         target_username: String,
         temporary_password: String,
         confirm_password: String,
+        error: Option<String>,
+        in_flight: bool,
+    },
+    EditDevice {
+        device_id: String,
+        display_name: String,
+        location: String,
         error: Option<String>,
         in_flight: bool,
     },
@@ -1023,6 +1032,28 @@ impl ControllerApp {
         }
     }
 
+    fn open_edit_device(
+        &mut self,
+        device_id: String,
+        display_name: String,
+        location: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let ScreenState::Connected { role, .. } = &self.state
+            && role == "admin"
+        {
+            self.overlay = Overlay::EditDevice {
+                device_id,
+                display_name,
+                location: location.unwrap_or_default(),
+                error: None,
+                in_flight: false,
+            };
+            self.active_field = ActiveField::EditDeviceDisplayName;
+            cx.notify();
+        }
+    }
+
     fn close_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay = Overlay::None;
         self.active_field = ActiveField::NewAccountUsername;
@@ -1240,6 +1271,109 @@ impl ControllerApp {
                     }
                     Err(join_err) => {
                         if let Overlay::ResetPassword {
+                            error, in_flight, ..
+                        } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(join_err.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_edit_device(&mut self, cx: &mut Context<Self>) {
+        let (session_token, target_id, target_name, target_location) = match &mut self.overlay {
+            Overlay::EditDevice {
+                device_id,
+                display_name,
+                location,
+                error,
+                in_flight,
+            } if !*in_flight => {
+                let trimmed_name = display_name.trim();
+                if trimmed_name.is_empty() {
+                    *error = Some("Display name cannot be empty.".into());
+                    cx.notify();
+                    return;
+                }
+                if trimmed_name.len() > 128 {
+                    *error = Some("Display name must not exceed 128 characters.".into());
+                    cx.notify();
+                    return;
+                }
+                let trimmed_loc = location.trim();
+                if trimmed_loc.len() > 128 {
+                    *error = Some("Location must not exceed 128 characters.".into());
+                    cx.notify();
+                    return;
+                }
+                let token = match &self.state {
+                    ScreenState::Connected { session_token, .. } => session_token.clone(),
+                    _ => return,
+                };
+                *in_flight = true;
+                *error = None;
+                (
+                    token,
+                    device_id.clone(),
+                    trimmed_name.to_string(),
+                    if trimmed_loc.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed_loc.to_string())
+                    },
+                )
+            }
+            _ => return,
+        };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let device_id_label = target_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(UpdateFleetDeviceRequest {
+                        device_id: target_id,
+                        display_name: target_name,
+                        location: target_location,
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    client.update_fleet_device(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(Ok(())) => {
+                        view.close_overlay(cx);
+                        if let ScreenState::Connected { notice, .. } = &mut view.state {
+                            *notice = Some(format!("Updated device '{device_id_label}'."));
+                            let token = tok_check.clone();
+                            view.fetch_status(token, cx);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if let Overlay::EditDevice {
+                            error, in_flight, ..
+                        } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(err.to_string());
+                        }
+                    }
+                    Err(join_err) => {
+                        if let Overlay::EditDevice {
                             error, in_flight, ..
                         } = &mut view.overlay
                         {
@@ -1527,46 +1661,168 @@ impl ControllerApp {
                     )
                     .into_any_element()
             }
+            Overlay::EditDevice {
+                device_id,
+                display_name,
+                location,
+                error,
+                in_flight,
+            } => {
+                let name_active = self.active_field == ActiveField::EditDeviceDisplayName;
+                let loc_active = self.active_field == ActiveField::EditDeviceLocation;
+
+                div()
+                    .mt_4()
+                    .p_4()
+                    .bg(rgb(0x16212e))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x2a3b4c))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(gpui::px(450.0))
+                    .child(div().text_lg().child("Edit Device"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8899aa))
+                            .child(format!("Device ID: {device_id}")),
+                    )
+                    .child("Display Name:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if name_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("ed-name-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::EditDeviceDisplayName;
+                                cx.notify();
+                            }))
+                            .child(if display_name.is_empty() {
+                                "Enter display name...".to_string()
+                            } else {
+                                display_name.clone()
+                            }),
+                    )
+                    .child("Location (optional):")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if loc_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("ed-location-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::EditDeviceLocation;
+                                cx.notify();
+                            }))
+                            .child(if location.is_empty() {
+                                "Enter location (optional)...".to_string()
+                            } else {
+                                location.clone()
+                            }),
+                    )
+                    .children(
+                        error.as_ref().map(|err| {
+                            div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(if *in_flight {
+                                        rgb(0x556677)
+                                    } else {
+                                        rgb(0x2d884d)
+                                    })
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("ed-submit-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_edit_device(cx);
+                                    }))
+                                    .child(if *in_flight {
+                                        "Saving..."
+                                    } else {
+                                        "Save Changes"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(rgb(0x445566))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("ed-cancel-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_overlay(cx);
+                                    }))
+                                    .child("Cancel"),
+                            ),
+                    )
+                    .into_any_element()
+            }
             Overlay::None => div().into_any_element(),
         }
     }
 
     fn handle_overlay_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = &event.keystroke.key;
-        let change_active = matches!(
-            (&self.overlay, self.active_field),
-            (Overlay::ChangePassword { .. }, ActiveField::CurrentPassword)
-                | (
-                    Overlay::ResetPassword { .. },
-                    ActiveField::TemporaryPassword
-                )
-        );
-        let is_change = matches!(self.overlay, Overlay::ChangePassword { .. });
         let in_flight = match &self.overlay {
             Overlay::ChangePassword { in_flight, .. }
-            | Overlay::ResetPassword { in_flight, .. } => *in_flight,
+            | Overlay::ResetPassword { in_flight, .. }
+            | Overlay::EditDevice { in_flight, .. } => *in_flight,
             Overlay::None => false,
         };
         if in_flight {
             return;
         }
         match key.as_str() {
-            "enter" => {
-                if is_change {
-                    self.submit_change_password(cx);
-                } else {
-                    self.submit_reset_password(cx);
-                }
-            }
+            "enter" => match &self.overlay {
+                Overlay::ChangePassword { .. } => self.submit_change_password(cx),
+                Overlay::ResetPassword { .. } => self.submit_reset_password(cx),
+                Overlay::EditDevice { .. } => self.submit_edit_device(cx),
+                Overlay::None => {}
+            },
             "tab" => {
-                self.active_field = match (is_change, change_active) {
-                    (true, true) => ActiveField::NewPassword,
-                    (true, _) if self.active_field == ActiveField::NewPassword => {
-                        ActiveField::ConfirmPassword
-                    }
-                    (true, _) => ActiveField::CurrentPassword,
-                    (false, true) => ActiveField::ConfirmPassword,
-                    (false, _) => ActiveField::TemporaryPassword,
+                self.active_field = match &self.overlay {
+                    Overlay::ChangePassword { .. } => match self.active_field {
+                        ActiveField::CurrentPassword => ActiveField::NewPassword,
+                        ActiveField::NewPassword => ActiveField::ConfirmPassword,
+                        _ => ActiveField::CurrentPassword,
+                    },
+                    Overlay::ResetPassword { .. } => match self.active_field {
+                        ActiveField::TemporaryPassword => ActiveField::ConfirmPassword,
+                        _ => ActiveField::TemporaryPassword,
+                    },
+                    Overlay::EditDevice { .. } => match self.active_field {
+                        ActiveField::EditDeviceDisplayName => ActiveField::EditDeviceLocation,
+                        _ => ActiveField::EditDeviceDisplayName,
+                    },
+                    Overlay::None => self.active_field,
                 };
                 cx.notify();
             }
@@ -1606,6 +1862,15 @@ impl ControllerApp {
                         ActiveField::ConfirmPassword,
                     ) => {
                         confirm_password.pop();
+                    }
+                    (
+                        Overlay::EditDevice { display_name, .. },
+                        ActiveField::EditDeviceDisplayName,
+                    ) => {
+                        display_name.pop();
+                    }
+                    (Overlay::EditDevice { location, .. }, ActiveField::EditDeviceLocation) => {
+                        location.pop();
                     }
                     _ => {}
                 }
@@ -1652,6 +1917,15 @@ impl ControllerApp {
                             ActiveField::ConfirmPassword,
                         ) => {
                             confirm_password.push(c);
+                        }
+                        (
+                            Overlay::EditDevice { display_name, .. },
+                            ActiveField::EditDeviceDisplayName,
+                        ) => {
+                            display_name.push(c);
+                        }
+                        (Overlay::EditDevice { location, .. }, ActiveField::EditDeviceLocation) => {
+                            location.push(c);
                         }
                         _ => {}
                     }
@@ -2209,7 +2483,7 @@ impl Render for ControllerApp {
                         },
                     ));
                 } else {
-                    let header_row = div()
+                    let mut header_row = div()
                         .flex()
                         .gap_4()
                         .py_1()
@@ -2217,31 +2491,44 @@ impl Render for ControllerApp {
                         .border_color(rgb(0x334455))
                         .text_sm()
                         .text_color(rgb(0x8899aa))
-                        .child(div().w(gpui::px(220.0)).child("Device"))
-                        .child(div().w(gpui::px(90.0)).child("Type"))
-                        .child(div().w(gpui::px(180.0)).child("Last Address"))
-                        .child(div().w(gpui::px(100.0)).child("Status"))
-                        .child(div().w(gpui::px(140.0)).child("Last Seen"));
+                        .child(div().w(gpui::px(200.0)).child("Device"))
+                        .child(div().w(gpui::px(80.0)).child("Type"))
+                        .child(div().w(gpui::px(140.0)).child("Location"))
+                        .child(div().w(gpui::px(160.0)).child("Last Address"))
+                        .child(div().w(gpui::px(90.0)).child("Status"))
+                        .child(div().w(gpui::px(130.0)).child("Last Seen"));
+                    if is_admin {
+                        header_row = header_row.child(div().w(gpui::px(70.0)).child("Actions"));
+                    }
                     fleet_list = fleet_list.child(header_row);
 
                     for device in devices {
-                        let row =
+                        let dev_id = device.device_id.clone();
+                        let dev_name = device.display_name.clone();
+                        let dev_loc = device.location.clone();
+                        let mut row =
                             div()
                                 .flex()
                                 .gap_4()
                                 .items_center()
                                 .py_1()
-                                .child(div().w(gpui::px(220.0)).child(format!(
+                                .child(div().w(gpui::px(200.0)).child(format!(
                                     "{} ({})",
                                     device.display_name, device.device_id
                                 )))
                                 .child(
                                     div()
-                                        .w(gpui::px(90.0))
+                                        .w(gpui::px(80.0))
                                         .text_color(rgb(0xaaaaaa))
                                         .child(device.device_type.clone()),
                                 )
-                                .child(div().w(gpui::px(180.0)).text_color(rgb(0xaaaaaa)).child(
+                                .child(div().w(gpui::px(140.0)).text_color(rgb(0xaaaaaa)).child(
+                                    match &device.location {
+                                        Some(loc) if !loc.is_empty() => loc.clone(),
+                                        _ => "—".to_string(),
+                                    },
+                                ))
+                                .child(div().w(gpui::px(160.0)).text_color(rgb(0xaaaaaa)).child(
                                     if device.last_address.is_empty() {
                                         "—".to_string()
                                     } else {
@@ -2250,7 +2537,7 @@ impl Render for ControllerApp {
                                 ))
                                 .child(
                                     div()
-                                        .w(gpui::px(100.0))
+                                        .w(gpui::px(90.0))
                                         .text_color(if device.online {
                                             rgb(0x44cc44)
                                         } else {
@@ -2260,11 +2547,35 @@ impl Render for ControllerApp {
                                 )
                                 .child(
                                     div()
-                                        .w(gpui::px(140.0))
+                                        .w(gpui::px(130.0))
                                         .text_color(rgb(0x8899aa))
                                         .text_sm()
                                         .child(relative_last_seen(device.last_seen_unix_ms)),
                                 );
+                        if is_admin {
+                            row = row.child(
+                                div().w(gpui::px(70.0)).child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(0x3a5a7a))
+                                        .text_color(rgb(0xffffff))
+                                        .rounded_md()
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .id(format!("edit-device-btn-{}", device.device_id))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.open_edit_device(
+                                                dev_id.clone(),
+                                                dev_name.clone(),
+                                                dev_loc.clone(),
+                                                cx,
+                                            );
+                                        }))
+                                        .child("Edit"),
+                                ),
+                            );
+                        }
                         fleet_list = fleet_list.child(row);
                     }
                 }
