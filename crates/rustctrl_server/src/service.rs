@@ -4,7 +4,8 @@ use rustctrl_core::DeviceId;
 use rustctrl_protocol::auth::{
     ChangeOwnPasswordReply, ChangeOwnPasswordRequest, ChangeStaffRoleReply, ChangeStaffRoleRequest,
     CreateStaffAccountReply, CreateStaffAccountRequest, DeactivateStaffAccountReply,
-    DeactivateStaffAccountRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
+    DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesReply,
+    ListFleetDevicesRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
     LoginRequest, LogoutReply, LogoutRequest, ReplaceTemporaryPasswordReply,
     ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply, ResetStaffPasswordRequest,
     StaffAccountEntry, StaffStatusReply, StaffStatusRequest,
@@ -82,10 +83,11 @@ impl Bootstrap for BootstrapService {
                 "certificate does not identify this device",
             ));
         }
+        let remote_address = request.remote_addr().map(|addr| addr.to_string());
         let body = request.into_inner();
         let timestamp = self
             .store
-            .heartbeat(id, body.name, body.agent_version)
+            .heartbeat(id, body.name, body.agent_version, remote_address)
             .await
             .map_err(database_error)?;
         tracing::debug!(device_id = %id, "heartbeat stored");
@@ -98,13 +100,15 @@ impl Bootstrap for BootstrapService {
 pub struct StaffAuthService {
     store: DeviceStore,
     remembered_lifetime_secs: u64,
+    offline_after_secs: u64,
 }
 
 impl StaffAuthService {
-    pub fn new(store: DeviceStore, remembered_lifetime_secs: u64) -> Self {
+    pub fn new(store: DeviceStore, remembered_lifetime_secs: u64, offline_after_secs: u64) -> Self {
         Self {
             store,
             remembered_lifetime_secs,
+            offline_after_secs,
         }
     }
 
@@ -134,6 +138,19 @@ impl StaffAuthService {
             Ok(Some(session)) if !session.revoked => Ok(session),
             _ => Err(Status::unauthenticated("invalid or revoked staff session")),
         }
+    }
+
+    async fn authenticate_staff<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<crate::store::StaffSession, Status> {
+        let session = self.authenticate_request(request).await?;
+        if session.must_change_password {
+            return Err(Status::permission_denied(
+                "password change required before accessing protected operations",
+            ));
+        }
+        Ok(session)
     }
 
     async fn authenticate_admin<T>(
@@ -525,12 +542,7 @@ impl StaffAuth for StaffAuthService {
         &self,
         request: Request<StaffStatusRequest>,
     ) -> Result<Response<StaffStatusReply>, Status> {
-        let session = self.authenticate_request(&request).await?;
-        if session.must_change_password {
-            return Err(Status::permission_denied(
-                "password change required before accessing protected operations",
-            ));
-        }
+        let session = self.authenticate_staff(&request).await?;
 
         let count = self.store.count().await.map_err(database_error)?;
         Ok(Response::new(StaffStatusReply {
@@ -540,6 +552,35 @@ impl StaffAuth for StaffAuthService {
             registered_devices: count,
             server_version: env!("CARGO_PKG_VERSION").into(),
         }))
+    }
+
+    async fn list_fleet_devices(
+        &self,
+        request: Request<ListFleetDevicesRequest>,
+    ) -> Result<Response<ListFleetDevicesReply>, Status> {
+        // Both roles read the complete Fleet Inventory; only a valid,
+        // non-temporary Staff Session is required.
+        self.authenticate_staff(&request).await?;
+
+        let devices = self.store.list_devices().await.map_err(database_error)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default();
+        let window_ms =
+            i64::try_from(self.offline_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        let entries = devices
+            .into_iter()
+            .map(|device| FleetDeviceEntry {
+                device_id: device.device_id,
+                display_name: device.name,
+                device_type: "windows".into(),
+                last_address: device.last_address.unwrap_or_default(),
+                online: now_ms.saturating_sub(device.last_seen_unix_ms) <= window_ms,
+                last_seen_unix_ms: device.last_seen_unix_ms,
+            })
+            .collect();
+        Ok(Response::new(ListFleetDevicesReply { devices: entries }))
     }
 
     async fn list_staff_accounts(
@@ -753,6 +794,7 @@ pub async fn serve_on(
         .add_service(StaffAuthServer::new(StaffAuthService::new(
             store,
             config.staff_session.remembered_lifetime_secs,
+            config.fleet.offline_after_secs,
         )))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),

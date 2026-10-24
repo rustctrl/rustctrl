@@ -9,3 +9,7 @@ client_ca = "../.local/pki/server/ca.pem"
 [staff_session]
 # Finite lifetime for remembered staff logins, enforced by the Server.
 remembered_lifetime_secs = 2592000
+
+[fleet]
+# Heartbeat freshness window used to derive Device online status.
+offline_after_secs = 60

@@ -6,9 +6,9 @@ use gpui::{
 use rustctrl_core::ControllerConfig;
 use rustctrl_protocol::auth::{
     ChangeOwnPasswordRequest, ChangeStaffRoleRequest, CreateStaffAccountRequest,
-    DeactivateStaffAccountRequest, ListStaffAccountsRequest, LoginRequest, LogoutRequest,
-    ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffAccountEntry,
-    StaffStatusRequest,
+    DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesRequest,
+    ListStaffAccountsRequest, LoginRequest, LogoutRequest, ReplaceTemporaryPasswordRequest,
+    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusRequest,
 };
 use std::time::Duration;
 
@@ -68,6 +68,7 @@ enum ScreenState {
         role: String,
         server_version: String,
         registered_devices: u64,
+        devices: Vec<FleetDeviceEntry>,
         accounts: Vec<StaffAccountEntry>,
         new_account_username: String,
         new_account_role: String,
@@ -196,6 +197,7 @@ impl ControllerApp {
                                 role: reply.role,
                                 server_version: reply.server_version,
                                 registered_devices: reply.registered_devices,
+                                devices: Vec::new(),
                                 accounts: Vec::new(),
                                 new_account_username: String::new(),
                                 new_account_role: "operator".into(),
@@ -357,6 +359,7 @@ impl ControllerApp {
                                 role: reply.role,
                                 server_version: "Loading...".into(),
                                 registered_devices: 0,
+                                devices: Vec::new(),
                                 accounts: Vec::new(),
                                 new_account_username: String::new(),
                                 new_account_role: "operator".into(),
@@ -494,6 +497,7 @@ impl ControllerApp {
                             role: role.clone(),
                             server_version: "Loading...".into(),
                             registered_devices: 0,
+                            devices: Vec::new(),
                             accounts: Vec::new(),
                             new_account_username: String::new(),
                             new_account_role: "operator".into(),
@@ -619,6 +623,18 @@ impl ControllerApp {
                     req.metadata_mut()
                         .insert("authorization", format!("Bearer {tok_for_req}").parse()?);
                     let reply = client.get_staff_status(req).await?.into_inner();
+                    // Both roles read the full Fleet Inventory; a failure here
+                    // fails the whole refresh so the previous data is kept and
+                    // reported as a Server problem instead of an empty Fleet.
+                    let mut devices_req = tonic::Request::new(ListFleetDevicesRequest {});
+                    devices_req
+                        .metadata_mut()
+                        .insert("authorization", format!("Bearer {tok_for_req}").parse()?);
+                    let devices = client
+                        .list_fleet_devices(devices_req)
+                        .await?
+                        .into_inner()
+                        .devices;
                     let accounts = if is_admin || reply.role == "admin" {
                         let mut list_req = tonic::Request::new(ListStaffAccountsRequest {});
                         list_req
@@ -632,13 +648,14 @@ impl ControllerApp {
                     } else {
                         Vec::new()
                     };
-                    Ok::<_, anyhow::Error>((reply, accounts))
+                    Ok::<_, anyhow::Error>((reply, devices, accounts))
                 })
                 .await;
 
             let _ = this.update(cx, |view, cx| {
                 if let ScreenState::Connected {
                     session_token: tok,
+                    devices,
                     accounts,
                     new_account_username,
                     new_account_role,
@@ -651,7 +668,7 @@ impl ControllerApp {
                     && *tok == tok_for_update
                 {
                     match res {
-                        Ok(Ok((reply, accs))) => {
+                        Ok(Ok((reply, devices_reply, accs))) => {
                             let updated_accounts = if reply.role == "admin" {
                                 accs
                             } else {
@@ -665,6 +682,7 @@ impl ControllerApp {
                                 role: reply.role,
                                 server_version: reply.server_version,
                                 registered_devices: reply.registered_devices,
+                                devices: devices_reply,
                                 accounts: updated_accounts,
                                 new_account_username: new_account_username.clone(),
                                 new_account_role: new_account_role.clone(),
@@ -681,6 +699,7 @@ impl ControllerApp {
                                 role: String::new(),
                                 server_version: "Unavailable".into(),
                                 registered_devices: 0,
+                                devices: devices.clone(),
                                 accounts: accounts.clone(),
                                 new_account_username: new_account_username.clone(),
                                 new_account_role: new_account_role.clone(),
@@ -697,6 +716,7 @@ impl ControllerApp {
                                 role: String::new(),
                                 server_version: "Unavailable".into(),
                                 registered_devices: 0,
+                                devices: devices.clone(),
                                 accounts: accounts.clone(),
                                 new_account_username: new_account_username.clone(),
                                 new_account_role: new_account_role.clone(),
@@ -2079,6 +2099,7 @@ impl Render for ControllerApp {
                 role,
                 server_version,
                 registered_devices,
+                devices,
                 accounts,
                 new_account_username,
                 new_account_role,
@@ -2089,58 +2110,67 @@ impl Render for ControllerApp {
                 ..
             } => {
                 let is_admin = role == "admin";
-                let mut content = container.child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(div().text_3xl().child("RustCtrl"))
-                                .child(format!(
-                                    "Connected over mutual TLS · Server {server_version}"
-                                ))
-                                .child(format!("Logged in as: {username} ({role})"))
-                                .child(format!(
-                                    "Registered devices in fleet: {registered_devices}"
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .px_4()
-                                        .py_2()
-                                        .bg(rgb(0x2d5a88))
-                                        .text_color(rgb(0xffffff))
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .id("change-password-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_change_password(cx);
-                                        }))
-                                        .child("Change Password"),
-                                )
-                                .child(
-                                    div()
-                                        .px_4()
-                                        .py_2()
-                                        .bg(rgb(0x883333))
-                                        .text_color(rgb(0xffffff))
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .id("signout-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.submit_logout(cx);
-                                        }))
-                                        .child("Sign Out"),
-                                ),
-                        ),
-                );
+                // Scrollable so a populated Fleet cannot push Devices and the
+                // account controls below the viewport.
+                let mut content = div()
+                    .id("connected-scroll")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().text_3xl().child("RustCtrl"))
+                                    .child(format!(
+                                        "Connected over mutual TLS · Server {server_version}"
+                                    ))
+                                    .child(format!("Logged in as: {username} ({role})"))
+                                    .child(format!(
+                                        "Registered devices in fleet: {registered_devices}"
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .px_4()
+                                            .py_2()
+                                            .bg(rgb(0x2d5a88))
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .id("change-password-btn")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.open_change_password(cx);
+                                            }))
+                                            .child("Change Password"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_4()
+                                            .py_2()
+                                            .bg(rgb(0x883333))
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .id("signout-btn")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit_logout(cx);
+                                            }))
+                                            .child("Sign Out"),
+                                    ),
+                            ),
+                    );
 
                 if let Some(err) = error {
                     content = content.child(
@@ -2161,6 +2191,84 @@ impl Render for ControllerApp {
                             .child(note.clone()),
                     );
                 }
+
+                // The Fleet Inventory is visible to both roles and derives
+                // online status from heartbeat freshness on the Server.
+                let mut fleet_list = div()
+                    .mt_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_xl().child("Fleet Inventory"));
+                if devices.is_empty() {
+                    fleet_list = fleet_list.child(div().text_sm().text_color(rgb(0x8899aa)).child(
+                        if server_version == "Unavailable" {
+                            "Server unavailable — the last known Fleet is shown below."
+                        } else {
+                            "No Devices registered yet."
+                        },
+                    ));
+                } else {
+                    let header_row = div()
+                        .flex()
+                        .gap_4()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(rgb(0x334455))
+                        .text_sm()
+                        .text_color(rgb(0x8899aa))
+                        .child(div().w(gpui::px(220.0)).child("Device"))
+                        .child(div().w(gpui::px(90.0)).child("Type"))
+                        .child(div().w(gpui::px(180.0)).child("Last Address"))
+                        .child(div().w(gpui::px(100.0)).child("Status"))
+                        .child(div().w(gpui::px(140.0)).child("Last Seen"));
+                    fleet_list = fleet_list.child(header_row);
+
+                    for device in devices {
+                        let row =
+                            div()
+                                .flex()
+                                .gap_4()
+                                .items_center()
+                                .py_1()
+                                .child(div().w(gpui::px(220.0)).child(format!(
+                                    "{} ({})",
+                                    device.display_name, device.device_id
+                                )))
+                                .child(
+                                    div()
+                                        .w(gpui::px(90.0))
+                                        .text_color(rgb(0xaaaaaa))
+                                        .child(device.device_type.clone()),
+                                )
+                                .child(div().w(gpui::px(180.0)).text_color(rgb(0xaaaaaa)).child(
+                                    if device.last_address.is_empty() {
+                                        "—".to_string()
+                                    } else {
+                                        device.last_address.clone()
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .w(gpui::px(100.0))
+                                        .text_color(if device.online {
+                                            rgb(0x44cc44)
+                                        } else {
+                                            rgb(0xff6b6b)
+                                        })
+                                        .child(if device.online { "Online" } else { "Offline" }),
+                                )
+                                .child(
+                                    div()
+                                        .w(gpui::px(140.0))
+                                        .text_color(rgb(0x8899aa))
+                                        .text_sm()
+                                        .child(relative_last_seen(device.last_seen_unix_ms)),
+                                );
+                        fleet_list = fleet_list.child(row);
+                    }
+                }
+                content = content.child(fleet_list);
 
                 if !matches!(self.overlay, Overlay::None) {
                     content = content.child(self.render_overlay_form(cx));
@@ -2482,9 +2590,23 @@ impl Render for ControllerApp {
                     );
                 }
 
-                content
+                container.child(content)
             }
         }
+    }
+}
+
+fn relative_last_seen(last_seen_unix_ms: i64) -> String {
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default();
+    let seconds = now_unix_ms.saturating_sub(last_seen_unix_ms) / 1000;
+    match seconds {
+        0..=59 => format!("{seconds}s ago"),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
     }
 }
 

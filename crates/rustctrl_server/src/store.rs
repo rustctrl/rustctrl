@@ -105,6 +105,15 @@ pub struct ActivityRecord {
     pub detail: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct DeviceRecord {
+    pub device_id: String,
+    pub name: String,
+    pub agent_version: String,
+    pub last_address: Option<String>,
+    pub last_seen_unix_ms: i64,
+}
+
 #[derive(Clone)]
 pub struct DeviceStore(Arc<Mutex<Connection>>);
 
@@ -121,6 +130,7 @@ impl DeviceStore {
                 device_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 agent_version TEXT NOT NULL,
+                last_address TEXT,
                 last_seen_unix_ms INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS staff_accounts (
@@ -152,8 +162,16 @@ impl DeviceStore {
                 detail TEXT NOT NULL
             );",
         )?;
-        // Existing databases predate account deactivation and remembered-session
-        // expiry; add missing columns in place.
+        // Existing databases predate account deactivation, remembered-session
+        // expiry, and observed device addresses; add missing columns in place.
+        let device_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('bootstrap_devices')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        if !device_columns.iter().any(|name| name == "last_address") {
+            connection
+                .execute_batch("ALTER TABLE bootstrap_devices ADD COLUMN last_address TEXT;")?;
+        }
         let staff_columns: Vec<String> = connection
             .prepare("SELECT name FROM pragma_table_info('staff_accounts')")?
             .query_map([], |row| row.get(0))?
@@ -178,7 +196,13 @@ impl DeviceStore {
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
 
-    pub async fn heartbeat(&self, id: DeviceId, name: String, version: String) -> Result<i64> {
+    pub async fn heartbeat(
+        &self,
+        id: DeviceId,
+        name: String,
+        version: String,
+        remote_address: Option<String>,
+    ) -> Result<i64> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             let now = current_time_ms()?;
@@ -187,12 +211,40 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             connection.execute(
-                "INSERT INTO bootstrap_devices VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO bootstrap_devices (device_id, name, agent_version, last_address, last_seen_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)
                 ON CONFLICT(device_id) DO UPDATE SET name=excluded.name,
-                agent_version=excluded.agent_version, last_seen_unix_ms=excluded.last_seen_unix_ms",
-                params![id.to_string(), name, version, now],
+                agent_version=excluded.agent_version, last_address=excluded.last_address, last_seen_unix_ms=excluded.last_seen_unix_ms",
+                params![id.to_string(), name, version, remote_address, now],
             )?;
             Ok(now)
+        })
+        .await?
+    }
+
+    pub async fn list_devices(&self) -> Result<Vec<DeviceRecord>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let mut stmt = connection.prepare(
+                "SELECT device_id, name, agent_version, last_address, last_seen_unix_ms FROM bootstrap_devices ORDER BY last_seen_unix_ms DESC, device_id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(DeviceRecord {
+                    device_id: row.get(0)?,
+                    name: row.get(1)?,
+                    agent_version: row.get(2)?,
+                    last_address: row.get(3)?,
+                    last_seen_unix_ms: row.get(4)?,
+                })
+            })?;
+            let mut devices = Vec::new();
+            for row in rows {
+                devices.push(row?);
+            }
+            Ok(devices)
         })
         .await?
     }
