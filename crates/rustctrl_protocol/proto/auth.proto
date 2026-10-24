@@ -10,6 +10,7 @@ service StaffAuth {
   rpc Logout(LogoutRequest) returns (LogoutReply);
   rpc GetStaffStatus(StaffStatusRequest) returns (StaffStatusReply);
   rpc ListFleetDevices(ListFleetDevicesRequest) returns (ListFleetDevicesReply);
+  rpc UpdateFleetDevice(UpdateFleetDeviceRequest) returns (UpdateFleetDeviceReply);
   rpc ListStaffAccounts(ListStaffAccountsRequest) returns (ListStaffAccountsReply);
   rpc CreateStaffAccount(CreateStaffAccountRequest) returns (CreateStaffAccountReply);
   rpc ChangeStaffRole(ChangeStaffRoleRequest) returns (ChangeStaffRoleReply);
@@ -88,10 +89,21 @@ message FleetDeviceEntry {
   string last_address = 4;
   bool online = 5;
   int64 last_seen_unix_ms = 6;
+  optional string location = 7;
 }
 
 message ListFleetDevicesReply {
   repeated FleetDeviceEntry devices = 1;
+}
+
+message UpdateFleetDeviceRequest {
+  string device_id = 1;
+  string display_name = 2;
+  optional string location = 3;
+}
+
+message UpdateFleetDeviceReply {
+  FleetDeviceEntry device = 1;
 }
 
 message StaffAccountEntry {

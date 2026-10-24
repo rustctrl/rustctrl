@@ -112,6 +112,7 @@ pub struct DeviceRecord {
     pub agent_version: String,
     pub last_address: Option<String>,
     pub last_seen_unix_ms: i64,
+    pub location: Option<String>,
 }
 
 #[derive(Clone)]
@@ -160,6 +161,13 @@ impl DeviceStore {
                 action TEXT NOT NULL,
                 result TEXT NOT NULL,
                 detail TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS device_metadata (
+                device_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                location TEXT,
+                updated_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(device_id) REFERENCES bootstrap_devices(device_id)
             );",
         )?;
         // Existing databases predate account deactivation, remembered-session
@@ -229,7 +237,10 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT device_id, name, agent_version, last_address, last_seen_unix_ms FROM bootstrap_devices ORDER BY last_seen_unix_ms DESC, device_id ASC",
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location
+                 FROM bootstrap_devices b
+                 LEFT JOIN device_metadata m ON b.device_id = m.device_id
+                 ORDER BY b.last_seen_unix_ms DESC, b.device_id ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(DeviceRecord {
@@ -238,6 +249,7 @@ impl DeviceStore {
                     agent_version: row.get(2)?,
                     last_address: row.get(3)?,
                     last_seen_unix_ms: row.get(4)?,
+                    location: row.get(5)?,
                 })
             })?;
             let mut devices = Vec::new();
@@ -245,6 +257,116 @@ impl DeviceStore {
                 devices.push(row?);
             }
             Ok(devices)
+        })
+        .await?
+    }
+
+    pub async fn get_device(&self, device_id: &str) -> Result<Option<DeviceRecord>> {
+        let store = self.clone();
+        let device_id = device_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let mut stmt = connection.prepare(
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location
+                 FROM bootstrap_devices b
+                 LEFT JOIN device_metadata m ON b.device_id = m.device_id
+                 WHERE b.device_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![device_id])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(DeviceRecord {
+                    device_id: row.get(0)?,
+                    name: row.get(1)?,
+                    agent_version: row.get(2)?,
+                    last_address: row.get(3)?,
+                    last_seen_unix_ms: row.get(4)?,
+                    location: row.get(5)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
+    }
+
+    pub async fn update_device_metadata(
+        &self,
+        device_id: &str,
+        display_name: &str,
+        location: Option<&str>,
+    ) -> Result<DeviceRecord> {
+        let device_id = device_id.trim();
+        let _: DeviceId = device_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid device_id"))?;
+        let display_name = display_name.trim();
+        anyhow::ensure!(!display_name.is_empty(), "display name cannot be empty");
+        anyhow::ensure!(
+            display_name.len() <= 128,
+            "display name must contain at most 128 characters"
+        );
+        let location = location
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string());
+        if let Some(loc) = &location {
+            anyhow::ensure!(
+                loc.len() <= 128,
+                "location must contain at most 128 characters"
+            );
+        }
+
+        let store = self.clone();
+        let device_id = device_id.to_string();
+        let display_name = display_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+
+            let exists: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM bootstrap_devices WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                anyhow::bail!("device '{device_id}' not found");
+            }
+
+            connection.execute(
+                "INSERT INTO device_metadata (device_id, display_name, location, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                     display_name = excluded.display_name,
+                     location = excluded.location,
+                     updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![device_id, display_name, location, now],
+            )?;
+
+            let record = connection.query_row(
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location
+                 FROM bootstrap_devices b
+                 LEFT JOIN device_metadata m ON b.device_id = m.device_id
+                 WHERE b.device_id = ?1",
+                params![device_id],
+                |row| {
+                    Ok(DeviceRecord {
+                        device_id: row.get(0)?,
+                        name: row.get(1)?,
+                        agent_version: row.get(2)?,
+                        last_address: row.get(3)?,
+                        last_seen_unix_ms: row.get(4)?,
+                        location: row.get(5)?,
+                    })
+                },
+            )?;
+
+            Ok(record)
         })
         .await?
     }
@@ -978,6 +1100,93 @@ mod tests {
         assert!(
             expired.revoked,
             "expired remembered session must be invalid"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn device_metadata_curation_survives_subsequent_heartbeats() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = DeviceStore::open(&temp.path().join("store.db"))?;
+        let dev_id = DeviceId::new();
+
+        // 1. A newly seen device starts with its reported hostname and no location.
+        store
+            .heartbeat(
+                dev_id,
+                "DESKTOP-ABC1234".into(),
+                "1.0.0".into(),
+                Some("192.168.1.50:5000".into()),
+            )
+            .await?;
+
+        let dev = store
+            .get_device(&dev_id.to_string())
+            .await?
+            .expect("device exists");
+        assert_eq!(dev.name, "DESKTOP-ABC1234");
+        assert_eq!(dev.location, None);
+        assert_eq!(dev.last_address, Some("192.168.1.50:5000".into()));
+
+        let list = store.list_devices().await?;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "DESKTOP-ABC1234");
+        assert_eq!(list[0].location, None);
+
+        // 2. Admin edits display name and adds location.
+        let updated = store
+            .update_device_metadata(
+                &dev_id.to_string(),
+                "Reception Front Desk",
+                Some("Building A - Floor 1"),
+            )
+            .await?;
+        assert_eq!(updated.name, "Reception Front Desk");
+        assert_eq!(updated.location, Some("Building A - Floor 1".into()));
+
+        // 3. Subsequent heartbeats report new IP, newer version, or even a different hostname.
+        // Observed data updates, but curated metadata must NOT be overwritten!
+        store
+            .heartbeat(
+                dev_id,
+                "DESKTOP-ABC1234-RENAMED".into(),
+                "1.1.0".into(),
+                Some("192.168.1.99:5000".into()),
+            )
+            .await?;
+
+        let dev_after = store
+            .get_device(&dev_id.to_string())
+            .await?
+            .expect("device exists");
+        assert_eq!(dev_after.name, "Reception Front Desk");
+        assert_eq!(dev_after.location, Some("Building A - Floor 1".into()));
+        assert_eq!(dev_after.agent_version, "1.1.0");
+        assert_eq!(dev_after.last_address, Some("192.168.1.99:5000".into()));
+
+        // 4. Admin clears the location (sets to None or whitespace).
+        let cleared = store
+            .update_device_metadata(&dev_id.to_string(), "Reception Front Desk", Some("   "))
+            .await?;
+        assert_eq!(cleared.name, "Reception Front Desk");
+        assert_eq!(cleared.location, None);
+
+        // 5. Validation checks:
+        // Empty display name rejected
+        assert!(
+            store
+                .update_device_metadata(&dev_id.to_string(), "   ", None)
+                .await
+                .is_err()
+        );
+        // Non-existent device rejected
+        let fake_id = DeviceId::new();
+        assert!(
+            store
+                .update_device_metadata(&fake_id.to_string(), "Valid Name", None)
+                .await
+                .is_err()
         );
 
         Ok(())
