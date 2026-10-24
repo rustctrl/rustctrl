@@ -6,8 +6,9 @@ use gpui::{
 use rustctrl_core::ControllerConfig;
 use rustctrl_protocol::auth::{
     ChangeOwnPasswordRequest, ChangeStaffRoleRequest, CreateStaffAccountRequest,
-    ListStaffAccountsRequest, LoginRequest, LogoutRequest, ReplaceTemporaryPasswordRequest,
-    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusRequest,
+    DeactivateStaffAccountRequest, ListStaffAccountsRequest, LoginRequest, LogoutRequest,
+    ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffAccountEntry,
+    StaffStatusRequest,
 };
 use std::time::Duration;
 
@@ -625,6 +626,94 @@ impl ControllerApp {
                     }
                     cx.notify();
                 }
+            });
+        })
+        .detach();
+    }
+
+    fn submit_deactivate_account(&mut self, target_username: String, cx: &mut Context<Self>) {
+        let session_token = match &mut self.state {
+            ScreenState::Connected {
+                session_token,
+                role,
+                in_flight,
+                error,
+                ..
+            } if role == "admin" && !*in_flight => {
+                *in_flight = true;
+                *error = None;
+                session_token.clone()
+            }
+            _ => return,
+        };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let target_label = target_username.clone();
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(DeactivateStaffAccountRequest {
+                        username: target_username,
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    client.deactivate_staff_account(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                let err_text = match &res {
+                    Ok(Ok(())) => None,
+                    Ok(Err(err)) => Some(err.to_string()),
+                    Err(join_err) => Some(join_err.to_string()),
+                };
+                if let ScreenState::Connected {
+                    in_flight, error, ..
+                } = &mut view.state
+                {
+                    *in_flight = false;
+                    if let Some(text) = err_text {
+                        *error = Some(text);
+                    }
+                }
+                if res.is_ok() {
+                    let self_deactivate = matches!(
+                        &view.state,
+                        ScreenState::Connected { username, session_token, .. }
+                            if *username == target_label && *session_token == tok_check
+                    );
+                    if self_deactivate {
+                        // Deactivating the own account revokes this session.
+                        view.state = ScreenState::Login {
+                            username: target_label,
+                            password: String::new(),
+                            error: None,
+                            notice: Some(
+                                "Account deactivated and this session was revoked.".into(),
+                            ),
+                            in_flight: false,
+                        };
+                        view.active_field = ActiveField::Username;
+                    } else if let ScreenState::Connected {
+                        notice,
+                        session_token,
+                        ..
+                    } = &mut view.state
+                    {
+                        *notice = Some(format!(
+                            "Account '{target_label}' deactivated; its sessions were revoked."
+                        ));
+                        let token = session_token.clone();
+                        view.fetch_status(token, cx);
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -1902,7 +1991,54 @@ impl Render for ControllerApp {
 
                             let target_user_clone = acc_username.clone();
                             let reset_target_clone = acc_username.clone();
+                            let deactivate_target_clone = acc_username.clone();
                             let new_target_role_str = new_target_role.to_string();
+
+                            let status_cell = if !acc.active {
+                                div()
+                                    .w(gpui::px(160.0))
+                                    .text_color(rgb(0x8899aa))
+                                    .child("Deactivated")
+                            } else {
+                                div()
+                                    .w(gpui::px(160.0))
+                                    .text_color(if acc.must_change_password {
+                                        rgb(0xffcc00)
+                                    } else {
+                                        rgb(0x44cc44)
+                                    })
+                                    .child(if acc.must_change_password {
+                                        "Temporary Password"
+                                    } else {
+                                        "Active"
+                                    })
+                            };
+
+                            let deactivate_button = if acc.active {
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .bg(if *in_flight {
+                                        rgb(0x556677)
+                                    } else {
+                                        rgb(0x664455)
+                                    })
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .id(format!("deactivate-btn-{}", acc_username))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.submit_deactivate_account(
+                                            deactivate_target_clone.clone(),
+                                            cx,
+                                        );
+                                    }))
+                                    .child("Deactivate")
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            };
 
                             let row = div()
                                 .flex()
@@ -1920,20 +2056,7 @@ impl Render for ControllerApp {
                                         })
                                         .child(acc_role),
                                 )
-                                .child(
-                                    div()
-                                        .w(gpui::px(160.0))
-                                        .text_color(if acc.must_change_password {
-                                            rgb(0xffcc00)
-                                        } else {
-                                            rgb(0x44cc44)
-                                        })
-                                        .child(if acc.must_change_password {
-                                            "Temporary Password"
-                                        } else {
-                                            "Active"
-                                        }),
-                                )
+                                .child(status_cell)
                                 .child(
                                     div()
                                         .w(gpui::px(310.0))
@@ -1979,7 +2102,8 @@ impl Render for ControllerApp {
                                                     );
                                                 }))
                                                 .child("Reset Password"),
-                                        ),
+                                        )
+                                        .child(deactivate_button),
                                 );
                             accounts_list = accounts_list.child(row);
                         }
