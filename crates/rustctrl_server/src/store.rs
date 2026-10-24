@@ -276,6 +276,157 @@ impl DeviceStore {
         .await?
     }
 
+    pub async fn list_staff_accounts(&self) -> Result<Vec<StaffAccount>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let mut stmt = connection.prepare(
+                "SELECT username, role, password_hash, must_change_password, created_at_unix_ms, updated_at_unix_ms FROM staff_accounts ORDER BY username ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let role_str: String = row.get(1)?;
+                let role: StaffRole = role_str.parse().map_err(|e: anyhow::Error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+                    )
+                })?;
+                let must_change: i64 = row.get(3)?;
+                Ok(StaffAccount {
+                    username: row.get(0)?,
+                    role,
+                    password_hash: row.get(2)?,
+                    must_change_password: must_change != 0,
+                    created_at_unix_ms: row.get(4)?,
+                    updated_at_unix_ms: row.get(5)?,
+                })
+            })?;
+            let mut accounts = Vec::new();
+            for r in rows {
+                accounts.push(r?);
+            }
+            Ok(accounts)
+        })
+        .await?
+    }
+
+    pub async fn create_staff_account(
+        &self,
+        username: String,
+        role: StaffRole,
+        temporary_password: String,
+    ) -> Result<StaffAccount> {
+        let username = username.trim().to_string();
+        anyhow::ensure!(
+            !username.is_empty() && username.len() <= 64,
+            "username must contain 1 to 64 characters"
+        );
+        anyhow::ensure!(
+            username
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'),
+            "username may only contain alphanumeric characters, '.', '_', or '-'"
+        );
+        let hash = crate::password::hash_password(&temporary_password)?;
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let exists: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM staff_accounts WHERE username = ?1",
+                params![username],
+                |row| row.get(0),
+            )?;
+            if exists > 0 {
+                anyhow::bail!("staff account '{username}' already exists");
+            }
+            connection.execute(
+                "INSERT INTO staff_accounts (username, role, password_hash, must_change_password, created_at_unix_ms, updated_at_unix_ms) VALUES (?1, ?2, ?3, 1, ?4, ?4)",
+                params![username, role.as_str(), hash, now],
+            )?;
+            Ok(StaffAccount {
+                username,
+                role,
+                password_hash: hash,
+                must_change_password: true,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })
+        })
+        .await?
+    }
+
+    pub async fn change_staff_role(
+        &self,
+        username: &str,
+        new_role: StaffRole,
+    ) -> Result<StaffAccount> {
+        let store = self.clone();
+        let username = username.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let tx = connection.transaction()?;
+            let (current_role, password_hash, must_change_password, created_at_unix_ms) = {
+                let mut stmt = tx.prepare(
+                    "SELECT role, password_hash, must_change_password, created_at_unix_ms FROM staff_accounts WHERE username = ?1",
+                )?;
+                let mut rows = stmt.query(params![username])?;
+                if let Some(row) = rows.next()? {
+                    let role_str: String = row.get(0)?;
+                    let role: StaffRole = role_str.parse()?;
+                    let must_change: i64 = row.get(2)?;
+                    (role, row.get(1)?, must_change != 0, row.get(3)?)
+                } else {
+                    anyhow::bail!("account '{username}' not found");
+                }
+            };
+
+            if current_role == StaffRole::Admin && new_role == StaffRole::Operator {
+                let admin_count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM staff_accounts WHERE role = 'admin'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if admin_count <= 1 {
+                    anyhow::bail!("cannot demote the last active admin");
+                }
+            }
+
+            tx.execute(
+                "UPDATE staff_accounts SET role = ?1, updated_at_unix_ms = ?2 WHERE username = ?3",
+                params![new_role.as_str(), now, username],
+            )?;
+
+            tx.execute(
+                "UPDATE staff_sessions SET role = ?1 WHERE username = ?2 AND revoked = 0",
+                params![new_role.as_str(), username],
+            )?;
+
+            tx.commit()?;
+
+            Ok(StaffAccount {
+                username,
+                role: new_role,
+                password_hash,
+                must_change_password,
+                created_at_unix_ms,
+                updated_at_unix_ms: now,
+            })
+        })
+        .await?
+    }
+
     pub async fn create_session(
         &self,
         session_id: String,
@@ -317,7 +468,7 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT session_id, username, role, must_change_password, created_at_unix_ms, last_seen_unix_ms, revoked FROM staff_sessions WHERE session_id = ?1",
+                "SELECT s.session_id, s.username, a.role, s.must_change_password, s.created_at_unix_ms, s.last_seen_unix_ms, s.revoked FROM staff_sessions s JOIN staff_accounts a ON s.username = a.username WHERE s.session_id = ?1",
             )?;
             let mut rows = stmt.query(params![session_id])?;
             if let Some(row) = rows.next()? {

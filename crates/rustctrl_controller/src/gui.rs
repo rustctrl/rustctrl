@@ -5,7 +5,8 @@ use gpui::{
 };
 use rustctrl_core::ControllerConfig;
 use rustctrl_protocol::auth::{
-    LoginRequest, LogoutRequest, ReplaceTemporaryPasswordRequest, StaffStatusRequest,
+    ChangeStaffRoleRequest, CreateStaffAccountRequest, ListStaffAccountsRequest, LoginRequest,
+    LogoutRequest, ReplaceTemporaryPasswordRequest, StaffAccountEntry, StaffStatusRequest,
 };
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ enum ActiveField {
     Password,
     NewPassword,
     ConfirmPassword,
+    NewAccountUsername,
+    NewAccountPassword,
 }
 
 #[derive(Clone)]
@@ -40,7 +43,12 @@ enum ScreenState {
         role: String,
         server_version: String,
         registered_devices: u64,
+        accounts: Vec<StaffAccountEntry>,
+        new_account_username: String,
+        new_account_role: String,
+        new_account_password: String,
         error: Option<String>,
+        in_flight: bool,
     },
 }
 
@@ -167,7 +175,12 @@ impl ControllerApp {
                                 role: reply.role,
                                 server_version: "Loading...".into(),
                                 registered_devices: 0,
+                                accounts: Vec::new(),
+                                new_account_username: String::new(),
+                                new_account_role: "operator".into(),
+                                new_account_password: String::new(),
                                 error: None,
+                                in_flight: false,
                             };
                             view.fetch_status(token, cx);
                         }
@@ -288,7 +301,12 @@ impl ControllerApp {
                             role: role.clone(),
                             server_version: "Loading...".into(),
                             registered_devices: 0,
+                            accounts: Vec::new(),
+                            new_account_username: String::new(),
+                            new_account_role: "operator".into(),
+                            new_account_password: String::new(),
                             error: None,
+                            in_flight: false,
                         };
                         view.fetch_status(session_token, cx);
                     }
@@ -381,6 +399,10 @@ impl ControllerApp {
         let handle = self.tokio_handle.clone();
         let tok_for_req = session_token.clone();
         let tok_for_update = session_token;
+        let is_admin = match &self.state {
+            ScreenState::Connected { role, .. } => role == "admin",
+            _ => false,
+        };
         cx.spawn(async move |this, cx| {
             let res = handle
                 .spawn(async move {
@@ -389,49 +411,244 @@ impl ControllerApp {
                     req.metadata_mut()
                         .insert("authorization", format!("Bearer {tok_for_req}").parse()?);
                     let reply = client.get_staff_status(req).await?.into_inner();
-                    Ok::<_, anyhow::Error>(reply)
+                    let accounts = if is_admin || reply.role == "admin" {
+                        let mut list_req = tonic::Request::new(ListStaffAccountsRequest {});
+                        list_req
+                            .metadata_mut()
+                            .insert("authorization", format!("Bearer {tok_for_req}").parse()?);
+                        client
+                            .list_staff_accounts(list_req)
+                            .await
+                            .map(|r| r.into_inner().accounts)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok::<_, anyhow::Error>((reply, accounts))
                 })
                 .await;
 
             let _ = this.update(cx, |view, cx| {
                 if let ScreenState::Connected {
                     session_token: tok,
-                    username,
-                    role,
+                    accounts,
+                    new_account_username,
+                    new_account_role,
+                    new_account_password,
+                    in_flight,
+                    error,
                     ..
-                } = &view.state
+                } = &mut view.state
                     && *tok == tok_for_update
                 {
                     match res {
-                        Ok(Ok(reply)) => {
+                        Ok(Ok((reply, accs))) => {
+                            let updated_accounts = if reply.role == "admin" {
+                                accs
+                            } else {
+                                Vec::new()
+                            };
+                            let keep_error = error.clone();
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
-                                username: username.clone(),
-                                role: role.clone(),
+                                username: reply.username,
+                                role: reply.role,
                                 server_version: reply.server_version,
                                 registered_devices: reply.registered_devices,
-                                error: None,
+                                accounts: updated_accounts,
+                                new_account_username: new_account_username.clone(),
+                                new_account_role: new_account_role.clone(),
+                                new_account_password: new_account_password.clone(),
+                                error: keep_error,
+                                in_flight: *in_flight,
                             };
                         }
                         Ok(Err(err)) => {
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
-                                username: username.clone(),
-                                role: role.clone(),
+                                username: String::new(),
+                                role: String::new(),
                                 server_version: "Unavailable".into(),
                                 registered_devices: 0,
+                                accounts: accounts.clone(),
+                                new_account_username: new_account_username.clone(),
+                                new_account_role: new_account_role.clone(),
+                                new_account_password: new_account_password.clone(),
                                 error: Some(err.to_string()),
+                                in_flight: false,
                             };
                         }
                         Err(e) => {
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
-                                username: username.clone(),
-                                role: role.clone(),
+                                username: String::new(),
+                                role: String::new(),
                                 server_version: "Unavailable".into(),
                                 registered_devices: 0,
+                                accounts: accounts.clone(),
+                                new_account_username: new_account_username.clone(),
+                                new_account_role: new_account_role.clone(),
+                                new_account_password: new_account_password.clone(),
                                 error: Some(e.to_string()),
+                                in_flight: false,
                             };
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn submit_create_account(&mut self, cx: &mut Context<Self>) {
+        let (session_token, new_user, new_role, new_pass) = match &mut self.state {
+            ScreenState::Connected {
+                session_token,
+                role,
+                new_account_username,
+                new_account_role,
+                new_account_password,
+                in_flight,
+                error,
+                ..
+            } if role == "admin" && !*in_flight => {
+                let user = new_account_username.trim().to_string();
+                if user.is_empty() {
+                    *error = Some("Username is required.".into());
+                    cx.notify();
+                    return;
+                }
+                if new_account_password.len() < 8 {
+                    *error = Some("Temporary password must contain at least 8 characters.".into());
+                    cx.notify();
+                    return;
+                }
+                *in_flight = true;
+                *error = None;
+                (
+                    session_token.clone(),
+                    user,
+                    new_account_role.clone(),
+                    new_account_password.clone(),
+                )
+            }
+            _ => return,
+        };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(CreateStaffAccountRequest {
+                        username: new_user,
+                        role: new_role,
+                        temporary_password: new_pass,
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    let reply = client.create_staff_account(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(reply)
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                if let ScreenState::Connected {
+                    session_token,
+                    new_account_username,
+                    new_account_password,
+                    in_flight,
+                    error,
+                    ..
+                } = &mut view.state
+                {
+                    *in_flight = false;
+                    match res {
+                        Ok(Ok(_reply)) => {
+                            new_account_username.clear();
+                            new_account_password.clear();
+                            *error = None;
+                            let token = session_token.clone();
+                            view.fetch_status(token, cx);
+                        }
+                        Ok(Err(e)) => {
+                            *error = Some(e.to_string());
+                        }
+                        Err(join_err) => {
+                            *error = Some(join_err.to_string());
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn submit_change_role(
+        &mut self,
+        target_username: String,
+        new_role: String,
+        cx: &mut Context<Self>,
+    ) {
+        let session_token = match &mut self.state {
+            ScreenState::Connected {
+                session_token,
+                role,
+                in_flight,
+                error,
+                ..
+            } if role == "admin" && !*in_flight => {
+                *in_flight = true;
+                *error = None;
+                session_token.clone()
+            }
+            _ => return,
+        };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(ChangeStaffRoleRequest {
+                        username: target_username,
+                        new_role,
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    let reply = client.change_staff_role(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(reply)
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                if let ScreenState::Connected {
+                    session_token,
+                    in_flight,
+                    error,
+                    ..
+                } = &mut view.state
+                {
+                    *in_flight = false;
+                    match res {
+                        Ok(Ok(_reply)) => {
+                            *error = None;
+                            let token = session_token.clone();
+                            view.fetch_status(token, cx);
+                        }
+                        Ok(Err(e)) => {
+                            *error = Some(e.to_string());
+                        }
+                        Err(join_err) => {
+                            *error = Some(join_err.to_string());
                         }
                     }
                     cx.notify();
@@ -544,7 +761,57 @@ impl ControllerApp {
                     _ => {}
                 }
             }
-            ScreenState::Connected { .. } => {}
+            ScreenState::Connected {
+                new_account_username,
+                new_account_password,
+                in_flight,
+                role,
+                ..
+            } => {
+                if *in_flight || role != "admin" {
+                    return;
+                }
+                match key.as_str() {
+                    "enter" => {
+                        self.submit_create_account(cx);
+                    }
+                    "tab" => {
+                        self.active_field = match self.active_field {
+                            ActiveField::NewAccountUsername => ActiveField::NewAccountPassword,
+                            _ => ActiveField::NewAccountUsername,
+                        };
+                        cx.notify();
+                    }
+                    "backspace" => {
+                        match self.active_field {
+                            ActiveField::NewAccountUsername => {
+                                new_account_username.pop();
+                            }
+                            ActiveField::NewAccountPassword => {
+                                new_account_password.pop();
+                            }
+                            _ => {}
+                        }
+                        cx.notify();
+                    }
+                    k if k.chars().count() == 1 => {
+                        let c = k.chars().next().unwrap();
+                        if !c.is_control() {
+                            match self.active_field {
+                                ActiveField::NewAccountUsername => {
+                                    new_account_username.push(c);
+                                }
+                                ActiveField::NewAccountPassword => {
+                                    new_account_password.push(c);
+                                }
+                                _ => {}
+                            }
+                            cx.notify();
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -786,36 +1053,317 @@ impl Render for ControllerApp {
                 role,
                 server_version,
                 registered_devices,
+                accounts,
+                new_account_username,
+                new_account_role,
+                new_account_password,
                 error,
+                in_flight,
                 ..
-            } => container
-                .child(div().text_3xl().child("RustCtrl"))
-                .child(format!(
-                    "Connected over mutual TLS · Server {server_version}"
-                ))
-                .child(format!("Logged in as: {username} ({role})"))
-                .child(format!("Registered devices in fleet: {registered_devices}"))
-                .children(
-                    error
-                        .as_ref()
-                        .map(|err| div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())),
-                )
-                .child(
+            } => {
+                let is_admin = role == "admin";
+                let mut content = container.child(
                     div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().text_3xl().child("RustCtrl"))
+                                .child(format!(
+                                    "Connected over mutual TLS · Server {server_version}"
+                                ))
+                                .child(format!("Logged in as: {username} ({role})"))
+                                .child(format!(
+                                    "Registered devices in fleet: {registered_devices}"
+                                )),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .py_2()
+                                .bg(rgb(0x883333))
+                                .text_color(rgb(0xffffff))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .id("signout-btn")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.submit_logout(cx);
+                                }))
+                                .child("Sign Out"),
+                        ),
+                );
+
+                if let Some(err) = error {
+                    content = content.child(
+                        div()
+                            .id("connected-error")
+                            .text_color(rgb(0xff6b6b))
+                            .text_sm()
+                            .child(err.clone()),
+                    );
+                }
+
+                if is_admin {
+                    let user_active = self.active_field == ActiveField::NewAccountUsername;
+                    let pass_active = self.active_field == ActiveField::NewAccountPassword;
+                    let masked_new_pass = "•".repeat(new_account_password.len());
+
+                    let mut accounts_list = div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().text_xl().child("Staff Accounts"));
+
+                    if accounts.is_empty() {
+                        accounts_list = accounts_list.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x8899aa))
+                                .child("No other accounts or loading..."),
+                        );
+                    } else {
+                        let header_row = div()
+                            .flex()
+                            .gap_4()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(rgb(0x334455))
+                            .text_sm()
+                            .text_color(rgb(0x8899aa))
+                            .child(div().w(gpui::px(140.0)).child("Username"))
+                            .child(div().w(gpui::px(100.0)).child("Role"))
+                            .child(div().w(gpui::px(160.0)).child("Status"))
+                            .child(div().w(gpui::px(160.0)).child("Action"));
+                        accounts_list = accounts_list.child(header_row);
+
+                        for acc in accounts {
+                            let acc_username = acc.username.clone();
+                            let acc_role = acc.role.clone();
+                            let is_target_admin = acc.role == "admin";
+                            let new_target_role =
+                                if is_target_admin { "operator" } else { "admin" };
+                            let btn_label = if is_target_admin {
+                                "Demote to Operator"
+                            } else {
+                                "Promote to Admin"
+                            };
+                            let btn_bg = if is_target_admin {
+                                rgb(0xaa5533)
+                            } else {
+                                rgb(0x2d884d)
+                            };
+
+                            let target_user_clone = acc_username.clone();
+                            let new_target_role_str = new_target_role.to_string();
+
+                            let row = div()
+                                .flex()
+                                .gap_4()
+                                .items_center()
+                                .py_1()
+                                .child(div().w(gpui::px(140.0)).child(acc_username.clone()))
+                                .child(
+                                    div()
+                                        .w(gpui::px(100.0))
+                                        .text_color(if is_target_admin {
+                                            rgb(0x4a90e2)
+                                        } else {
+                                            rgb(0xaaaaaa)
+                                        })
+                                        .child(acc_role),
+                                )
+                                .child(
+                                    div()
+                                        .w(gpui::px(160.0))
+                                        .text_color(if acc.must_change_password {
+                                            rgb(0xffcc00)
+                                        } else {
+                                            rgb(0x44cc44)
+                                        })
+                                        .child(if acc.must_change_password {
+                                            "Temporary Password"
+                                        } else {
+                                            "Active"
+                                        }),
+                                )
+                                .child(
+                                    div().w(gpui::px(160.0)).child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(if *in_flight { rgb(0x556677) } else { btn_bg })
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .id(format!("role-btn-{}", acc_username))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.submit_change_role(
+                                                    target_user_clone.clone(),
+                                                    new_target_role_str.clone(),
+                                                    cx,
+                                                );
+                                            }))
+                                            .child(btn_label),
+                                    ),
+                                );
+                            accounts_list = accounts_list.child(row);
+                        }
+                    }
+
+                    let create_form = div()
                         .mt_4()
-                        .px_4()
-                        .py_2()
-                        .max_w(gpui::px(120.0))
-                        .bg(rgb(0x883333))
-                        .text_color(rgb(0xffffff))
-                        .rounded_md()
-                        .cursor_pointer()
-                        .id("signout-btn")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.submit_logout(cx);
-                        }))
-                        .child("Sign Out"),
-                ),
+                        .p_4()
+                        .bg(rgb(0x16212e))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(0x2a3b4c))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .max_w(gpui::px(450.0))
+                        .child(div().text_lg().child("Create Staff Account"))
+                        .child("New Username:")
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .bg(rgb(0x1a2634))
+                                .border_1()
+                                .border_color(if user_active {
+                                    rgb(0x4a90e2)
+                                } else {
+                                    rgb(0x334455)
+                                })
+                                .rounded_md()
+                                .id("new-account-username-input")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.active_field = ActiveField::NewAccountUsername;
+                                    cx.notify();
+                                }))
+                                .child(if new_account_username.is_empty() {
+                                    "Enter username...".to_string()
+                                } else {
+                                    new_account_username.clone()
+                                }),
+                        )
+                        .child("Role:")
+                        .child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(if new_account_role == "operator" {
+                                            rgb(0x2d5a88)
+                                        } else {
+                                            rgb(0x223344)
+                                        })
+                                        .id("role-operator-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let ScreenState::Connected {
+                                                new_account_role, ..
+                                            } = &mut this.state
+                                            {
+                                                *new_account_role = "operator".into();
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child("Operator"),
+                                )
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .bg(if new_account_role == "admin" {
+                                            rgb(0x2d5a88)
+                                        } else {
+                                            rgb(0x223344)
+                                        })
+                                        .id("role-admin-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let ScreenState::Connected {
+                                                new_account_role, ..
+                                            } = &mut this.state
+                                            {
+                                                *new_account_role = "admin".into();
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child("Admin"),
+                                ),
+                        )
+                        .child("Temporary Password:")
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .bg(rgb(0x1a2634))
+                                .border_1()
+                                .border_color(if pass_active {
+                                    rgb(0x4a90e2)
+                                } else {
+                                    rgb(0x334455)
+                                })
+                                .rounded_md()
+                                .id("new-account-password-input")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.active_field = ActiveField::NewAccountPassword;
+                                    cx.notify();
+                                }))
+                                .child(if new_account_password.is_empty() {
+                                    "Minimum 8 characters...".to_string()
+                                } else {
+                                    masked_new_pass
+                                }),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .py_2()
+                                .bg(if *in_flight {
+                                    rgb(0x556677)
+                                } else {
+                                    rgb(0x2d884d)
+                                })
+                                .text_color(rgb(0xffffff))
+                                .rounded_md()
+                                .cursor_pointer()
+                                .id("create-account-btn")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.submit_create_account(cx);
+                                }))
+                                .child(if *in_flight {
+                                    "Creating..."
+                                } else {
+                                    "Create Account"
+                                }),
+                        );
+
+                    content = content.child(accounts_list).child(create_form);
+                } else {
+                    content = content.child(
+                        div()
+                            .mt_4()
+                            .p_4()
+                            .bg(rgb(0x16212e))
+                            .rounded_lg()
+                            .text_color(rgb(0x8899aa))
+                            .child("Staff account administration is restricted to Admins. Fleet monitoring mode is active."),
+                    );
+                }
+
+                content
+            }
         }
     }
 }

@@ -2,7 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rustctrl_core::{ControllerConfig, init_logging};
 use rustctrl_protocol::auth::{
-    LoginRequest, LogoutRequest, ReplaceTemporaryPasswordRequest, StaffStatusRequest,
+    ChangeStaffRoleRequest, CreateStaffAccountRequest, ListStaffAccountsRequest, LoginRequest,
+    LogoutRequest, ReplaceTemporaryPasswordRequest, StaffStatusRequest,
 };
 use rustctrl_protocol::bootstrap::HealthRequest;
 use std::path::PathBuf;
@@ -39,6 +40,34 @@ enum Command {
         replace_password: Option<String>,
         #[arg(long)]
         logout: bool,
+    },
+    ListAccounts {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+    },
+    CreateAccount {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        target_username: String,
+        #[arg(long)]
+        target_role: String,
+        #[arg(long)]
+        temporary_password: String,
+    },
+    ChangeRole {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        target_username: String,
+        #[arg(long)]
+        new_role: String,
     },
 }
 
@@ -121,6 +150,112 @@ fn main() -> Result<()> {
                 println!("Logout success.");
             }
 
+            Ok(())
+        }),
+        Command::ListAccounts { username, password } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest { username, password })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!("temporary password must be replaced before listing accounts");
+                }
+                let mut req = tonic::Request::new(ListStaffAccountsRequest {});
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client.list_staff_accounts(req).await?.into_inner();
+                println!("Staff Accounts ({}):", reply.accounts.len());
+                for acc in reply.accounts {
+                    println!(
+                        "  username={} role={} temporary={}",
+                        acc.username, acc.role, acc.must_change_password
+                    );
+                }
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
+        Command::CreateAccount {
+            username,
+            password,
+            target_username,
+            target_role,
+            temporary_password,
+        } => tokio::runtime::Runtime::new()?.block_on(async {
+            let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+            let login_reply = client
+                .login(LoginRequest { username, password })
+                .await?
+                .into_inner();
+            if login_reply.must_change_password {
+                anyhow::bail!("temporary password must be replaced before creating accounts");
+            }
+            let mut req = tonic::Request::new(CreateStaffAccountRequest {
+                username: target_username,
+                role: target_role,
+                temporary_password,
+            });
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let reply = client.create_staff_account(req).await?.into_inner();
+            if let Some(acc) = reply.account {
+                println!(
+                    "Account created: username={} role={} temporary={}",
+                    acc.username, acc.role, acc.must_change_password
+                );
+            }
+            let mut logout_req = tonic::Request::new(LogoutRequest {});
+            logout_req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let _ = client.logout(logout_req).await;
+            Ok(())
+        }),
+        Command::ChangeRole {
+            username,
+            password,
+            target_username,
+            new_role,
+        } => tokio::runtime::Runtime::new()?.block_on(async {
+            let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+            let login_reply = client
+                .login(LoginRequest { username, password })
+                .await?
+                .into_inner();
+            if login_reply.must_change_password {
+                anyhow::bail!("temporary password must be replaced before changing roles");
+            }
+            let mut req = tonic::Request::new(ChangeStaffRoleRequest {
+                username: target_username,
+                new_role,
+            });
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let reply = client.change_staff_role(req).await?.into_inner();
+            println!(
+                "Role changed: username={} role={}",
+                reply.username, reply.role
+            );
+            let mut logout_req = tonic::Request::new(LogoutRequest {});
+            logout_req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let _ = client.logout(logout_req).await;
             Ok(())
         }),
         Command::Gui => {
