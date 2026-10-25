@@ -5,15 +5,16 @@ use crate::{
 use anyhow::{Context, Result};
 use rustctrl_core::DeviceId;
 use rustctrl_protocol::auth::{
-    ChangeOwnPasswordReply, ChangeOwnPasswordRequest, ChangeStaffRoleReply, ChangeStaffRoleRequest,
-    CreateStaffAccountReply, CreateStaffAccountRequest, CreateTargetReply, CreateTargetRequest,
-    DeactivateStaffAccountReply, DeactivateStaffAccountRequest, FleetDeviceEntry,
-    ListFleetDevicesReply, ListFleetDevicesRequest, ListStaffAccountsReply,
-    ListStaffAccountsRequest, LoginReply, LoginRequest, LogoutReply, LogoutRequest,
-    RemoveTargetReply, RemoveTargetRequest, ReplaceTemporaryPasswordReply,
-    ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply, ResetStaffPasswordRequest,
-    StaffAccountEntry, StaffStatusReply, StaffStatusRequest, UpdateFleetDeviceReply,
-    UpdateFleetDeviceRequest, UpdateTargetReply, UpdateTargetRequest,
+    BlockDeviceReply, BlockDeviceRequest, ChangeOwnPasswordReply, ChangeOwnPasswordRequest,
+    ChangeStaffRoleReply, ChangeStaffRoleRequest, CreateStaffAccountReply,
+    CreateStaffAccountRequest, CreateTargetReply, CreateTargetRequest, DeactivateStaffAccountReply,
+    DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesReply,
+    ListFleetDevicesRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
+    LoginRequest, LogoutReply, LogoutRequest, RemoveTargetReply, RemoveTargetRequest,
+    ReplaceTemporaryPasswordReply, ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply,
+    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusReply, StaffStatusRequest,
+    UnblockDeviceReply, UnblockDeviceRequest, UpdateFleetDeviceReply, UpdateFleetDeviceRequest,
+    UpdateTargetReply, UpdateTargetRequest,
     staff_auth_server::{StaffAuth, StaffAuthServer},
 };
 use rustctrl_protocol::bootstrap::{
@@ -88,6 +89,16 @@ impl Bootstrap for BootstrapService {
                 "certificate does not identify this device",
             ));
         }
+
+        if self
+            .store
+            .is_device_blocked(&id.to_string())
+            .await
+            .map_err(database_error)?
+        {
+            return Err(Status::permission_denied("device is blocked"));
+        }
+
         let remote_address = request.remote_addr().map(|addr| addr.to_string());
         let body = request.into_inner();
         let timestamp = self
@@ -806,6 +817,116 @@ impl StaffAuth for StaffAuthService {
         }
     }
 
+    async fn block_device(
+        &self,
+        request: Request<BlockDeviceRequest>,
+    ) -> Result<Response<BlockDeviceReply>, Status> {
+        let body = request.get_ref();
+        let target_device_id = body.device_id.trim().to_string();
+        let session = self
+            .authenticate_admin(&request, "block_device", Some(&target_device_id))
+            .await?;
+
+        match self
+            .store
+            .block_device(&target_device_id, &session.username)
+            .await
+        {
+            Ok(blocked) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "block_device".into(),
+                        "success".into(),
+                        format!("blocked device '{target_device_id}'"),
+                    )
+                    .await;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_default();
+                let window_ms =
+                    i64::try_from(self.offline_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+                Ok(Response::new(BlockDeviceReply {
+                    device: Some(to_fleet_device_entry(blocked, now_ms, window_ms)),
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "block_device".into(),
+                        "rejected".into(),
+                        format!("failed to block device '{target_device_id}': {err_msg}"),
+                    )
+                    .await;
+                if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else if err_msg.contains("already blocked") {
+                    Err(Status::failed_precondition(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
+    }
+
+    async fn unblock_device(
+        &self,
+        request: Request<UnblockDeviceRequest>,
+    ) -> Result<Response<UnblockDeviceReply>, Status> {
+        let body = request.get_ref();
+        let target_device_id = body.device_id.trim().to_string();
+        let session = self
+            .authenticate_admin(&request, "unblock_device", Some(&target_device_id))
+            .await?;
+
+        match self.store.unblock_device(&target_device_id).await {
+            Ok(unblocked) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "unblock_device".into(),
+                        "success".into(),
+                        format!("unblocked device '{target_device_id}'"),
+                    )
+                    .await;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_default();
+                let window_ms =
+                    i64::try_from(self.offline_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+                Ok(Response::new(UnblockDeviceReply {
+                    device: Some(to_fleet_device_entry(unblocked, now_ms, window_ms)),
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "unblock_device".into(),
+                        "rejected".into(),
+                        format!("failed to unblock device '{target_device_id}': {err_msg}"),
+                    )
+                    .await;
+                if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else if err_msg.contains("not blocked") {
+                    Err(Status::failed_precondition(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
+    }
+
     async fn list_staff_accounts(
         &self,
         request: Request<ListStaffAccountsRequest>,
@@ -984,12 +1105,14 @@ impl StaffAuth for StaffAuthService {
 
 fn to_fleet_device_entry(device: DeviceRecord, now_ms: i64, window_ms: i64) -> FleetDeviceEntry {
     let is_windows = device.device_type == "windows";
-    let online = if is_windows {
+    let online = if is_windows && !device.blocked {
         now_ms.saturating_sub(device.last_seen_unix_ms) <= window_ms
     } else {
         false
     };
-    let status = if !is_windows {
+    let status = if device.blocked {
+        "blocked".into()
+    } else if !is_windows {
         "unverified".into()
     } else if online {
         "online".into()
@@ -1006,6 +1129,7 @@ fn to_fleet_device_entry(device: DeviceRecord, now_ms: i64, window_ms: i64) -> F
         location: device.location,
         configured_address: device.configured_address,
         status,
+        blocked: device.blocked,
     }
 }
 
@@ -1020,6 +1144,7 @@ fn target_to_fleet_device_entry(target: TargetRecord) -> FleetDeviceEntry {
         location: target.location,
         configured_address: Some(target.configured_address),
         status: "unverified".into(),
+        blocked: false,
     }
 }
 

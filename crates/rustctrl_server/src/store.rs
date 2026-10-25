@@ -115,6 +115,7 @@ pub struct DeviceRecord {
     pub location: Option<String>,
     pub device_type: String,
     pub configured_address: Option<String>,
+    pub blocked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +191,11 @@ impl DeviceStore {
                 location TEXT,
                 created_at_unix_ms INTEGER NOT NULL,
                 updated_at_unix_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS blocked_devices (
+                device_id TEXT PRIMARY KEY,
+                blocked_at_unix_ms INTEGER NOT NULL,
+                blocked_by TEXT NOT NULL
             );",
         )?;
         // Existing databases predate account deactivation, remembered-session
@@ -240,6 +246,14 @@ impl DeviceStore {
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let is_blocked: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM blocked_devices WHERE device_id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )?;
+            if is_blocked > 0 {
+                anyhow::bail!("device '{}' is blocked", id);
+            }
             connection.execute(
                 "INSERT INTO bootstrap_devices (device_id, name, agent_version, last_address, last_seen_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)
                 ON CONFLICT(device_id) DO UPDATE SET name=excluded.name,
@@ -259,11 +273,12 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT b.device_id, COALESCE(m.display_name, b.name) AS display_name, b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL
+                "SELECT b.device_id, COALESCE(m.display_name, b.name) AS display_name, b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL, CASE WHEN bl.device_id IS NOT NULL THEN 1 ELSE 0 END
                  FROM bootstrap_devices b
                  LEFT JOIN device_metadata m ON b.device_id = m.device_id
+                 LEFT JOIN blocked_devices bl ON b.device_id = bl.device_id
                  UNION ALL
-                 SELECT t.target_id, t.display_name, '', NULL, 0, t.location, t.target_type, t.configured_address
+                 SELECT t.target_id, t.display_name, '', NULL, 0, t.location, t.target_type, t.configured_address, 0
                  FROM connection_targets t
                  ORDER BY 5 DESC, 2 ASC, 1 ASC",
             )?;
@@ -277,6 +292,7 @@ impl DeviceStore {
                     location: row.get(5)?,
                     device_type: row.get(6)?,
                     configured_address: row.get(7)?,
+                    blocked: row.get::<_, i64>(8)? != 0,
                 })
             })?;
             let mut devices = Vec::new();
@@ -297,12 +313,13 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL, CASE WHEN bl.device_id IS NOT NULL THEN 1 ELSE 0 END
                  FROM bootstrap_devices b
                  LEFT JOIN device_metadata m ON b.device_id = m.device_id
+                 LEFT JOIN blocked_devices bl ON b.device_id = bl.device_id
                  WHERE b.device_id = ?1
                  UNION ALL
-                 SELECT t.target_id, t.display_name, '', NULL, 0, t.location, t.target_type, t.configured_address
+                 SELECT t.target_id, t.display_name, '', NULL, 0, t.location, t.target_type, t.configured_address, 0
                  FROM connection_targets t
                  WHERE t.target_id = ?1",
             )?;
@@ -317,6 +334,7 @@ impl DeviceStore {
                     location: row.get(5)?,
                     device_type: row.get(6)?,
                     configured_address: row.get(7)?,
+                    blocked: row.get::<_, i64>(8)? != 0,
                 }))
             } else {
                 Ok(None)
@@ -382,7 +400,90 @@ impl DeviceStore {
             )?;
 
             let record = connection.query_row(
-                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL, CASE WHEN bl.device_id IS NOT NULL THEN 1 ELSE 0 END
+                 FROM bootstrap_devices b
+                 LEFT JOIN device_metadata m ON b.device_id = m.device_id
+                 LEFT JOIN blocked_devices bl ON b.device_id = bl.device_id
+                 WHERE b.device_id = ?1",
+                params![device_id],
+                |row| {
+                    Ok(DeviceRecord {
+                        device_id: row.get(0)?,
+                        name: row.get(1)?,
+                        agent_version: row.get(2)?,
+                        last_address: row.get(3)?,
+                        last_seen_unix_ms: row.get(4)?,
+                        location: row.get(5)?,
+                        device_type: row.get(6)?,
+                        configured_address: row.get(7)?,
+                        blocked: row.get::<_, i64>(8)? != 0,
+                    })
+                },
+            )?;
+
+            Ok(record)
+        })
+        .await?
+    }
+
+    pub async fn is_device_blocked(&self, device_id: &str) -> Result<bool> {
+        let store = self.clone();
+        let device_id = device_id.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM blocked_devices WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await?
+    }
+
+    pub async fn block_device(&self, device_id: &str, blocked_by: &str) -> Result<DeviceRecord> {
+        let device_id = device_id.trim();
+        let _: DeviceId = device_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid device_id"))?;
+        let store = self.clone();
+        let device_id = device_id.to_string();
+        let blocked_by = blocked_by.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+
+            let exists: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM bootstrap_devices WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                anyhow::bail!("device '{device_id}' not found");
+            }
+
+            let is_blocked: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM blocked_devices WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )?;
+            if is_blocked > 0 {
+                anyhow::bail!("device '{device_id}' is already blocked");
+            }
+
+            connection.execute(
+                "INSERT INTO blocked_devices (device_id, blocked_at_unix_ms, blocked_by) VALUES (?1, ?2, ?3)",
+                params![device_id, now, blocked_by],
+            )?;
+
+            let record = connection.query_row(
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL, 1
                  FROM bootstrap_devices b
                  LEFT JOIN device_metadata m ON b.device_id = m.device_id
                  WHERE b.device_id = ?1",
@@ -397,6 +498,69 @@ impl DeviceStore {
                         location: row.get(5)?,
                         device_type: row.get(6)?,
                         configured_address: row.get(7)?,
+                        blocked: true,
+                    })
+                },
+            )?;
+
+            Ok(record)
+        })
+        .await?
+    }
+
+    pub async fn unblock_device(&self, device_id: &str) -> Result<DeviceRecord> {
+        let device_id = device_id.trim();
+        let _: DeviceId = device_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid device_id"))?;
+        let store = self.clone();
+        let device_id = device_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+
+            let exists: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM bootstrap_devices WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                anyhow::bail!("device '{device_id}' not found");
+            }
+
+            let is_blocked: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM blocked_devices WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )?;
+            if is_blocked == 0 {
+                anyhow::bail!("device '{device_id}' is not blocked");
+            }
+
+            connection.execute(
+                "DELETE FROM blocked_devices WHERE device_id = ?1",
+                params![device_id],
+            )?;
+
+            let record = connection.query_row(
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL, 0
+                 FROM bootstrap_devices b
+                 LEFT JOIN device_metadata m ON b.device_id = m.device_id
+                 WHERE b.device_id = ?1",
+                params![device_id],
+                |row| {
+                    Ok(DeviceRecord {
+                        device_id: row.get(0)?,
+                        name: row.get(1)?,
+                        agent_version: row.get(2)?,
+                        last_address: row.get(3)?,
+                        last_seen_unix_ms: row.get(4)?,
+                        location: row.get(5)?,
+                        device_type: row.get(6)?,
+                        configured_address: row.get(7)?,
+                        blocked: false,
                     })
                 },
             )?;
@@ -1400,6 +1564,137 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn device_blocking_and_unblocking_restricts_heartbeat_and_persists() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("store.db");
+        let store = DeviceStore::open(&db_path)?;
+        let dev_id = DeviceId::new();
+
+        // 1. Initial heartbeat registers the device as unblocked.
+        store
+            .heartbeat(
+                dev_id,
+                "DESKTOP-TEST".into(),
+                "1.0.0".into(),
+                Some("192.168.1.100:5000".into()),
+            )
+            .await?;
+
+        let dev = store
+            .get_device(&dev_id.to_string())
+            .await?
+            .expect("device exists");
+        assert!(!dev.blocked, "newly registered device must not be blocked");
+        assert!(
+            !store.is_device_blocked(&dev_id.to_string()).await?,
+            "is_device_blocked must return false"
+        );
+
+        // 2. Admin blocks the device.
+        let blocked_record = store.block_device(&dev_id.to_string(), "alice").await?;
+        assert!(blocked_record.blocked, "record must be blocked");
+        assert!(
+            store.is_device_blocked(&dev_id.to_string()).await?,
+            "is_device_blocked must return true"
+        );
+
+        let dev_blocked = store
+            .get_device(&dev_id.to_string())
+            .await?
+            .expect("device exists");
+        assert!(dev_blocked.blocked, "get_device must show blocked");
+
+        let list = store.list_devices().await?;
+        assert_eq!(list.len(), 1);
+        assert!(list[0].blocked, "list_devices must show blocked");
+
+        // 3. Heartbeat for blocked device must fail.
+        let hb_err = store
+            .heartbeat(
+                dev_id,
+                "DESKTOP-TEST".into(),
+                "1.0.0".into(),
+                Some("192.168.1.101:5000".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            hb_err.to_string().contains("is blocked"),
+            "heartbeat error must indicate device is blocked: {hb_err}"
+        );
+
+        // 4. Blocking an already-blocked device must fail.
+        let already_blocked_err = store
+            .block_device(&dev_id.to_string(), "alice")
+            .await
+            .unwrap_err();
+        assert!(
+            already_blocked_err.to_string().contains("already blocked"),
+            "error must indicate already blocked: {already_blocked_err}"
+        );
+
+        // 5. Blocking persists across store reopen.
+        drop(store);
+        let store2 = DeviceStore::open(&db_path)?;
+        assert!(
+            store2.is_device_blocked(&dev_id.to_string()).await?,
+            "is_device_blocked must persist across restart"
+        );
+        let list2 = store2.list_devices().await?;
+        assert!(list2[0].blocked, "list_devices must persist blocked");
+
+        // 6. Admin unblocks the device.
+        let unblocked_record = store2.unblock_device(&dev_id.to_string()).await?;
+        assert!(!unblocked_record.blocked, "record must be unblocked");
+        assert!(
+            !store2.is_device_blocked(&dev_id.to_string()).await?,
+            "is_device_blocked must return false after unblock"
+        );
+
+        // 7. Unblocking a non-blocked device must fail.
+        let not_blocked_err = store2
+            .unblock_device(&dev_id.to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            not_blocked_err.to_string().contains("not blocked"),
+            "error must indicate not blocked: {not_blocked_err}"
+        );
+
+        // 8. Subsequent heartbeat succeeds.
+        store2
+            .heartbeat(
+                dev_id,
+                "DESKTOP-TEST".into(),
+                "1.0.1".into(),
+                Some("192.168.1.102:5000".into()),
+            )
+            .await?;
+        let dev_restored = store2
+            .get_device(&dev_id.to_string())
+            .await?
+            .expect("device exists");
+        assert_eq!(dev_restored.agent_version, "1.0.1");
+        assert!(!dev_restored.blocked);
+
+        // 9. Edge cases: non-existent device and invalid device ID.
+        let non_existent = DeviceId::new();
+        let not_found_err = store2
+            .block_device(&non_existent.to_string(), "alice")
+            .await
+            .unwrap_err();
+        assert!(not_found_err.to_string().contains("not found"));
+
+        let invalid_id_err = store2
+            .block_device("not-a-uuid", "alice")
+            .await
+            .unwrap_err();
+        assert!(invalid_id_err.to_string().contains("invalid device_id"));
 
         Ok(())
     }

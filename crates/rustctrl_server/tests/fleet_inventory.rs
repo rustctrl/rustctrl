@@ -1,9 +1,10 @@
 use anyhow::Result;
 use rustctrl_core::{ClientConfig, DeviceId};
 use rustctrl_protocol::auth::{
-    CreateStaffAccountRequest, CreateTargetRequest, ListFleetDevicesRequest, LoginRequest,
-    RemoveTargetRequest, ReplaceTemporaryPasswordRequest, StaffStatusRequest,
-    UpdateFleetDeviceRequest, UpdateTargetRequest, staff_auth_client::StaffAuthClient,
+    BlockDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest, ListFleetDevicesRequest,
+    LoginRequest, RemoveTargetRequest, ReplaceTemporaryPasswordRequest, StaffStatusRequest,
+    UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
+    staff_auth_client::StaffAuthClient,
 };
 use rustctrl_protocol::bootstrap::HeartbeatRequest;
 use rustctrl_server::{
@@ -1536,6 +1537,529 @@ async fn admin_manages_targets_via_controller_cli() -> Result<()> {
     assert!(
         !remove_out.contains(&target_id),
         "target must not appear after removal: {remove_out}"
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_blocks_and_unblocks_device_denying_agent_calls_even_on_established_tls_channel_and_survives_restart()
+-> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pki_dir = temp.path().join("pki");
+    let device_id = DeviceId::new();
+    initialize(&PkiOptions {
+        output: pki_dir.clone(),
+        server_output: None,
+        server_names: vec!["localhost".into()],
+        server_ips: vec!["127.0.0.1".parse().unwrap()],
+        endpoint: "https://localhost:9876".into(),
+        domain_name: "localhost".into(),
+        device_id,
+    })?;
+    let config_path = pki_dir.join("server.toml");
+    let db_path = temp.path().join("rustctrl.db");
+    let exe = env!("CARGO_BIN_EXE_rustctrl-server");
+
+    bootstrap_admin(exe, &config_path, "alice", "AliceTemp123!").await;
+
+    let server = RunningServer::start(&pki_dir, db_path.clone()).await?;
+    let mut admin = connect(&pki_dir, &server.endpoint).await?;
+
+    let boot = admin
+        .login(LoginRequest {
+            username: "alice".into(),
+            password: "AliceTemp123!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    admin
+        .replace_temporary_password(authorized(
+            &boot.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "AlicePermanent123!".into(),
+            },
+        ))
+        .await?;
+    let alice_session = login(&mut admin, "alice", "AlicePermanent123!").await?;
+
+    // Alice creates operator Bob.
+    admin
+        .create_staff_account(authorized(
+            &alice_session,
+            CreateStaffAccountRequest {
+                username: "bob".into(),
+                role: "operator".into(),
+                temporary_password: "BobTemp12345!".into(),
+            },
+        ))
+        .await?;
+    let mut operator_client = connect(&pki_dir, &server.endpoint).await?;
+    let bob_boot = operator_client
+        .login(LoginRequest {
+            username: "bob".into(),
+            password: "BobTemp12345!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    operator_client
+        .replace_temporary_password(authorized(
+            &bob_boot.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "BobPermanent123!".into(),
+            },
+        ))
+        .await?;
+    let bob_session = login(&mut operator_client, "bob", "BobPermanent123!").await?;
+
+    // 1. Establish an agent TLS channel and register initial heartbeat.
+    let mut agent =
+        rustctrl_network::connect(&client_config(&pki_dir, &server.endpoint, "agent")).await?;
+    agent
+        .send_heartbeat(HeartbeatRequest {
+            device_id: device_id.to_string(),
+            name: "Workstation 1".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await?;
+
+    // Device is visible in inventory as online and not blocked.
+    let list_initial = admin
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(list_initial.devices.len(), 1);
+    let dev = &list_initial.devices[0];
+    assert_eq!(dev.device_id, device_id.to_string());
+    assert_eq!(dev.status, "online");
+    assert!(!dev.blocked);
+    let initial_last_seen = dev.last_seen_unix_ms;
+    assert!(initial_last_seen > 0);
+
+    // 2. Operator Bob attempts to block the device -> rejected.
+    let op_block_err = operator_client
+        .block_device(authorized(
+            &bob_session,
+            BlockDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(op_block_err.code(), Code::PermissionDenied);
+
+    // 3. Admin Alice blocks the device.
+    let block_reply = admin
+        .block_device(authorized(
+            &alice_session,
+            BlockDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await?
+        .into_inner();
+    let blocked_dev = block_reply.device.expect("device returned");
+    assert_eq!(blocked_dev.status, "blocked");
+    assert!(blocked_dev.blocked);
+
+    // Inventory lists device as blocked while preserving heartbeat freshness.
+    let list_blocked = admin
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(list_blocked.devices.len(), 1);
+    assert_eq!(list_blocked.devices[0].status, "blocked");
+    assert!(list_blocked.devices[0].blocked);
+    assert_eq!(
+        list_blocked.devices[0].last_seen_unix_ms, initial_last_seen,
+        "blocked device must retain its previous heartbeat freshness timestamp"
+    );
+
+    // Operator Bob also sees the device as blocked.
+    let op_view_blocked = operator_client
+        .list_fleet_devices(authorized(&bob_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(op_view_blocked.devices[0].status, "blocked");
+    assert!(op_view_blocked.devices[0].blocked);
+
+    // 4. Operational call rejection over EXISTING TLS channel.
+    let existing_channel_err = agent
+        .send_heartbeat(HeartbeatRequest {
+            device_id: device_id.to_string(),
+            name: "Workstation 1".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(existing_channel_err.code(), Code::PermissionDenied);
+    assert!(
+        existing_channel_err.message().contains("device is blocked"),
+        "error must indicate device is blocked: {existing_channel_err}"
+    );
+
+    // 5. Operational call rejection over RECONNECTING / fresh channel.
+    let mut fresh_agent =
+        rustctrl_network::connect(&client_config(&pki_dir, &server.endpoint, "agent")).await?;
+    let reconnect_err = fresh_agent
+        .send_heartbeat(HeartbeatRequest {
+            device_id: device_id.to_string(),
+            name: "Workstation 1".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reconnect_err.code(), Code::PermissionDenied);
+    assert!(
+        reconnect_err.message().contains("device is blocked"),
+        "reconnecting agent must still be denied: {reconnect_err}"
+    );
+
+    // 6. Certificate identity check precedence: if certificate SAN does not match payload device_id,
+    // the certificate check must fail first with certificate mismatch.
+    let fake_id = DeviceId::new();
+    let cert_mismatch_err = fresh_agent
+        .send_heartbeat(HeartbeatRequest {
+            device_id: fake_id.to_string(),
+            name: "Spoofed".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(cert_mismatch_err.code(), Code::PermissionDenied);
+    assert!(
+        cert_mismatch_err
+            .message()
+            .contains("certificate does not identify this device"),
+        "certificate SAN check must take precedence: {cert_mismatch_err}"
+    );
+
+    // 7. Restart Server and verify persistence.
+    server.shutdown().await?;
+    let restarted = RunningServer::start(&pki_dir, db_path).await?;
+    let mut admin_restarted = connect(&pki_dir, &restarted.endpoint).await?;
+    let alice_restarted = login(&mut admin_restarted, "alice", "AlicePermanent123!").await?;
+
+    let list_after_restart = admin_restarted
+        .list_fleet_devices(authorized(&alice_restarted, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(list_after_restart.devices[0].status, "blocked");
+    assert!(list_after_restart.devices[0].blocked);
+
+    // Agent heartbeat after server restart is STILL denied.
+    let mut agent_after_restart =
+        rustctrl_network::connect(&client_config(&pki_dir, &restarted.endpoint, "agent")).await?;
+    let restart_hb_err = agent_after_restart
+        .send_heartbeat(HeartbeatRequest {
+            device_id: device_id.to_string(),
+            name: "Workstation 1".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(restart_hb_err.code(), Code::PermissionDenied);
+    assert!(restart_hb_err.message().contains("device is blocked"));
+
+    // 8. Operator Bob cannot unblock.
+    let mut op_restarted = connect(&pki_dir, &restarted.endpoint).await?;
+    let bob_restarted = login(&mut op_restarted, "bob", "BobPermanent123!").await?;
+    let op_unblock_err = op_restarted
+        .unblock_device(authorized(
+            &bob_restarted,
+            UnblockDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(op_unblock_err.code(), Code::PermissionDenied);
+
+    // 9. Admin Alice unblocks the device.
+    let unblock_reply = admin_restarted
+        .unblock_device(authorized(
+            &alice_restarted,
+            UnblockDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await?
+        .into_inner();
+    let unblocked_dev = unblock_reply.device.expect("device returned");
+    assert!(!unblocked_dev.blocked);
+
+    // 10. Agent can now successfully send heartbeat!
+    agent_after_restart
+        .send_heartbeat(HeartbeatRequest {
+            device_id: device_id.to_string(),
+            name: "Workstation 1".into(),
+            agent_version: "0.1.1".into(),
+        })
+        .await?;
+
+    // Device is back to online with updated timestamp.
+    let list_restored = admin_restarted
+        .list_fleet_devices(authorized(&alice_restarted, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(list_restored.devices[0].status, "online");
+    assert!(!list_restored.devices[0].blocked);
+    assert!(list_restored.devices[0].last_seen_unix_ms >= initial_last_seen);
+
+    // 11. Activity log verification: allowed and rejected actions logged with actor and device attribution.
+    let activity = list_activity(exe, &config_path).await;
+    assert!(
+        activity.contains("action=block_device")
+            && activity.contains("actor=alice")
+            && activity.contains("result=success")
+            && activity.contains(&device_id.to_string()),
+        "activity log must record alice block_device success: {activity}"
+    );
+    assert!(
+        activity.contains("action=block_device")
+            && activity.contains("actor=bob")
+            && activity.contains("result=rejected")
+            && activity.contains(&device_id.to_string()),
+        "activity log must record bob block_device rejection: {activity}"
+    );
+    assert!(
+        activity.contains("action=unblock_device")
+            && activity.contains("actor=alice")
+            && activity.contains("result=success")
+            && activity.contains(&device_id.to_string()),
+        "activity log must record alice unblock_device success: {activity}"
+    );
+    assert!(
+        activity.contains("action=unblock_device")
+            && activity.contains("actor=bob")
+            && activity.contains("result=rejected")
+            && activity.contains(&device_id.to_string()),
+        "activity log must record bob unblock_device rejection: {activity}"
+    );
+
+    restarted.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_manages_device_block_via_controller_cli() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pki_dir = temp.path().join("pki");
+    let device_id = DeviceId::new();
+    initialize(&PkiOptions {
+        output: pki_dir.clone(),
+        server_output: None,
+        server_names: vec!["localhost".into()],
+        server_ips: vec!["127.0.0.1".parse().unwrap()],
+        endpoint: "https://localhost:9876".into(),
+        domain_name: "localhost".into(),
+        device_id,
+    })?;
+    let config_path = pki_dir.join("server.toml");
+    let controller_config_path = pki_dir.join("clients/controller/config.toml");
+    let db_path = temp.path().join("rustctrl.db");
+
+    let server_exe = env!("CARGO_BIN_EXE_rustctrl-server");
+    let ext = std::env::consts::EXE_SUFFIX;
+    let controller_exe = Path::new(server_exe)
+        .parent()
+        .unwrap()
+        .join(format!("rustctrl-controller{ext}"));
+    if !controller_exe.is_file() {
+        eprintln!(
+            "Skipping controller CLI test: binary not found at {:?}",
+            controller_exe
+        );
+        return Ok(());
+    }
+
+    bootstrap_admin(server_exe, &config_path, "alice", "AliceTemp123!").await;
+
+    let server = RunningServer::start(&pki_dir, db_path).await?;
+    let controller_toml = format!(
+        "[server]\nendpoint = \"{}\"\ndomain_name = \"localhost\"\nca_certificate = \"ca.pem\"\ncertificate = \"cert.pem\"\nprivate_key = \"key.pem\"\n",
+        server.endpoint
+    );
+    std::fs::write(&controller_config_path, controller_toml)?;
+
+    let run_controller = |args: &[&str]| {
+        let exe = controller_exe.clone();
+        let config = controller_config_path.clone();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let mut cmd = Command::new(&exe);
+                cmd.arg("--config").arg(&config);
+                for arg in &args {
+                    cmd.arg(arg);
+                }
+                cmd.output().expect("run rustctrl-controller CLI")
+            })
+            .await
+            .expect("join rustctrl-controller CLI")
+        }
+    };
+
+    // Alice logs in and replaces password.
+    let bootstrap = run_controller(&[
+        "login",
+        "--username",
+        "alice",
+        "--password",
+        "AliceTemp123!",
+        "--replace-password",
+        "AlicePermanent123!",
+    ])
+    .await;
+    assert!(bootstrap.status.success());
+
+    // Alice creates operator Bob.
+    let mut admin = connect(&pki_dir, &server.endpoint).await?;
+    let alice_session = login(&mut admin, "alice", "AlicePermanent123!").await?;
+    admin
+        .create_staff_account(authorized(
+            &alice_session,
+            CreateStaffAccountRequest {
+                username: "bob".into(),
+                role: "operator".into(),
+                temporary_password: "BobTemp12345!".into(),
+            },
+        ))
+        .await?;
+    drop(admin);
+
+    let bob_replace = run_controller(&[
+        "login",
+        "--username",
+        "bob",
+        "--password",
+        "BobTemp12345!",
+        "--replace-password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(bob_replace.status.success());
+
+    // Agent registers device via heartbeat.
+    agent_heartbeat(&pki_dir, &server.endpoint, device_id).await?;
+
+    // Operator Bob cannot block device.
+    let op_block = run_controller(&[
+        "block-device",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+    ])
+    .await;
+    assert!(
+        !op_block.status.success(),
+        "operator block-device must fail: {}",
+        String::from_utf8_lossy(&op_block.stdout)
+    );
+
+    // Admin Alice blocks device.
+    let admin_block = run_controller(&[
+        "block-device",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+    ])
+    .await;
+    assert!(
+        admin_block.status.success(),
+        "admin block-device must succeed: {}",
+        String::from_utf8_lossy(&admin_block.stderr)
+    );
+    let block_out = String::from_utf8_lossy(&admin_block.stdout);
+    assert!(
+        block_out.contains("Blocked device ") && block_out.contains("status=blocked"),
+        "unexpected block output: {block_out}"
+    );
+
+    // Operator Bob lists devices and observes status=blocked.
+    let list_view = run_controller(&[
+        "list-devices",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(list_view.status.success());
+    let list_out = String::from_utf8_lossy(&list_view.stdout);
+    assert!(
+        list_out.contains(&device_id.to_string()) && list_out.contains("status=blocked"),
+        "device must be listed with status=blocked: {list_out}"
+    );
+
+    // Real Agent heartbeat is denied while blocked via Controller CLI action.
+    let blocked_hb_res = agent_heartbeat(&pki_dir, &server.endpoint, device_id).await;
+    assert!(
+        blocked_hb_res.is_err(),
+        "Agent heartbeat must be denied after Controller blocks the device"
+    );
+
+    // Operator Bob cannot unblock device.
+    let op_unblock = run_controller(&[
+        "unblock-device",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+    ])
+    .await;
+    assert!(!op_unblock.status.success());
+
+    // Admin Alice unblocks device.
+    let admin_unblock = run_controller(&[
+        "unblock-device",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+    ])
+    .await;
+    assert!(
+        admin_unblock.status.success(),
+        "admin unblock-device must succeed: {}",
+        String::from_utf8_lossy(&admin_unblock.stderr)
+    );
+    let unblock_out = String::from_utf8_lossy(&admin_unblock.stdout);
+    assert!(
+        unblock_out.contains("Unblocked device "),
+        "unexpected unblock output: {unblock_out}"
+    );
+
+    // Real Agent heartbeat succeeds after Controller unblocks the device.
+    agent_heartbeat(&pki_dir, &server.endpoint, device_id).await?;
+
+    // Operator Bob lists devices and device is no longer blocked.
+    let list_after_unblock = run_controller(&[
+        "list-devices",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(list_after_unblock.status.success());
+    let unblock_list_out = String::from_utf8_lossy(&list_after_unblock.stdout);
+    assert!(
+        !unblock_list_out.contains("status=blocked"),
+        "device must not have status=blocked after unblock: {unblock_list_out}"
     );
 
     server.shutdown().await?;
