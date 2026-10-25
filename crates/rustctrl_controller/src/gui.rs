@@ -6,11 +6,11 @@ use gpui::{
 use rustctrl_core::ControllerConfig;
 use rustctrl_protocol::auth::{
     BlockDeviceRequest, ChangeOwnPasswordRequest, ChangeStaffRoleRequest,
-    CreateStaffAccountRequest, CreateTargetRequest, DeactivateStaffAccountRequest,
-    FleetDeviceEntry, ListFleetDevicesRequest, ListStaffAccountsRequest, LoginRequest,
-    LogoutRequest, RemoveTargetRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest,
-    StaffAccountEntry, StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest,
-    UpdateTargetRequest,
+    CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
+    DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesRequest,
+    ListStaffAccountsRequest, LoginRequest, LogoutRequest, RemoveTargetRequest,
+    ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffAccountEntry,
+    StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
 };
 use std::time::Duration;
 
@@ -1979,6 +1979,68 @@ impl ControllerApp {
         .detach();
     }
 
+    fn submit_clean_offline_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let session_token = match &self.state {
+            ScreenState::Connected {
+                session_token,
+                role,
+                ..
+            } if role == "admin" => session_token.clone(),
+            _ => return,
+        };
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let device_label = device_id.clone();
+
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(CleanOfflineDeviceRequest { device_id });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    client.clean_offline_device(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                let is_same_session = match &view.state {
+                    ScreenState::Connected { session_token, .. } => session_token == &tok_check,
+                    _ => false,
+                };
+                if !is_same_session {
+                    return;
+                }
+
+                match res {
+                    Ok(Ok(())) => {
+                        if let ScreenState::Connected { notice, .. } = &mut view.state {
+                            *notice = Some(format!("Cleaned offline device '{device_label}'."));
+                            let token = tok_check.clone();
+                            view.fetch_status(token, cx);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if let ScreenState::Connected { error, .. } = &mut view.state {
+                            *error = Some(err.to_string());
+                        }
+                    }
+                    Err(join_err) => {
+                        if let ScreenState::Connected { error, .. } = &mut view.state {
+                            *error = Some(format!("Join error: {join_err}"));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_overlay_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.overlay {
             Overlay::ChangePassword {
@@ -3476,7 +3538,7 @@ impl Render for ControllerApp {
                         .child(div().w(gpui::px(90.0)).child("Status"))
                         .child(div().w(gpui::px(100.0)).child("Last Seen"));
                     if is_admin {
-                        header_row = header_row.child(div().w(gpui::px(190.0)).child("Actions"));
+                        header_row = header_row.child(div().w(gpui::px(260.0)).child("Actions"));
                     }
                     fleet_list = fleet_list.child(header_row);
 
@@ -3550,7 +3612,7 @@ impl Render for ControllerApp {
                                 let dev_id_for_remove = dev_id.clone();
                                 row = row.child(
                                     div()
-                                        .w(gpui::px(190.0))
+                                        .w(gpui::px(260.0))
                                         .flex()
                                         .gap_2()
                                         .child(
@@ -3599,75 +3661,96 @@ impl Render for ControllerApp {
                             } else {
                                 let is_blocked = device.blocked || device.status == "blocked";
                                 let dev_id_for_edit = dev_id.clone();
-                                row = row.child(
-                                    div()
-                                        .w(gpui::px(190.0))
-                                        .flex()
-                                        .gap_2()
-                                        .child(
+                                let mut actions_div =
+                                    div().w(gpui::px(260.0)).flex().gap_2().child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(0x3a5a7a))
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .id(format!("edit-device-btn-{}", device.device_id))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_edit_device(
+                                                    dev_id_for_edit.clone(),
+                                                    dev_name.clone(),
+                                                    dev_loc.clone(),
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("Edit"),
+                                    );
+
+                                if is_blocked {
+                                    let dev_id_for_unblock = dev_id.clone();
+                                    actions_div = actions_div.child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(0x2d884d))
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .id(format!("unblock-device-btn-{}", device.device_id))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.submit_unblock_device(
+                                                    dev_id_for_unblock.clone(),
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("Unblock"),
+                                    );
+                                } else {
+                                    let dev_id_for_block = dev_id.clone();
+                                    actions_div = actions_div.child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(0x883333))
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .id(format!("block-device-btn-{}", device.device_id))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.submit_block_device(
+                                                    dev_id_for_block.clone(),
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("Block"),
+                                    );
+
+                                    if !device.online || device.status == "offline" {
+                                        let dev_id_for_clean = dev_id.clone();
+                                        actions_div = actions_div.child(
                                             div()
                                                 .px_2()
                                                 .py_1()
-                                                .bg(rgb(0x3a5a7a))
-                                                .text_color(rgb(0xffffff))
-                                                .rounded_md()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .id(format!("edit-device-btn-{}", device.device_id))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.open_edit_device(
-                                                        dev_id_for_edit.clone(),
-                                                        dev_name.clone(),
-                                                        dev_loc.clone(),
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child("Edit"),
-                                        )
-                                        .child(if is_blocked {
-                                            let dev_id_for_unblock = dev_id.clone();
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .bg(rgb(0x2d884d))
+                                                .bg(rgb(0x7a4a3a))
                                                 .text_color(rgb(0xffffff))
                                                 .rounded_md()
                                                 .text_xs()
                                                 .cursor_pointer()
                                                 .id(format!(
-                                                    "unblock-device-btn-{}",
+                                                    "clean-device-btn-{}",
                                                     device.device_id
                                                 ))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.submit_unblock_device(
-                                                        dev_id_for_unblock.clone(),
+                                                    this.submit_clean_offline_device(
+                                                        dev_id_for_clean.clone(),
                                                         cx,
                                                     );
                                                 }))
-                                                .child("Unblock")
-                                        } else {
-                                            let dev_id_for_block = dev_id.clone();
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .bg(rgb(0x883333))
-                                                .text_color(rgb(0xffffff))
-                                                .rounded_md()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .id(format!(
-                                                    "block-device-btn-{}",
-                                                    device.device_id
-                                                ))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.submit_block_device(
-                                                        dev_id_for_block.clone(),
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child("Block")
-                                        }),
-                                );
+                                                .child("Clean"),
+                                        );
+                                    }
+                                }
+
+                                row = row.child(actions_div);
                             }
                         }
                         fleet_list = fleet_list.child(row);
@@ -4368,6 +4451,42 @@ mod tests {
         assert!(
             vm.last_seen.contains('s') || vm.last_seen.contains('m'),
             "last_seen should reflect relative time"
+        );
+    }
+
+    #[test]
+    fn format_device_row_presents_offline_windows_device_distinct_from_blocked() {
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default();
+        let entry = FleetDeviceEntry {
+            device_id: "dev-win-offline-101".into(),
+            display_name: "Stale PC".into(),
+            online: false,
+            last_seen_unix_ms: now_unix_ms - 120_000,
+            last_address: "10.0.0.99".into(),
+            location: Some("Storage".into()),
+            device_type: "windows".into(),
+            configured_address: None,
+            status: "offline".into(),
+            blocked: false,
+        };
+
+        let vm = format_device_row(&entry);
+        assert_eq!(vm.device_id, "dev-win-offline-101");
+        assert_eq!(vm.display_name, "Stale PC");
+        assert_eq!(vm.device_type, "windows");
+        assert_eq!(vm.location, "Storage");
+        assert_eq!(vm.last_address, "10.0.0.99");
+        assert_eq!(vm.configured_address, "—");
+        assert_eq!(
+            vm.status, "Offline",
+            "offline unblocked device must display Offline status"
+        );
+        assert_ne!(
+            vm.last_seen, "—",
+            "last_seen timestamp must be formatted for offline device"
         );
     }
 }

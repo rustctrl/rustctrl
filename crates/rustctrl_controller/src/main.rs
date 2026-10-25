@@ -3,9 +3,9 @@ use clap::{Parser, Subcommand};
 use rustctrl_core::{ControllerConfig, init_logging};
 use rustctrl_protocol::auth::{
     BlockDeviceRequest, ChangeOwnPasswordRequest, ChangeStaffRoleRequest,
-    CreateStaffAccountRequest, CreateTargetRequest, DeactivateStaffAccountRequest,
-    ListFleetDevicesRequest, ListStaffAccountsRequest, LoginRequest, LogoutRequest,
-    RemoveTargetRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest,
+    CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
+    DeactivateStaffAccountRequest, ListFleetDevicesRequest, ListStaffAccountsRequest, LoginRequest,
+    LogoutRequest, RemoveTargetRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest,
     StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
 };
 use rustctrl_protocol::bootstrap::HealthRequest;
@@ -129,6 +129,14 @@ enum Command {
         device_id: String,
     },
     UnblockDevice {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        device_id: String,
+    },
+    CleanOfflineDevice {
         #[arg(long)]
         username: String,
         #[arg(long)]
@@ -754,6 +762,40 @@ fn main() -> Result<()> {
                         device.device_id, device.display_name, device.status
                     );
                 }
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
+        Command::CleanOfflineDevice {
+            username,
+            password,
+            device_id,
+        } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest {
+                        username,
+                        password,
+                        remember: false,
+                    })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!("temporary password must be replaced before cleaning device");
+                }
+                let mut req = tonic::Request::new(CleanOfflineDeviceRequest { device_id });
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client.clean_offline_device(req).await?.into_inner();
+                println!("Cleaned offline device {}", reply.device_id);
                 let mut logout_req = tonic::Request::new(LogoutRequest {});
                 logout_req.metadata_mut().insert(
                     "authorization",

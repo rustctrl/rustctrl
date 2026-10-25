@@ -13,6 +13,7 @@ service StaffAuth {
   rpc UpdateFleetDevice(UpdateFleetDeviceRequest) returns (UpdateFleetDeviceReply);
   rpc BlockDevice(BlockDeviceRequest) returns (BlockDeviceReply);
   rpc UnblockDevice(UnblockDeviceRequest) returns (UnblockDeviceReply);
+  rpc CleanOfflineDevice(CleanOfflineDeviceRequest) returns (CleanOfflineDeviceReply);
   rpc CreateTarget(CreateTargetRequest) returns (CreateTargetReply);
   rpc UpdateTarget(UpdateTargetRequest) returns (UpdateTargetReply);
   rpc RemoveTarget(RemoveTargetRequest) returns (RemoveTargetReply);
@@ -128,6 +129,15 @@ message UnblockDeviceRequest {
 
 message UnblockDeviceReply {
   FleetDeviceEntry device = 1;
+}
+
+message CleanOfflineDeviceRequest {
+  string device_id = 1;
+}
+
+message CleanOfflineDeviceReply {
+  bool success = 1;
+  string device_id = 2;
 }
 
 message CreateTargetRequest {

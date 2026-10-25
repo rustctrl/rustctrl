@@ -1,9 +1,9 @@
 use anyhow::Result;
 use rustctrl_core::{ClientConfig, DeviceId};
 use rustctrl_protocol::auth::{
-    BlockDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest, ListFleetDevicesRequest,
-    LoginRequest, RemoveTargetRequest, ReplaceTemporaryPasswordRequest, StaffStatusRequest,
-    UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
+    BlockDeviceRequest, CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
+    ListFleetDevicesRequest, LoginRequest, RemoveTargetRequest, ReplaceTemporaryPasswordRequest,
+    StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
     staff_auth_client::StaffAuthClient,
 };
 use rustctrl_protocol::bootstrap::HeartbeatRequest;
@@ -2063,5 +2063,539 @@ async fn admin_manages_device_block_via_controller_cli() -> Result<()> {
     );
 
     server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_cleans_offline_device_and_restores_on_agent_reconnect_and_survives_restart()
+-> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pki_dir = temp.path().join("pki");
+    let device_id = DeviceId::new();
+    initialize(&PkiOptions {
+        output: pki_dir.clone(),
+        server_output: None,
+        server_names: vec!["localhost".into()],
+        server_ips: vec!["127.0.0.1".parse().unwrap()],
+        endpoint: "https://localhost:9876".into(),
+        domain_name: "localhost".into(),
+        device_id,
+    })?;
+    let config_path = pki_dir.join("server.toml");
+    let db_path = temp.path().join("rustctrl.db");
+    let exe = env!("CARGO_BIN_EXE_rustctrl-server");
+
+    bootstrap_admin(exe, &config_path, "alice", "AliceTemp123!").await;
+
+    let server = RunningServer::start(&pki_dir, db_path.clone()).await?;
+    let mut admin = connect(&pki_dir, &server.endpoint).await?;
+
+    let boot = admin
+        .login(LoginRequest {
+            username: "alice".into(),
+            password: "AliceTemp123!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    admin
+        .replace_temporary_password(authorized(
+            &boot.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "AlicePermanent123!".into(),
+            },
+        ))
+        .await?;
+    let alice_session = login(&mut admin, "alice", "AlicePermanent123!").await?;
+
+    // Alice creates operator Bob.
+    admin
+        .create_staff_account(authorized(
+            &alice_session,
+            CreateStaffAccountRequest {
+                username: "bob".into(),
+                role: "operator".into(),
+                temporary_password: "BobTemp12345!".into(),
+            },
+        ))
+        .await?;
+    let mut operator_client = connect(&pki_dir, &server.endpoint).await?;
+    let bob_boot = operator_client
+        .login(LoginRequest {
+            username: "bob".into(),
+            password: "BobTemp12345!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    operator_client
+        .replace_temporary_password(authorized(
+            &bob_boot.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "BobPermanent123!".into(),
+            },
+        ))
+        .await?;
+    let bob_session = login(&mut operator_client, "bob", "BobPermanent123!").await?;
+
+    // 1. Establish an agent TLS channel and run real Agent heartbeat loop.
+    let agent_stop = CancellationToken::new();
+    let agent_task = {
+        let stop = agent_stop.clone();
+        let pki_dir = pki_dir.clone();
+        let endpoint = server.endpoint.clone();
+        tokio::spawn(async move {
+            let mut agent =
+                rustctrl_network::connect(&client_config(&pki_dir, &endpoint, "agent")).await?;
+            while !stop.is_cancelled() {
+                agent
+                    .send_heartbeat(HeartbeatRequest {
+                        device_id: device_id.to_string(),
+                        name: "Workstation Offline Test".into(),
+                        agent_version: "0.1.0".into(),
+                    })
+                    .await?;
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Alice curates device metadata.
+    admin
+        .update_fleet_device(authorized(
+            &alice_session,
+            UpdateFleetDeviceRequest {
+                device_id: device_id.to_string(),
+                display_name: "Floor 3 PC".into(),
+                location: Some("Room 301".into()),
+            },
+        ))
+        .await?;
+
+    // 2. While device is still ONLINE, Admin cleanup attempt MUST fail.
+    let online_clean_err = admin
+        .clean_offline_device(authorized(
+            &alice_session,
+            CleanOfflineDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(online_clean_err.code(), Code::FailedPrecondition);
+    assert!(online_clean_err.message().contains("online"));
+
+    // 3. Stop running Agent (simulating real Agent stop/disconnect).
+    agent_stop.cancel();
+    agent_task.await??;
+
+    // Wait for offline threshold (server offline_after_secs is 1 second).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Verify device is now offline in inventory.
+    let list_offline = admin
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(list_offline.devices.len(), 1);
+    assert_eq!(list_offline.devices[0].status, "offline");
+    assert!(!list_offline.devices[0].online);
+
+    // 4. Operator Bob attempts cleanup -> MUST fail with permission denied.
+    let op_clean_err = operator_client
+        .clean_offline_device(authorized(
+            &bob_session,
+            CleanOfflineDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(op_clean_err.code(), Code::PermissionDenied);
+
+    // 5. Admin Alice blocks the offline device.
+    admin
+        .block_device(authorized(
+            &alice_session,
+            BlockDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await?;
+
+    // Attempting cleanup on blocked device MUST fail.
+    let blocked_clean_err = admin
+        .clean_offline_device(authorized(
+            &alice_session,
+            CleanOfflineDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(blocked_clean_err.code(), Code::FailedPrecondition);
+    assert!(blocked_clean_err.message().contains("blocked"));
+
+    // Verify blocked device remains visible as blocked in inventory.
+    let list_blocked = admin
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(list_blocked.devices.len(), 1);
+    assert_eq!(list_blocked.devices[0].status, "blocked");
+    assert!(list_blocked.devices[0].blocked);
+
+    // 6. Admin Alice unblocks device -> it is offline again.
+    admin
+        .unblock_device(authorized(
+            &alice_session,
+            UnblockDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await?;
+
+    // 7. Admin Alice cleans up the offline device -> succeeds!
+    let clean_reply = admin
+        .clean_offline_device(authorized(
+            &alice_session,
+            CleanOfflineDeviceRequest {
+                device_id: device_id.to_string(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(clean_reply.success);
+    assert_eq!(clean_reply.device_id, device_id.to_string());
+
+    // Inventory is now empty (visible entry removed).
+    let list_after_clean = admin
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert!(
+        list_after_clean.devices.is_empty(),
+        "cleaned device must not appear in inventory"
+    );
+
+    // 8. Server restart -> cleanup persists across restart.
+    server.shutdown().await?;
+    let restarted = RunningServer::start(&pki_dir, db_path).await?;
+    let mut admin_restarted = connect(&pki_dir, &restarted.endpoint).await?;
+    let alice_restarted = login(&mut admin_restarted, "alice", "AlicePermanent123!").await?;
+
+    let list_after_restart = admin_restarted
+        .list_fleet_devices(authorized(&alice_restarted, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert!(
+        list_after_restart.devices.is_empty(),
+        "cleaned device must remain removed after restart"
+    );
+
+    // Server outage distinction: stopped server connectivity fails rather than falsely reporting fleet offline.
+    let outage = connect(&pki_dir, "https://localhost:1").await;
+    assert!(outage.is_err(), "stopped server must fail connection");
+
+    // 9. Still-authorized Agent reconnects with the SAME identity -> restores entry!
+    let mut reconnecting_agent =
+        rustctrl_network::connect(&client_config(&pki_dir, &restarted.endpoint, "agent")).await?;
+    reconnecting_agent
+        .send_heartbeat(HeartbeatRequest {
+            device_id: device_id.to_string(),
+            name: "Workstation Reconnected".into(),
+            agent_version: "0.1.1".into(),
+        })
+        .await?;
+
+    let list_restored = admin_restarted
+        .list_fleet_devices(authorized(&alice_restarted, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(
+        list_restored.devices.len(),
+        1,
+        "exactly one device must be present; no duplicates"
+    );
+    let restored = &list_restored.devices[0];
+    assert_eq!(restored.device_id, device_id.to_string());
+    assert_eq!(restored.status, "online");
+    assert!(!restored.blocked);
+
+    // 10. Verify activity log records cleanup attempts (allowed and rejected) with actor and device attribution.
+    let activity = list_activity(exe, &config_path).await;
+    assert!(
+        activity.contains("action=clean_offline_device")
+            && activity.contains("actor=alice")
+            && activity.contains("result=rejected")
+            && activity.contains(&device_id.to_string()),
+        "activity log must record alice online clean rejection: {activity}"
+    );
+    assert!(
+        activity.contains("action=clean_offline_device")
+            && activity.contains("actor=bob")
+            && activity.contains("result=rejected")
+            && activity.contains(&device_id.to_string()),
+        "activity log must record bob clean rejection: {activity}"
+    );
+    assert!(
+        activity.contains("action=clean_offline_device")
+            && activity.contains("actor=alice")
+            && activity.contains("result=success")
+            && activity.contains(&device_id.to_string()),
+        "activity log must record alice clean success: {activity}"
+    );
+    assert!(
+        activity.contains("action=update_fleet_device")
+            && activity.contains(&device_id.to_string()),
+        "historical activity attribution must be preserved: {activity}"
+    );
+
+    restarted.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_manages_device_cleanup_via_controller_cli() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pki_dir = temp.path().join("pki");
+    let device_id = DeviceId::new();
+    initialize(&PkiOptions {
+        output: pki_dir.clone(),
+        server_output: None,
+        server_names: vec!["localhost".into()],
+        server_ips: vec!["127.0.0.1".parse().unwrap()],
+        endpoint: "https://localhost:9876".into(),
+        domain_name: "localhost".into(),
+        device_id,
+    })?;
+    let config_path = pki_dir.join("server.toml");
+    let controller_config_path = pki_dir.join("clients/controller/config.toml");
+    let db_path = temp.path().join("rustctrl.db");
+
+    let server_exe = env!("CARGO_BIN_EXE_rustctrl-server");
+    let ext = std::env::consts::EXE_SUFFIX;
+    let controller_exe = Path::new(server_exe)
+        .parent()
+        .unwrap()
+        .join(format!("rustctrl-controller{ext}"));
+    if !controller_exe.is_file() {
+        eprintln!(
+            "Skipping controller CLI test: binary not found at {:?}",
+            controller_exe
+        );
+        return Ok(());
+    }
+
+    bootstrap_admin(server_exe, &config_path, "alice", "AliceTemp123!").await;
+
+    let server = RunningServer::start(&pki_dir, db_path).await?;
+    let controller_toml = format!(
+        "[server]\nendpoint = \"{}\"\ndomain_name = \"localhost\"\nca_certificate = \"ca.pem\"\ncertificate = \"cert.pem\"\nprivate_key = \"key.pem\"\n",
+        server.endpoint
+    );
+    std::fs::write(&controller_config_path, controller_toml)?;
+
+    let run_controller = |args: &[&str]| {
+        let exe = controller_exe.clone();
+        let config = controller_config_path.clone();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let mut cmd = Command::new(&exe);
+                cmd.arg("--config").arg(&config);
+                for arg in &args {
+                    cmd.arg(arg);
+                }
+                cmd.output().expect("run rustctrl-controller CLI")
+            })
+            .await
+            .expect("join rustctrl-controller CLI")
+        }
+    };
+
+    // Alice logs in and replaces password.
+    let bootstrap = run_controller(&[
+        "login",
+        "--username",
+        "alice",
+        "--password",
+        "AliceTemp123!",
+        "--replace-password",
+        "AlicePermanent123!",
+    ])
+    .await;
+    assert!(bootstrap.status.success());
+
+    // Alice creates operator Bob.
+    let mut admin = connect(&pki_dir, &server.endpoint).await?;
+    let alice_session = login(&mut admin, "alice", "AlicePermanent123!").await?;
+    admin
+        .create_staff_account(authorized(
+            &alice_session,
+            CreateStaffAccountRequest {
+                username: "bob".into(),
+                role: "operator".into(),
+                temporary_password: "BobTemp12345!".into(),
+            },
+        ))
+        .await?;
+    drop(admin);
+
+    let bob_replace = run_controller(&[
+        "login",
+        "--username",
+        "bob",
+        "--password",
+        "BobTemp12345!",
+        "--replace-password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(bob_replace.status.success());
+
+    // Agent registers device via heartbeat.
+    agent_heartbeat(&pki_dir, &server.endpoint, device_id).await?;
+
+    // Wait until device goes offline (offline_after_secs is 1 second).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Operator Bob cannot clean offline device.
+    let op_clean = run_controller(&[
+        "clean-offline-device",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+    ])
+    .await;
+    assert!(
+        !op_clean.status.success(),
+        "operator clean-offline-device must fail: {}",
+        String::from_utf8_lossy(&op_clean.stdout)
+    );
+
+    // Admin Alice blocks device.
+    let admin_block = run_controller(&[
+        "block-device",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+    ])
+    .await;
+    assert!(admin_block.status.success());
+
+    // Admin Alice tries to clean blocked device -> fails.
+    let admin_clean_blocked = run_controller(&[
+        "clean-offline-device",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+    ])
+    .await;
+    assert!(
+        !admin_clean_blocked.status.success(),
+        "cleaning blocked device must fail"
+    );
+
+    // Admin Alice unblocks device.
+    let admin_unblock = run_controller(&[
+        "unblock-device",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+    ])
+    .await;
+    assert!(admin_unblock.status.success());
+
+    // Admin Alice cleans offline device -> succeeds!
+    let admin_clean = run_controller(&[
+        "clean-offline-device",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--device-id",
+        &device_id.to_string(),
+    ])
+    .await;
+    assert!(
+        admin_clean.status.success(),
+        "admin clean-offline-device must succeed: {}",
+        String::from_utf8_lossy(&admin_clean.stderr)
+    );
+    let clean_out = String::from_utf8_lossy(&admin_clean.stdout);
+    assert!(
+        clean_out.contains("Cleaned offline device ") && clean_out.contains(&device_id.to_string()),
+        "unexpected clean output: {clean_out}"
+    );
+
+    // Operator Bob lists devices -> device is gone!
+    let list_empty = run_controller(&[
+        "list-devices",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(list_empty.status.success());
+    let list_out = String::from_utf8_lossy(&list_empty.stdout);
+    assert!(
+        !list_out.contains(&device_id.to_string()),
+        "device must not appear in list-devices after cleanup: {list_out}"
+    );
+
+    // Reconnecting Agent sends heartbeat -> restores entry!
+    agent_heartbeat(&pki_dir, &server.endpoint, device_id).await?;
+
+    let list_restored = run_controller(&[
+        "list-devices",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(list_restored.status.success());
+    let restored_out = String::from_utf8_lossy(&list_restored.stdout);
+    assert!(
+        restored_out.contains(&device_id.to_string()) && restored_out.contains("status=online"),
+        "restored device must appear with status=online: {restored_out}"
+    );
+
+    server.shutdown().await?;
+
+    // Server outage distinction: when server is down, Controller CLI fails connection rather than reporting fleet offline.
+    let outage_cli = run_controller(&[
+        "list-devices",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(
+        !outage_cli.status.success(),
+        "Controller CLI must report connection failure during server outage"
+    );
+
     Ok(())
 }
