@@ -11,6 +11,8 @@ service StaffAuth {
   rpc GetStaffStatus(StaffStatusRequest) returns (StaffStatusReply);
   rpc ListFleetDevices(ListFleetDevicesRequest) returns (ListFleetDevicesReply);
   rpc UpdateFleetDevice(UpdateFleetDeviceRequest) returns (UpdateFleetDeviceReply);
+  rpc BlockDevice(BlockDeviceRequest) returns (BlockDeviceReply);
+  rpc UnblockDevice(UnblockDeviceRequest) returns (UnblockDeviceReply);
   rpc CreateTarget(CreateTargetRequest) returns (CreateTargetReply);
   rpc UpdateTarget(UpdateTargetRequest) returns (UpdateTargetReply);
   rpc RemoveTarget(RemoveTargetRequest) returns (RemoveTargetReply);
@@ -95,6 +97,7 @@ message FleetDeviceEntry {
   optional string location = 7;
   optional string configured_address = 8;
   string status = 9;
+  bool blocked = 10;
 }
 
 message ListFleetDevicesReply {
@@ -108,6 +111,22 @@ message UpdateFleetDeviceRequest {
 }
 
 message UpdateFleetDeviceReply {
+  FleetDeviceEntry device = 1;
+}
+
+message BlockDeviceRequest {
+  string device_id = 1;
+}
+
+message BlockDeviceReply {
+  FleetDeviceEntry device = 1;
+}
+
+message UnblockDeviceRequest {
+  string device_id = 1;
+}
+
+message UnblockDeviceReply {
   FleetDeviceEntry device = 1;
 }
 
