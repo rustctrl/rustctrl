@@ -1,9 +1,9 @@
 use anyhow::Result;
 use rustctrl_core::{ClientConfig, DeviceId};
 use rustctrl_protocol::auth::{
-    CreateStaffAccountRequest, ListFleetDevicesRequest, LoginRequest,
-    ReplaceTemporaryPasswordRequest, StaffStatusRequest, UpdateFleetDeviceRequest,
-    staff_auth_client::StaffAuthClient,
+    CreateStaffAccountRequest, CreateTargetRequest, ListFleetDevicesRequest, LoginRequest,
+    RemoveTargetRequest, ReplaceTemporaryPasswordRequest, StaffStatusRequest,
+    UpdateFleetDeviceRequest, UpdateTargetRequest, staff_auth_client::StaffAuthClient,
 };
 use rustctrl_protocol::bootstrap::HeartbeatRequest;
 use rustctrl_server::{
@@ -855,5 +855,689 @@ async fn admin_can_edit_device_display_name_and_location_and_survives_heartbeats
     );
 
     restarted.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_manages_android_tv_connection_targets_as_unverified_inventory_entries() -> Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    let pki_dir = temp.path().join("pki");
+    let win_device_id = DeviceId::new();
+    initialize(&PkiOptions {
+        output: pki_dir.clone(),
+        server_output: None,
+        server_names: vec!["localhost".into()],
+        server_ips: vec!["127.0.0.1".parse().unwrap()],
+        endpoint: "https://localhost:9876".into(),
+        domain_name: "localhost".into(),
+        device_id: win_device_id,
+    })?;
+    let config_path = pki_dir.join("server.toml");
+    let db_path = temp.path().join("rustctrl.db");
+    let exe = env!("CARGO_BIN_EXE_rustctrl-server");
+
+    bootstrap_admin(exe, &config_path, "alice", "AliceTemp123!").await;
+
+    let server = RunningServer::start(&pki_dir, db_path.clone()).await?;
+    let mut admin_client = connect(&pki_dir, &server.endpoint).await?;
+
+    let boot = admin_client
+        .login(LoginRequest {
+            username: "alice".into(),
+            password: "AliceTemp123!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    admin_client
+        .replace_temporary_password(authorized(
+            &boot.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "AlicePermanent123!".into(),
+            },
+        ))
+        .await?;
+    let alice_session = login(&mut admin_client, "alice", "AlicePermanent123!").await?;
+
+    // Create Operator account for Bob.
+    admin_client
+        .create_staff_account(authorized(
+            &alice_session,
+            CreateStaffAccountRequest {
+                username: "bob".into(),
+                role: "operator".into(),
+                temporary_password: "BobTemp12345!".into(),
+            },
+        ))
+        .await?;
+    let mut operator_client = connect(&pki_dir, &server.endpoint).await?;
+    let bob_boot = operator_client
+        .login(LoginRequest {
+            username: "bob".into(),
+            password: "BobTemp12345!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    operator_client
+        .replace_temporary_password(authorized(
+            &bob_boot.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "BobPermanent123!".into(),
+            },
+        ))
+        .await?;
+    let bob_session = login(&mut operator_client, "bob", "BobPermanent123!").await?;
+
+    // Operator cannot create a target: rejected with PermissionDenied.
+    let op_create_err = operator_client
+        .create_target(authorized(
+            &bob_session,
+            CreateTargetRequest {
+                display_name: "Operator Attempt TV".into(),
+                address: "192.168.1.100:5555".into(),
+                location: Some("Lobby".into()),
+                target_type: Some("android_tv".into()),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(op_create_err.code(), Code::PermissionDenied);
+
+    // Unauthenticated caller cannot create a target.
+    let unauth_err = admin_client
+        .create_target(Request::new(CreateTargetRequest {
+            display_name: "Unauth TV".into(),
+            address: "192.168.1.100".into(),
+            location: None,
+            target_type: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(unauth_err.code(), Code::Unauthenticated);
+
+    // Validation: empty display name or address rejected.
+    let empty_name_err = admin_client
+        .create_target(authorized(
+            &alice_session,
+            CreateTargetRequest {
+                display_name: "   ".into(),
+                address: "192.168.1.100:5555".into(),
+                location: None,
+                target_type: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(empty_name_err.code(), Code::InvalidArgument);
+
+    let empty_addr_err = admin_client
+        .create_target(authorized(
+            &alice_session,
+            CreateTargetRequest {
+                display_name: "Boardroom TV".into(),
+                address: "   ".into(),
+                location: None,
+                target_type: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(empty_addr_err.code(), Code::InvalidArgument);
+
+    // Admin creates an Android TV target.
+    let create_reply = admin_client
+        .create_target(authorized(
+            &alice_session,
+            CreateTargetRequest {
+                display_name: "Boardroom TV".into(),
+                address: "192.168.1.150:5555".into(),
+                location: Some("Building B - Room 301".into()),
+                target_type: Some("android_tv".into()),
+            },
+        ))
+        .await?
+        .into_inner();
+    let target = create_reply.target.expect("target present in reply");
+    assert!(!target.device_id.is_empty());
+    let target_id = target.device_id.clone();
+    assert_eq!(target.display_name, "Boardroom TV");
+    assert_eq!(target.device_type, "android_tv");
+    assert_eq!(
+        target.configured_address,
+        Some("192.168.1.150:5555".into()),
+        "configured target address must be recorded"
+    );
+    assert!(
+        target.last_address.is_empty(),
+        "TV target must not have observed agent address"
+    );
+    assert!(
+        !target.online,
+        "TV target must not claim online status without permanent agent"
+    );
+    assert_eq!(
+        target.status, "unverified",
+        "TV target must be marked unverified"
+    );
+    assert_eq!(
+        target.last_seen_unix_ms, 0,
+        "TV target must not fabricate a last-seen timestamp"
+    );
+    assert_eq!(target.location, Some("Building B - Room 301".into()));
+
+    // Both Admin and Operator read the same target from ListFleetDevices.
+    let admin_view = admin_client
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    let op_view = operator_client
+        .list_fleet_devices(authorized(&bob_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(admin_view.devices.len(), 1);
+    assert_eq!(admin_view.devices, op_view.devices);
+    assert_eq!(admin_view.devices[0].device_id, target_id);
+    assert_eq!(admin_view.devices[0].status, "unverified");
+
+    let status_after_target = admin_client
+        .get_staff_status(authorized(&alice_session, StaffStatusRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_after_target.registered_devices, 1,
+        "fleet count must include connection targets"
+    );
+
+    // Connect a Windows agent: now inventory contains both Windows and Android TV target.
+    agent_heartbeat(&pki_dir, &server.endpoint, win_device_id).await?;
+
+    let multi_view = admin_client
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(multi_view.devices.len(), 2);
+    let status_multi = admin_client
+        .get_staff_status(authorized(&alice_session, StaffStatusRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_multi.registered_devices, 2,
+        "fleet count must include both bootstrap devices and connection targets"
+    );
+    let win_entry = multi_view
+        .devices
+        .iter()
+        .find(|d| d.device_type == "windows")
+        .expect("windows device found");
+    let tv_entry = multi_view
+        .devices
+        .iter()
+        .find(|d| d.device_type == "android_tv")
+        .expect("tv target found");
+    assert_eq!(win_entry.device_id, win_device_id.to_string());
+    assert!(win_entry.online);
+    assert_eq!(win_entry.status, "online");
+    assert!(win_entry.last_address.starts_with("127.0.0.1:"));
+    assert_eq!(win_entry.configured_address, None);
+
+    assert_eq!(tv_entry.device_id, target_id);
+    assert!(!tv_entry.online);
+    assert_eq!(tv_entry.status, "unverified");
+    assert_eq!(
+        tv_entry.configured_address,
+        Some("192.168.1.150:5555".into())
+    );
+    assert!(tv_entry.last_address.is_empty());
+    assert_eq!(tv_entry.last_seen_unix_ms, 0);
+
+    // Operator cannot edit or remove the target.
+    let op_update_err = operator_client
+        .update_target(authorized(
+            &bob_session,
+            UpdateTargetRequest {
+                target_id: target_id.clone(),
+                display_name: "Hacked TV".into(),
+                address: "10.0.0.1".into(),
+                location: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(op_update_err.code(), Code::PermissionDenied);
+
+    let op_remove_err = operator_client
+        .remove_target(authorized(
+            &bob_session,
+            RemoveTargetRequest {
+                target_id: target_id.clone(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(op_remove_err.code(), Code::PermissionDenied);
+
+    // Admin edits the target.
+    let update_reply = admin_client
+        .update_target(authorized(
+            &alice_session,
+            UpdateTargetRequest {
+                target_id: target_id.clone(),
+                display_name: "Executive Boardroom TV".into(),
+                address: "192.168.1.155:5555".into(),
+                location: Some("Building B - Room 302".into()),
+            },
+        ))
+        .await?
+        .into_inner();
+    let updated_tv = update_reply.target.expect("updated target in reply");
+    assert_eq!(updated_tv.device_id, target_id);
+    assert_eq!(updated_tv.display_name, "Executive Boardroom TV");
+    assert_eq!(
+        updated_tv.configured_address,
+        Some("192.168.1.155:5555".into())
+    );
+    assert_eq!(updated_tv.location, Some("Building B - Room 302".into()));
+    assert_eq!(updated_tv.status, "unverified");
+    assert_eq!(updated_tv.last_seen_unix_ms, 0);
+
+    // Server restart preserves the target data.
+    drop(admin_client);
+    drop(operator_client);
+    server.shutdown().await?;
+
+    let restarted = RunningServer::start(&pki_dir, db_path).await?;
+    let mut client = connect(&pki_dir, &restarted.endpoint).await?;
+    let alice_restarted = login(&mut client, "alice", "AlicePermanent123!").await?;
+
+    let restarted_view = client
+        .list_fleet_devices(authorized(&alice_restarted, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(restarted_view.devices.len(), 2);
+    let restarted_tv = restarted_view
+        .devices
+        .iter()
+        .find(|d| d.device_type == "android_tv")
+        .expect("tv target found after restart");
+    assert_eq!(restarted_tv.device_id, target_id);
+    assert_eq!(restarted_tv.display_name, "Executive Boardroom TV");
+    assert_eq!(
+        restarted_tv.configured_address,
+        Some("192.168.1.155:5555".into())
+    );
+    assert_eq!(restarted_tv.location, Some("Building B - Room 302".into()));
+    assert_eq!(restarted_tv.status, "unverified");
+    assert_eq!(restarted_tv.last_seen_unix_ms, 0);
+
+    // Admin removes the target.
+    let remove_reply = client
+        .remove_target(authorized(
+            &alice_restarted,
+            RemoveTargetRequest {
+                target_id: target_id.clone(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(remove_reply.success);
+    assert_eq!(remove_reply.target_id, target_id);
+
+    // After removal, only the Windows device remains.
+    let after_removal_view = client
+        .list_fleet_devices(authorized(&alice_restarted, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(after_removal_view.devices.len(), 1);
+    assert_eq!(after_removal_view.devices[0].device_type, "windows");
+    let status_after_removal = client
+        .get_staff_status(authorized(&alice_restarted, StaffStatusRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(
+        status_after_removal.registered_devices, 1,
+        "fleet count must decrease when a target is removed"
+    );
+
+    // Removing non-existent target returns NotFound.
+    let remove_nonexistent_err = client
+        .remove_target(authorized(
+            &alice_restarted,
+            RemoveTargetRequest {
+                target_id: target_id.clone(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(remove_nonexistent_err.code(), Code::NotFound);
+
+    // Activity log contains target actions and rejections.
+    let activity = list_activity(exe, &config_path).await;
+    assert!(
+        activity.contains("action=create_target")
+            && activity.contains("actor=alice")
+            && activity.contains("result=success")
+            && activity.contains(&target_id),
+        "activity must log create_target success: {activity}"
+    );
+    assert!(
+        activity.contains("action=create_target")
+            && activity.contains("actor=bob")
+            && activity.contains("result=rejected"),
+        "activity must log rejected create_target: {activity}"
+    );
+    assert!(
+        activity.contains("action=update_target")
+            && activity.contains("actor=alice")
+            && activity.contains("result=success")
+            && activity.contains(&target_id),
+        "activity must log update_target success: {activity}"
+    );
+    assert!(
+        activity.contains("action=update_target")
+            && activity.contains("actor=bob")
+            && activity.contains("result=rejected")
+            && activity.contains(&target_id),
+        "activity must log rejected update_target: {activity}"
+    );
+    assert!(
+        activity.contains("action=remove_target")
+            && activity.contains("actor=alice")
+            && activity.contains("result=success")
+            && activity.contains(&target_id),
+        "activity must log remove_target success: {activity}"
+    );
+    assert!(
+        activity.contains("action=remove_target")
+            && activity.contains("actor=bob")
+            && activity.contains("result=rejected")
+            && activity.contains(&target_id),
+        "activity must log rejected remove_target: {activity}"
+    );
+
+    restarted.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_manages_targets_via_controller_cli() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pki_dir = temp.path().join("pki");
+    let device_id = DeviceId::new();
+    initialize(&PkiOptions {
+        output: pki_dir.clone(),
+        server_output: None,
+        server_names: vec!["localhost".into()],
+        server_ips: vec!["127.0.0.1".parse().unwrap()],
+        endpoint: "https://localhost:9876".into(),
+        domain_name: "localhost".into(),
+        device_id,
+    })?;
+    let config_path = pki_dir.join("server.toml");
+    let controller_config_path = pki_dir.join("clients/controller/config.toml");
+    let db_path = temp.path().join("rustctrl.db");
+
+    let server_exe = env!("CARGO_BIN_EXE_rustctrl-server");
+    let ext = std::env::consts::EXE_SUFFIX;
+    let controller_exe = Path::new(server_exe)
+        .parent()
+        .unwrap()
+        .join(format!("rustctrl-controller{ext}"));
+    if !controller_exe.is_file() {
+        eprintln!(
+            "Skipping controller CLI test: binary not found at {:?}",
+            controller_exe
+        );
+        return Ok(());
+    }
+
+    bootstrap_admin(server_exe, &config_path, "alice", "AliceTemp123!").await;
+
+    let server = RunningServer::start(&pki_dir, db_path).await?;
+    let controller_toml = format!(
+        "[server]\nendpoint = \"{}\"\ndomain_name = \"localhost\"\nca_certificate = \"ca.pem\"\ncertificate = \"cert.pem\"\nprivate_key = \"key.pem\"\n",
+        server.endpoint
+    );
+    std::fs::write(&controller_config_path, controller_toml)?;
+
+    let run_controller = |args: &[&str]| {
+        let exe = controller_exe.clone();
+        let config = controller_config_path.clone();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let mut cmd = Command::new(&exe);
+                cmd.arg("--config").arg(&config);
+                for arg in &args {
+                    cmd.arg(arg);
+                }
+                cmd.output().expect("run rustctrl-controller CLI")
+            })
+            .await
+            .expect("join rustctrl-controller CLI")
+        }
+    };
+
+    // Alice logs in and replaces password.
+    let bootstrap = run_controller(&[
+        "login",
+        "--username",
+        "alice",
+        "--password",
+        "AliceTemp123!",
+        "--replace-password",
+        "AlicePermanent123!",
+    ])
+    .await;
+    assert!(bootstrap.status.success());
+
+    // Alice creates operator Bob.
+    let mut admin = connect(&pki_dir, &server.endpoint).await?;
+    let alice_session = login(&mut admin, "alice", "AlicePermanent123!").await?;
+    admin
+        .create_staff_account(authorized(
+            &alice_session,
+            CreateStaffAccountRequest {
+                username: "bob".into(),
+                role: "operator".into(),
+                temporary_password: "BobTemp12345!".into(),
+            },
+        ))
+        .await?;
+    drop(admin);
+
+    let bob_replace = run_controller(&[
+        "login",
+        "--username",
+        "bob",
+        "--password",
+        "BobTemp12345!",
+        "--replace-password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(bob_replace.status.success());
+
+    // Operator Bob cannot add targets.
+    let op_add = run_controller(&[
+        "add-target",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+        "--display-name",
+        "Operator Target",
+        "--address",
+        "192.168.1.50:5555",
+    ])
+    .await;
+    assert!(
+        !op_add.status.success(),
+        "operator add-target must fail: {}",
+        String::from_utf8_lossy(&op_add.stdout)
+    );
+
+    // Admin Alice adds Android TV target.
+    let admin_add = run_controller(&[
+        "add-target",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--display-name",
+        "Breakroom TV",
+        "--address",
+        "192.168.1.200:5555",
+        "--location",
+        "Breakroom",
+    ])
+    .await;
+    assert!(
+        admin_add.status.success(),
+        "admin add-target must succeed: {}",
+        String::from_utf8_lossy(&admin_add.stderr)
+    );
+    let add_out = String::from_utf8_lossy(&admin_add.stdout);
+    assert!(
+        add_out.contains("Added target ") && add_out.contains("name=Breakroom TV"),
+        "unexpected add output: {add_out}"
+    );
+    let target_id = add_out
+        .split("Added target ")
+        .nth(1)
+        .and_then(|s| s.split(':').next())
+        .map(|s| s.trim().to_string())
+        .expect("target id parsed from output");
+
+    // Operator Bob lists devices and sees the new target as unverified.
+    let list_view = run_controller(&[
+        "list-devices",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(list_view.status.success());
+    let list_out = String::from_utf8_lossy(&list_view.stdout);
+    assert!(
+        list_out.contains(&target_id)
+            && list_out.contains("name=Breakroom TV")
+            && list_out.contains("type=android_tv")
+            && list_out.contains("location=Breakroom")
+            && list_out.contains("last_address=-")
+            && list_out.contains("configured_address=192.168.1.200:5555")
+            && list_out.contains("status=unverified")
+            && list_out.contains("last_seen_unix_ms=-"),
+        "operator must see target details with unverified status: {list_out}"
+    );
+
+    // Operator Bob cannot edit targets.
+    let op_edit = run_controller(&[
+        "edit-target",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+        "--target-id",
+        &target_id,
+        "--display-name",
+        "Hacked TV",
+        "--address",
+        "10.0.0.1:5555",
+    ])
+    .await;
+    assert!(!op_edit.status.success());
+
+    // Admin Alice edits target.
+    let admin_edit = run_controller(&[
+        "edit-target",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--target-id",
+        &target_id,
+        "--display-name",
+        "Cafeteria TV",
+        "--address",
+        "192.168.1.201:5555",
+        "--location",
+        "Cafeteria",
+    ])
+    .await;
+    assert!(
+        admin_edit.status.success(),
+        "admin edit-target must succeed: {}",
+        String::from_utf8_lossy(&admin_edit.stderr)
+    );
+
+    // Operator Bob observes the edited target.
+    let list_after_edit = run_controller(&[
+        "list-devices",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(list_after_edit.status.success());
+    let edit_out = String::from_utf8_lossy(&list_after_edit.stdout);
+    assert!(
+        edit_out.contains("name=Cafeteria TV")
+            && edit_out.contains("location=Cafeteria")
+            && edit_out.contains("configured_address=192.168.1.201:5555")
+            && edit_out.contains("status=unverified"),
+        "operator must see updated target: {edit_out}"
+    );
+
+    // Operator Bob cannot remove targets.
+    let op_remove = run_controller(&[
+        "remove-target",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+        "--target-id",
+        &target_id,
+    ])
+    .await;
+    assert!(!op_remove.status.success());
+
+    // Admin Alice removes target.
+    let admin_remove = run_controller(&[
+        "remove-target",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--target-id",
+        &target_id,
+    ])
+    .await;
+    assert!(
+        admin_remove.status.success(),
+        "admin remove-target must succeed: {}",
+        String::from_utf8_lossy(&admin_remove.stderr)
+    );
+
+    // Operator Bob lists devices and target is gone.
+    let list_after_remove = run_controller(&[
+        "list-devices",
+        "--username",
+        "bob",
+        "--password",
+        "BobPermanent123!",
+    ])
+    .await;
+    assert!(list_after_remove.status.success());
+    let remove_out = String::from_utf8_lossy(&list_after_remove.stdout);
+    assert!(
+        !remove_out.contains(&target_id),
+        "target must not appear after removal: {remove_out}"
+    );
+
+    server.shutdown().await?;
     Ok(())
 }

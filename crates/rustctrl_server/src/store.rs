@@ -113,6 +113,19 @@ pub struct DeviceRecord {
     pub last_address: Option<String>,
     pub last_seen_unix_ms: i64,
     pub location: Option<String>,
+    pub device_type: String,
+    pub configured_address: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetRecord {
+    pub target_id: String,
+    pub display_name: String,
+    pub target_type: String,
+    pub configured_address: String,
+    pub location: Option<String>,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
 }
 
 #[derive(Clone)]
@@ -168,6 +181,15 @@ impl DeviceStore {
                 location TEXT,
                 updated_at_unix_ms INTEGER NOT NULL,
                 FOREIGN KEY(device_id) REFERENCES bootstrap_devices(device_id)
+            );
+            CREATE TABLE IF NOT EXISTS connection_targets (
+                target_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                configured_address TEXT NOT NULL,
+                location TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL
             );",
         )?;
         // Existing databases predate account deactivation, remembered-session
@@ -237,10 +259,13 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location
+                "SELECT b.device_id, COALESCE(m.display_name, b.name) AS display_name, b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL
                  FROM bootstrap_devices b
                  LEFT JOIN device_metadata m ON b.device_id = m.device_id
-                 ORDER BY b.last_seen_unix_ms DESC, b.device_id ASC",
+                 UNION ALL
+                 SELECT t.target_id, t.display_name, '', NULL, 0, t.location, t.target_type, t.configured_address
+                 FROM connection_targets t
+                 ORDER BY 5 DESC, 2 ASC, 1 ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(DeviceRecord {
@@ -250,6 +275,8 @@ impl DeviceStore {
                     last_address: row.get(3)?,
                     last_seen_unix_ms: row.get(4)?,
                     location: row.get(5)?,
+                    device_type: row.get(6)?,
+                    configured_address: row.get(7)?,
                 })
             })?;
             let mut devices = Vec::new();
@@ -270,10 +297,14 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL
                  FROM bootstrap_devices b
                  LEFT JOIN device_metadata m ON b.device_id = m.device_id
-                 WHERE b.device_id = ?1",
+                 WHERE b.device_id = ?1
+                 UNION ALL
+                 SELECT t.target_id, t.display_name, '', NULL, 0, t.location, t.target_type, t.configured_address
+                 FROM connection_targets t
+                 WHERE t.target_id = ?1",
             )?;
             let mut rows = stmt.query(params![device_id])?;
             if let Some(row) = rows.next()? {
@@ -284,6 +315,8 @@ impl DeviceStore {
                     last_address: row.get(3)?,
                     last_seen_unix_ms: row.get(4)?,
                     location: row.get(5)?,
+                    device_type: row.get(6)?,
+                    configured_address: row.get(7)?,
                 }))
             } else {
                 Ok(None)
@@ -349,7 +382,7 @@ impl DeviceStore {
             )?;
 
             let record = connection.query_row(
-                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL
                  FROM bootstrap_devices b
                  LEFT JOIN device_metadata m ON b.device_id = m.device_id
                  WHERE b.device_id = ?1",
@@ -362,11 +395,189 @@ impl DeviceStore {
                         last_address: row.get(3)?,
                         last_seen_unix_ms: row.get(4)?,
                         location: row.get(5)?,
+                        device_type: row.get(6)?,
+                        configured_address: row.get(7)?,
                     })
                 },
             )?;
 
             Ok(record)
+        })
+        .await?
+    }
+
+    pub async fn create_target(
+        &self,
+        display_name: &str,
+        address: &str,
+        target_type: Option<&str>,
+        location: Option<&str>,
+    ) -> Result<TargetRecord> {
+        let display_name = display_name.trim();
+        anyhow::ensure!(!display_name.is_empty(), "display name cannot be empty");
+        anyhow::ensure!(
+            display_name.len() <= 128,
+            "display name must contain at most 128 characters"
+        );
+
+        let address = address.trim();
+        anyhow::ensure!(!address.is_empty(), "configured address cannot be empty");
+        anyhow::ensure!(
+            address.len() <= 128,
+            "configured address must contain at most 128 characters"
+        );
+
+        let target_type = match target_type.unwrap_or("android_tv").trim() {
+            "" | "android_tv" => "android_tv",
+            other => anyhow::bail!("unsupported target type '{other}'"),
+        };
+
+        let location = location
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string());
+        if let Some(loc) = &location {
+            anyhow::ensure!(
+                loc.len() <= 128,
+                "location must contain at most 128 characters"
+            );
+        }
+
+        let store = self.clone();
+        let display_name = display_name.to_string();
+        let address = address.to_string();
+        let target_type = target_type.to_string();
+        tokio::task::spawn_blocking(move || {
+            let target_id = DeviceId::new().to_string();
+            let now = current_time_ms()?;
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+
+            connection.execute(
+                "INSERT INTO connection_targets (target_id, display_name, target_type, configured_address, location, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![target_id, display_name, target_type, address, location, now, now],
+            )?;
+
+            Ok(TargetRecord {
+                target_id,
+                display_name,
+                target_type,
+                configured_address: address,
+                location,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })
+        })
+        .await?
+    }
+
+    pub async fn update_target(
+        &self,
+        target_id: &str,
+        display_name: &str,
+        address: &str,
+        location: Option<&str>,
+    ) -> Result<TargetRecord> {
+        let target_id = target_id.trim();
+        let _: DeviceId = target_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid target_id"))?;
+
+        let display_name = display_name.trim();
+        anyhow::ensure!(!display_name.is_empty(), "display name cannot be empty");
+        anyhow::ensure!(
+            display_name.len() <= 128,
+            "display name must contain at most 128 characters"
+        );
+
+        let address = address.trim();
+        anyhow::ensure!(!address.is_empty(), "configured address cannot be empty");
+        anyhow::ensure!(
+            address.len() <= 128,
+            "configured address must contain at most 128 characters"
+        );
+
+        let location = location
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string());
+        if let Some(loc) = &location {
+            anyhow::ensure!(
+                loc.len() <= 128,
+                "location must contain at most 128 characters"
+            );
+        }
+
+        let store = self.clone();
+        let target_id = target_id.to_string();
+        let display_name = display_name.to_string();
+        let address = address.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+
+            let changed = connection.execute(
+                "UPDATE connection_targets
+                 SET display_name = ?1, configured_address = ?2, location = ?3, updated_at_unix_ms = ?4
+                 WHERE target_id = ?5",
+                params![display_name, address, location, now, target_id],
+            )?;
+            if changed == 0 {
+                anyhow::bail!("target '{target_id}' not found");
+            }
+
+            let record = connection.query_row(
+                "SELECT target_id, display_name, target_type, configured_address, location, created_at_unix_ms, updated_at_unix_ms
+                 FROM connection_targets
+                 WHERE target_id = ?1",
+                params![target_id],
+                |row| {
+                    Ok(TargetRecord {
+                        target_id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        target_type: row.get(2)?,
+                        configured_address: row.get(3)?,
+                        location: row.get(4)?,
+                        created_at_unix_ms: row.get(5)?,
+                        updated_at_unix_ms: row.get(6)?,
+                    })
+                },
+            )?;
+
+            Ok(record)
+        })
+        .await?
+    }
+
+    pub async fn remove_target(&self, target_id: &str) -> Result<String> {
+        let target_id = target_id.trim();
+        let _: DeviceId = target_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid target_id"))?;
+
+        let store = self.clone();
+        let target_id = target_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+
+            let changed = connection.execute(
+                "DELETE FROM connection_targets WHERE target_id = ?1",
+                params![target_id],
+            )?;
+            if changed == 0 {
+                anyhow::bail!("target '{target_id}' not found");
+            }
+
+            Ok(target_id)
         })
         .await?
     }
@@ -378,10 +589,11 @@ impl DeviceStore {
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-            let count: i64 =
-                connection.query_row("SELECT COUNT(*) FROM bootstrap_devices", [], |row| {
-                    row.get(0)
-                })?;
+            let count: i64 = connection.query_row(
+                "SELECT (SELECT COUNT(*) FROM bootstrap_devices) + (SELECT COUNT(*) FROM connection_targets)",
+                [],
+                |row| row.get(0),
+            )?;
             Ok(u64::try_from(count)?)
         })
         .await?

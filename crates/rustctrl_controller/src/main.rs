@@ -3,9 +3,10 @@ use clap::{Parser, Subcommand};
 use rustctrl_core::{ControllerConfig, init_logging};
 use rustctrl_protocol::auth::{
     ChangeOwnPasswordRequest, ChangeStaffRoleRequest, CreateStaffAccountRequest,
-    DeactivateStaffAccountRequest, ListFleetDevicesRequest, ListStaffAccountsRequest, LoginRequest,
-    LogoutRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffStatusRequest,
-    UpdateFleetDeviceRequest,
+    CreateTargetRequest, DeactivateStaffAccountRequest, ListFleetDevicesRequest,
+    ListStaffAccountsRequest, LoginRequest, LogoutRequest, RemoveTargetRequest,
+    ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffStatusRequest,
+    UpdateFleetDeviceRequest, UpdateTargetRequest,
 };
 use rustctrl_protocol::bootstrap::HealthRequest;
 use std::path::PathBuf;
@@ -118,6 +119,40 @@ enum Command {
         display_name: String,
         #[arg(long)]
         location: Option<String>,
+    },
+    AddTarget {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        display_name: String,
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        location: Option<String>,
+    },
+    EditTarget {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        target_id: String,
+        #[arg(long)]
+        display_name: String,
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        location: Option<String>,
+    },
+    RemoveTarget {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        target_id: String,
     },
 }
 
@@ -542,19 +577,34 @@ fn main() -> Result<()> {
                 let reply = client.list_fleet_devices(req).await?.into_inner();
                 println!("Fleet Devices ({}):", reply.devices.len());
                 for device in reply.devices {
+                    let last_addr_str = if !device.last_address.is_empty() {
+                        &device.last_address
+                    } else {
+                        "-"
+                    };
+                    let config_addr_str = device.configured_address.as_deref().unwrap_or("-");
+                    let status_str = if !device.status.is_empty() {
+                        &device.status
+                    } else if device.online {
+                        "online"
+                    } else {
+                        "offline"
+                    };
+                    let last_seen_str = if device.last_seen_unix_ms == 0 {
+                        "-".to_string()
+                    } else {
+                        device.last_seen_unix_ms.to_string()
+                    };
                     println!(
-                        "  device={} name={} type={} location={} address={} status={} last_seen_unix_ms={}",
+                        "  device={} name={} type={} location={} last_address={} configured_address={} status={} last_seen_unix_ms={}",
                         device.device_id,
                         device.display_name,
                         device.device_type,
                         device.location.as_deref().unwrap_or("-"),
-                        if device.last_address.is_empty() {
-                            "-"
-                        } else {
-                            &device.last_address
-                        },
-                        if device.online { "online" } else { "offline" },
-                        device.last_seen_unix_ms
+                        last_addr_str,
+                        config_addr_str,
+                        status_str,
+                        last_seen_str,
                     );
                 }
                 let mut logout_req = tonic::Request::new(LogoutRequest {});
@@ -610,6 +660,142 @@ fn main() -> Result<()> {
                         if device.online { "online" } else { "offline" }
                     );
                 }
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
+        Command::AddTarget {
+            username,
+            password,
+            display_name,
+            address,
+            location,
+        } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest {
+                        username,
+                        password,
+                        remember: false,
+                    })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!("temporary password must be replaced before adding target");
+                }
+                let mut req = tonic::Request::new(CreateTargetRequest {
+                    display_name,
+                    address,
+                    location,
+                    target_type: Some("android_tv".into()),
+                });
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client.create_target(req).await?.into_inner();
+                if let Some(target) = reply.target {
+                    println!(
+                        "Added target {}: name={} type={} address={} status={}",
+                        target.device_id,
+                        target.display_name,
+                        target.device_type,
+                        target.configured_address.as_deref().unwrap_or("-"),
+                        target.status
+                    );
+                }
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
+        Command::EditTarget {
+            username,
+            password,
+            target_id,
+            display_name,
+            address,
+            location,
+        } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest {
+                        username,
+                        password,
+                        remember: false,
+                    })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!("temporary password must be replaced before editing target");
+                }
+                let mut req = tonic::Request::new(UpdateTargetRequest {
+                    target_id,
+                    display_name,
+                    address,
+                    location,
+                });
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client.update_target(req).await?.into_inner();
+                if let Some(target) = reply.target {
+                    println!(
+                        "Updated target {}: name={} type={} address={} location={} status={}",
+                        target.device_id,
+                        target.display_name,
+                        target.device_type,
+                        target.configured_address.as_deref().unwrap_or("-"),
+                        target.location.as_deref().unwrap_or("-"),
+                        target.status
+                    );
+                }
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
+        Command::RemoveTarget {
+            username,
+            password,
+            target_id,
+        } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest {
+                        username,
+                        password,
+                        remember: false,
+                    })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!("temporary password must be replaced before removing target");
+                }
+                let mut req = tonic::Request::new(RemoveTargetRequest { target_id });
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client.remove_target(req).await?.into_inner();
+                println!("Removed target {}: success={}", reply.target_id, reply.success);
                 let mut logout_req = tonic::Request::new(LogoutRequest {});
                 logout_req.metadata_mut().insert(
                     "authorization",

@@ -11,6 +11,9 @@ service StaffAuth {
   rpc GetStaffStatus(StaffStatusRequest) returns (StaffStatusReply);
   rpc ListFleetDevices(ListFleetDevicesRequest) returns (ListFleetDevicesReply);
   rpc UpdateFleetDevice(UpdateFleetDeviceRequest) returns (UpdateFleetDeviceReply);
+  rpc CreateTarget(CreateTargetRequest) returns (CreateTargetReply);
+  rpc UpdateTarget(UpdateTargetRequest) returns (UpdateTargetReply);
+  rpc RemoveTarget(RemoveTargetRequest) returns (RemoveTargetReply);
   rpc ListStaffAccounts(ListStaffAccountsRequest) returns (ListStaffAccountsReply);
   rpc CreateStaffAccount(CreateStaffAccountRequest) returns (CreateStaffAccountReply);
   rpc ChangeStaffRole(ChangeStaffRoleRequest) returns (ChangeStaffRoleReply);
@@ -90,6 +93,8 @@ message FleetDeviceEntry {
   bool online = 5;
   int64 last_seen_unix_ms = 6;
   optional string location = 7;
+  optional string configured_address = 8;
+  string status = 9;
 }
 
 message ListFleetDevicesReply {
@@ -104,6 +109,37 @@ message UpdateFleetDeviceRequest {
 
 message UpdateFleetDeviceReply {
   FleetDeviceEntry device = 1;
+}
+
+message CreateTargetRequest {
+  string display_name = 1;
+  string address = 2;
+  optional string location = 3;
+  optional string target_type = 4;
+}
+
+message CreateTargetReply {
+  FleetDeviceEntry target = 1;
+}
+
+message UpdateTargetRequest {
+  string target_id = 1;
+  string display_name = 2;
+  string address = 3;
+  optional string location = 4;
+}
+
+message UpdateTargetReply {
+  FleetDeviceEntry target = 1;
+}
+
+message RemoveTargetRequest {
+  string target_id = 1;
+}
+
+message RemoveTargetReply {
+  bool success = 1;
+  string target_id = 2;
 }
 
 message StaffAccountEntry {

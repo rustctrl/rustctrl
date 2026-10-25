@@ -1,15 +1,19 @@
-use crate::{config::ServerConfig, store::DeviceStore};
+use crate::{
+    config::ServerConfig,
+    store::{DeviceRecord, DeviceStore, TargetRecord},
+};
 use anyhow::{Context, Result};
 use rustctrl_core::DeviceId;
 use rustctrl_protocol::auth::{
     ChangeOwnPasswordReply, ChangeOwnPasswordRequest, ChangeStaffRoleReply, ChangeStaffRoleRequest,
-    CreateStaffAccountReply, CreateStaffAccountRequest, DeactivateStaffAccountReply,
-    DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesReply,
-    ListFleetDevicesRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
-    LoginRequest, LogoutReply, LogoutRequest, ReplaceTemporaryPasswordReply,
+    CreateStaffAccountReply, CreateStaffAccountRequest, CreateTargetReply, CreateTargetRequest,
+    DeactivateStaffAccountReply, DeactivateStaffAccountRequest, FleetDeviceEntry,
+    ListFleetDevicesReply, ListFleetDevicesRequest, ListStaffAccountsReply,
+    ListStaffAccountsRequest, LoginReply, LoginRequest, LogoutReply, LogoutRequest,
+    RemoveTargetReply, RemoveTargetRequest, ReplaceTemporaryPasswordReply,
     ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply, ResetStaffPasswordRequest,
     StaffAccountEntry, StaffStatusReply, StaffStatusRequest, UpdateFleetDeviceReply,
-    UpdateFleetDeviceRequest,
+    UpdateFleetDeviceRequest, UpdateTargetReply, UpdateTargetRequest,
     staff_auth_server::{StaffAuth, StaffAuthServer},
 };
 use rustctrl_protocol::bootstrap::{
@@ -572,17 +576,169 @@ impl StaffAuth for StaffAuthService {
             i64::try_from(self.offline_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
         let entries = devices
             .into_iter()
-            .map(|device| FleetDeviceEntry {
-                device_id: device.device_id,
-                display_name: device.name,
-                device_type: "windows".into(),
-                last_address: device.last_address.unwrap_or_default(),
-                online: now_ms.saturating_sub(device.last_seen_unix_ms) <= window_ms,
-                last_seen_unix_ms: device.last_seen_unix_ms,
-                location: device.location,
-            })
+            .map(|device| to_fleet_device_entry(device, now_ms, window_ms))
             .collect();
         Ok(Response::new(ListFleetDevicesReply { devices: entries }))
+    }
+
+    async fn create_target(
+        &self,
+        request: Request<CreateTargetRequest>,
+    ) -> Result<Response<CreateTargetReply>, Status> {
+        let session = self
+            .authenticate_admin(&request, "create_target", None)
+            .await?;
+        let body = request.into_inner();
+        let display_name = body.display_name.trim();
+        let address = body.address.trim();
+        let target_type = body.target_type.as_deref();
+        let location = body.location.as_deref();
+
+        match self
+            .store
+            .create_target(display_name, address, target_type, location)
+            .await
+        {
+            Ok(target) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "create_target".into(),
+                        "success".into(),
+                        format!(
+                            "created target '{}' (name='{}', address='{}', type='{}')",
+                            target.target_id,
+                            target.display_name,
+                            target.configured_address,
+                            target.target_type
+                        ),
+                    )
+                    .await;
+                Ok(Response::new(CreateTargetReply {
+                    target: Some(target_to_fleet_device_entry(target)),
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "create_target".into(),
+                        "rejected".into(),
+                        format!("failed to create target: {err_msg}"),
+                    )
+                    .await;
+                Err(Status::invalid_argument(err_msg))
+            }
+        }
+    }
+
+    async fn update_target(
+        &self,
+        request: Request<UpdateTargetRequest>,
+    ) -> Result<Response<UpdateTargetReply>, Status> {
+        let body = request.get_ref();
+        let target_id = body.target_id.trim().to_string();
+        let session = self
+            .authenticate_admin(&request, "update_target", Some(&target_id))
+            .await?;
+        let body = request.into_inner();
+        let display_name = body.display_name.trim();
+        let address = body.address.trim();
+        let location = body.location.as_deref();
+
+        match self
+            .store
+            .update_target(&target_id, display_name, address, location)
+            .await
+        {
+            Ok(target) => {
+                let location_desc = match &target.location {
+                    Some(loc) => format!("'{loc}'"),
+                    None => "none".into(),
+                };
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "update_target".into(),
+                        "success".into(),
+                        format!(
+                            "updated target '{target_id}' (name='{}', address='{}', location={location_desc})",
+                            target.display_name, target.configured_address
+                        ),
+                    )
+                    .await;
+                Ok(Response::new(UpdateTargetReply {
+                    target: Some(target_to_fleet_device_entry(target)),
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "update_target".into(),
+                        "rejected".into(),
+                        format!("failed to update target '{target_id}': {err_msg}"),
+                    )
+                    .await;
+                if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
+    }
+
+    async fn remove_target(
+        &self,
+        request: Request<RemoveTargetRequest>,
+    ) -> Result<Response<RemoveTargetReply>, Status> {
+        let body = request.get_ref();
+        let target_id = body.target_id.trim().to_string();
+        let session = self
+            .authenticate_admin(&request, "remove_target", Some(&target_id))
+            .await?;
+
+        match self.store.remove_target(&target_id).await {
+            Ok(removed_id) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "remove_target".into(),
+                        "success".into(),
+                        format!("removed target '{target_id}'"),
+                    )
+                    .await;
+                Ok(Response::new(RemoveTargetReply {
+                    success: true,
+                    target_id: removed_id,
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "remove_target".into(),
+                        "rejected".into(),
+                        format!("failed to remove target '{target_id}': {err_msg}"),
+                    )
+                    .await;
+                if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
     }
 
     async fn update_fleet_device(
@@ -627,15 +783,7 @@ impl StaffAuth for StaffAuthService {
                 let window_ms =
                     i64::try_from(self.offline_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
                 Ok(Response::new(UpdateFleetDeviceReply {
-                    device: Some(FleetDeviceEntry {
-                        device_id: updated.device_id,
-                        display_name: updated.name,
-                        device_type: "windows".into(),
-                        last_address: updated.last_address.unwrap_or_default(),
-                        online: now_ms.saturating_sub(updated.last_seen_unix_ms) <= window_ms,
-                        last_seen_unix_ms: updated.last_seen_unix_ms,
-                        location: updated.location,
-                    }),
+                    device: Some(to_fleet_device_entry(updated, now_ms, window_ms)),
                 }))
             }
             Err(e) => {
@@ -831,6 +979,47 @@ impl StaffAuth for StaffAuthService {
                 }
             }
         }
+    }
+}
+
+fn to_fleet_device_entry(device: DeviceRecord, now_ms: i64, window_ms: i64) -> FleetDeviceEntry {
+    let is_windows = device.device_type == "windows";
+    let online = if is_windows {
+        now_ms.saturating_sub(device.last_seen_unix_ms) <= window_ms
+    } else {
+        false
+    };
+    let status = if !is_windows {
+        "unverified".into()
+    } else if online {
+        "online".into()
+    } else {
+        "offline".into()
+    };
+    FleetDeviceEntry {
+        device_id: device.device_id,
+        display_name: device.name,
+        device_type: device.device_type,
+        last_address: device.last_address.unwrap_or_default(),
+        online,
+        last_seen_unix_ms: device.last_seen_unix_ms,
+        location: device.location,
+        configured_address: device.configured_address,
+        status,
+    }
+}
+
+fn target_to_fleet_device_entry(target: TargetRecord) -> FleetDeviceEntry {
+    FleetDeviceEntry {
+        device_id: target.target_id,
+        display_name: target.display_name,
+        device_type: target.target_type,
+        last_address: String::new(),
+        online: false,
+        last_seen_unix_ms: 0,
+        location: target.location,
+        configured_address: Some(target.configured_address),
+        status: "unverified".into(),
     }
 }
 

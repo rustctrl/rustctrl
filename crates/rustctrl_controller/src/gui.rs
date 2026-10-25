@@ -6,9 +6,10 @@ use gpui::{
 use rustctrl_core::ControllerConfig;
 use rustctrl_protocol::auth::{
     ChangeOwnPasswordRequest, ChangeStaffRoleRequest, CreateStaffAccountRequest,
-    DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesRequest,
-    ListStaffAccountsRequest, LoginRequest, LogoutRequest, ReplaceTemporaryPasswordRequest,
-    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusRequest, UpdateFleetDeviceRequest,
+    CreateTargetRequest, DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesRequest,
+    ListStaffAccountsRequest, LoginRequest, LogoutRequest, RemoveTargetRequest,
+    ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffAccountEntry,
+    StaffStatusRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
 };
 use std::time::Duration;
 
@@ -24,6 +25,12 @@ enum ActiveField {
     NewAccountPassword,
     EditDeviceDisplayName,
     EditDeviceLocation,
+    AddTargetDisplayName,
+    AddTargetAddress,
+    AddTargetLocation,
+    EditTargetDisplayName,
+    EditTargetAddress,
+    EditTargetLocation,
 }
 
 #[derive(Clone)]
@@ -47,6 +54,23 @@ enum Overlay {
         request_id: u64,
         device_id: String,
         display_name: String,
+        location: String,
+        error: Option<String>,
+        in_flight: bool,
+    },
+    AddTarget {
+        request_id: u64,
+        display_name: String,
+        address: String,
+        location: String,
+        error: Option<String>,
+        in_flight: bool,
+    },
+    EditTarget {
+        request_id: u64,
+        target_id: String,
+        display_name: String,
+        address: String,
         location: String,
         error: Option<String>,
         in_flight: bool,
@@ -103,6 +127,7 @@ struct ControllerApp {
     focus_handle: FocusHandle,
     tokio_handle: tokio::runtime::Handle,
     next_edit_device_request_id: u64,
+    next_target_request_id: u64,
     _refresh: Task<()>,
     _restore: Option<Task<()>>,
 }
@@ -285,6 +310,7 @@ impl ControllerApp {
             focus_handle,
             tokio_handle,
             next_edit_device_request_id: 0,
+            next_target_request_id: 0,
             _refresh: refresh,
             _restore: Some(restore),
         }
@@ -1088,6 +1114,64 @@ impl ControllerApp {
         }
     }
 
+    fn open_add_target(&mut self, cx: &mut Context<Self>) {
+        if let Overlay::AddTarget {
+            in_flight: true, ..
+        } = self.overlay
+        {
+            return;
+        }
+        if let ScreenState::Connected { role, .. } = &self.state
+            && role == "admin"
+        {
+            self.next_target_request_id = self.next_target_request_id.wrapping_add(1);
+            let request_id = self.next_target_request_id;
+            self.overlay = Overlay::AddTarget {
+                request_id,
+                display_name: String::new(),
+                address: String::new(),
+                location: String::new(),
+                error: None,
+                in_flight: false,
+            };
+            self.active_field = ActiveField::AddTargetDisplayName;
+            cx.notify();
+        }
+    }
+
+    fn open_edit_target(
+        &mut self,
+        target_id: String,
+        display_name: String,
+        address: String,
+        location: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Overlay::EditTarget {
+            in_flight: true, ..
+        } = self.overlay
+        {
+            return;
+        }
+        if let ScreenState::Connected { role, .. } = &self.state
+            && role == "admin"
+        {
+            self.next_target_request_id = self.next_target_request_id.wrapping_add(1);
+            let request_id = self.next_target_request_id;
+            self.overlay = Overlay::EditTarget {
+                request_id,
+                target_id,
+                display_name,
+                address,
+                location: location.unwrap_or_default(),
+                error: None,
+                in_flight: false,
+            };
+            self.active_field = ActiveField::EditTargetDisplayName;
+            cx.notify();
+        }
+    }
+
     fn close_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay = Overlay::None;
         self.active_field = ActiveField::NewAccountUsername;
@@ -1437,6 +1521,330 @@ impl ControllerApp {
                         {
                             *in_flight = false;
                             *error = Some(join_err.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_add_target(&mut self, cx: &mut Context<Self>) {
+        let (request_id, session_token, target_name, target_addr, target_location) =
+            match &mut self.overlay {
+                Overlay::AddTarget {
+                    request_id,
+                    display_name,
+                    address,
+                    location,
+                    error,
+                    in_flight,
+                } => {
+                    if *in_flight {
+                        return;
+                    }
+                    let trimmed_name = display_name.trim();
+                    if trimmed_name.is_empty() {
+                        *error = Some("Display name cannot be empty.".into());
+                        cx.notify();
+                        return;
+                    }
+                    let trimmed_addr = address.trim();
+                    if trimmed_addr.is_empty() {
+                        *error = Some("Connection address cannot be empty.".into());
+                        cx.notify();
+                        return;
+                    }
+                    let trimmed_loc = location.trim();
+                    let token = match &self.state {
+                        ScreenState::Connected { session_token, .. } => session_token.clone(),
+                        _ => return,
+                    };
+                    *in_flight = true;
+                    *error = None;
+                    (
+                        *request_id,
+                        token,
+                        trimmed_name.to_string(),
+                        trimmed_addr.to_string(),
+                        if trimmed_loc.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed_loc.to_string())
+                        },
+                    )
+                }
+                _ => return,
+            };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let target_name_label = target_name.clone();
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(CreateTargetRequest {
+                        display_name: target_name,
+                        address: target_addr,
+                        location: target_location,
+                        target_type: Some("android_tv".into()),
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    let reply = client.create_target(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(reply)
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                let is_same_session = match &view.state {
+                    ScreenState::Connected { session_token, .. } => session_token == &tok_check,
+                    _ => false,
+                };
+                if !is_same_session {
+                    return;
+                }
+
+                let is_matching_form = match &view.overlay {
+                    Overlay::AddTarget {
+                        request_id: current_req_id,
+                        ..
+                    } => *current_req_id == request_id,
+                    _ => false,
+                };
+
+                match res {
+                    Ok(Ok(reply)) => {
+                        if is_matching_form {
+                            view.close_overlay(cx);
+                        }
+                        if let ScreenState::Connected { notice, .. } = &mut view.state {
+                            let id_str = reply
+                                .target
+                                .as_ref()
+                                .map(|t| t.device_id.as_str())
+                                .unwrap_or("");
+                            *notice = Some(format!(
+                                "Added Android TV target '{target_name_label}' ({id_str})."
+                            ));
+                            let token = tok_check.clone();
+                            view.fetch_status(token, cx);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if is_matching_form
+                            && let Overlay::AddTarget {
+                                error, in_flight, ..
+                            } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(err.to_string());
+                        }
+                    }
+                    Err(join_err) => {
+                        if is_matching_form
+                            && let Overlay::AddTarget {
+                                error, in_flight, ..
+                            } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(join_err.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_edit_target(&mut self, cx: &mut Context<Self>) {
+        let (request_id, session_token, target_id, target_name, target_addr, target_location) =
+            match &mut self.overlay {
+                Overlay::EditTarget {
+                    request_id,
+                    target_id,
+                    display_name,
+                    address,
+                    location,
+                    error,
+                    in_flight,
+                } => {
+                    if *in_flight {
+                        return;
+                    }
+                    let trimmed_name = display_name.trim();
+                    if trimmed_name.is_empty() {
+                        *error = Some("Display name cannot be empty.".into());
+                        cx.notify();
+                        return;
+                    }
+                    let trimmed_addr = address.trim();
+                    if trimmed_addr.is_empty() {
+                        *error = Some("Connection address cannot be empty.".into());
+                        cx.notify();
+                        return;
+                    }
+                    let trimmed_loc = location.trim();
+                    let token = match &self.state {
+                        ScreenState::Connected { session_token, .. } => session_token.clone(),
+                        _ => return,
+                    };
+                    *in_flight = true;
+                    *error = None;
+                    (
+                        *request_id,
+                        token,
+                        target_id.clone(),
+                        trimmed_name.to_string(),
+                        trimmed_addr.to_string(),
+                        if trimmed_loc.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed_loc.to_string())
+                        },
+                    )
+                }
+                _ => return,
+            };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let target_id_label = target_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(UpdateTargetRequest {
+                        target_id,
+                        display_name: target_name,
+                        address: target_addr,
+                        location: target_location,
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    client.update_target(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                let is_same_session = match &view.state {
+                    ScreenState::Connected { session_token, .. } => session_token == &tok_check,
+                    _ => false,
+                };
+                if !is_same_session {
+                    return;
+                }
+
+                let is_matching_form = match &view.overlay {
+                    Overlay::EditTarget {
+                        request_id: current_req_id,
+                        target_id: current_target_id,
+                        ..
+                    } => *current_req_id == request_id && current_target_id == &target_id_label,
+                    _ => false,
+                };
+
+                match res {
+                    Ok(Ok(())) => {
+                        if is_matching_form {
+                            view.close_overlay(cx);
+                        }
+                        if let ScreenState::Connected { notice, .. } = &mut view.state {
+                            *notice = Some(format!("Updated target '{target_id_label}'."));
+                            let token = tok_check.clone();
+                            view.fetch_status(token, cx);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if is_matching_form
+                            && let Overlay::EditTarget {
+                                error, in_flight, ..
+                            } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(err.to_string());
+                        }
+                    }
+                    Err(join_err) => {
+                        if is_matching_form
+                            && let Overlay::EditTarget {
+                                error, in_flight, ..
+                            } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *error = Some(join_err.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_remove_target(&mut self, target_id: String, cx: &mut Context<Self>) {
+        let session_token = match &self.state {
+            ScreenState::Connected {
+                session_token,
+                role,
+                ..
+            } if role == "admin" => session_token.clone(),
+            _ => return,
+        };
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let target_label = target_id.clone();
+
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(RemoveTargetRequest { target_id });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    client.remove_target(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                let is_same_session = match &view.state {
+                    ScreenState::Connected { session_token, .. } => session_token == &tok_check,
+                    _ => false,
+                };
+                if !is_same_session {
+                    return;
+                }
+
+                match res {
+                    Ok(Ok(())) => {
+                        if let ScreenState::Connected { notice, .. } = &mut view.state {
+                            *notice = Some(format!("Removed target '{target_label}'."));
+                            let token = tok_check.clone();
+                            view.fetch_status(token, cx);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if let ScreenState::Connected { error, .. } = &mut view.state {
+                            *error = Some(err.to_string());
+                        }
+                    }
+                    Err(join_err) => {
+                        if let ScreenState::Connected { error, .. } = &mut view.state {
+                            *error = Some(format!("Join error: {join_err}"));
                         }
                     }
                 }
@@ -1844,6 +2252,307 @@ impl ControllerApp {
                     )
                     .into_any_element()
             }
+            Overlay::AddTarget {
+                display_name,
+                address,
+                location,
+                error,
+                in_flight,
+                ..
+            } => {
+                let name_active = self.active_field == ActiveField::AddTargetDisplayName;
+                let addr_active = self.active_field == ActiveField::AddTargetAddress;
+                let loc_active = self.active_field == ActiveField::AddTargetLocation;
+
+                div()
+                    .mt_4()
+                    .p_4()
+                    .bg(rgb(0x16212e))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x2a3b4c))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(gpui::px(450.0))
+                    .child(div().text_lg().child("Add Android TV Target"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8899aa))
+                            .child("Target Type: Android TV (unverified)"),
+                    )
+                    .child("Display Name:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if name_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("at-name-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::AddTargetDisplayName;
+                                cx.notify();
+                            }))
+                            .child(if display_name.is_empty() {
+                                "Enter display name...".to_string()
+                            } else {
+                                display_name.clone()
+                            }),
+                    )
+                    .child("Connection Address:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if addr_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("at-address-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::AddTargetAddress;
+                                cx.notify();
+                            }))
+                            .child(if address.is_empty() {
+                                "e.g. 192.168.1.150:5555...".to_string()
+                            } else {
+                                address.clone()
+                            }),
+                    )
+                    .child("Location (optional):")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if loc_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("at-location-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::AddTargetLocation;
+                                cx.notify();
+                            }))
+                            .child(if location.is_empty() {
+                                "Enter location (optional)...".to_string()
+                            } else {
+                                location.clone()
+                            }),
+                    )
+                    .children(
+                        error.as_ref().map(|err| {
+                            div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(if *in_flight {
+                                        rgb(0x556677)
+                                    } else {
+                                        rgb(0x2d884d)
+                                    })
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("at-submit-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_add_target(cx);
+                                    }))
+                                    .child(if *in_flight {
+                                        "Adding..."
+                                    } else {
+                                        "Add Target"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(rgb(0x445566))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("at-cancel-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_overlay(cx);
+                                    }))
+                                    .child("Cancel"),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            Overlay::EditTarget {
+                target_id,
+                display_name,
+                address,
+                location,
+                error,
+                in_flight,
+                ..
+            } => {
+                let name_active = self.active_field == ActiveField::EditTargetDisplayName;
+                let addr_active = self.active_field == ActiveField::EditTargetAddress;
+                let loc_active = self.active_field == ActiveField::EditTargetLocation;
+
+                div()
+                    .mt_4()
+                    .p_4()
+                    .bg(rgb(0x16212e))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x2a3b4c))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(gpui::px(450.0))
+                    .child(div().text_lg().child("Edit Android TV Target"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8899aa))
+                            .child(format!("Target ID: {target_id}")),
+                    )
+                    .child("Display Name:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if name_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("et-name-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::EditTargetDisplayName;
+                                cx.notify();
+                            }))
+                            .child(if display_name.is_empty() {
+                                "Enter display name...".to_string()
+                            } else {
+                                display_name.clone()
+                            }),
+                    )
+                    .child("Connection Address:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if addr_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("et-address-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::EditTargetAddress;
+                                cx.notify();
+                            }))
+                            .child(if address.is_empty() {
+                                "e.g. 192.168.1.150:5555...".to_string()
+                            } else {
+                                address.clone()
+                            }),
+                    )
+                    .child("Location (optional):")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if loc_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("et-location-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::EditTargetLocation;
+                                cx.notify();
+                            }))
+                            .child(if location.is_empty() {
+                                "Enter location (optional)...".to_string()
+                            } else {
+                                location.clone()
+                            }),
+                    )
+                    .children(
+                        error.as_ref().map(|err| {
+                            div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(if *in_flight {
+                                        rgb(0x556677)
+                                    } else {
+                                        rgb(0x2d884d)
+                                    })
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("et-submit-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_edit_target(cx);
+                                    }))
+                                    .child(if *in_flight {
+                                        "Saving..."
+                                    } else {
+                                        "Save Changes"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(rgb(0x445566))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("et-cancel-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_overlay(cx);
+                                    }))
+                                    .child("Cancel"),
+                            ),
+                    )
+                    .into_any_element()
+            }
             Overlay::None => div().into_any_element(),
         }
     }
@@ -1853,7 +2562,9 @@ impl ControllerApp {
         let in_flight = match &self.overlay {
             Overlay::ChangePassword { in_flight, .. }
             | Overlay::ResetPassword { in_flight, .. }
-            | Overlay::EditDevice { in_flight, .. } => *in_flight,
+            | Overlay::EditDevice { in_flight, .. }
+            | Overlay::AddTarget { in_flight, .. }
+            | Overlay::EditTarget { in_flight, .. } => *in_flight,
             Overlay::None => false,
         };
         if in_flight {
@@ -1864,6 +2575,8 @@ impl ControllerApp {
                 Overlay::ChangePassword { .. } => self.submit_change_password(cx),
                 Overlay::ResetPassword { .. } => self.submit_reset_password(cx),
                 Overlay::EditDevice { .. } => self.submit_edit_device(cx),
+                Overlay::AddTarget { .. } => self.submit_add_target(cx),
+                Overlay::EditTarget { .. } => self.submit_edit_target(cx),
                 Overlay::None => {}
             },
             "tab" => {
@@ -1880,6 +2593,16 @@ impl ControllerApp {
                     Overlay::EditDevice { .. } => match self.active_field {
                         ActiveField::EditDeviceDisplayName => ActiveField::EditDeviceLocation,
                         _ => ActiveField::EditDeviceDisplayName,
+                    },
+                    Overlay::AddTarget { .. } => match self.active_field {
+                        ActiveField::AddTargetDisplayName => ActiveField::AddTargetAddress,
+                        ActiveField::AddTargetAddress => ActiveField::AddTargetLocation,
+                        _ => ActiveField::AddTargetDisplayName,
+                    },
+                    Overlay::EditTarget { .. } => match self.active_field {
+                        ActiveField::EditTargetDisplayName => ActiveField::EditTargetAddress,
+                        ActiveField::EditTargetAddress => ActiveField::EditTargetLocation,
+                        _ => ActiveField::EditTargetDisplayName,
                     },
                     Overlay::None => self.active_field,
                 };
@@ -1929,6 +2652,30 @@ impl ControllerApp {
                         display_name.pop();
                     }
                     (Overlay::EditDevice { location, .. }, ActiveField::EditDeviceLocation) => {
+                        location.pop();
+                    }
+                    (
+                        Overlay::AddTarget { display_name, .. },
+                        ActiveField::AddTargetDisplayName,
+                    ) => {
+                        display_name.pop();
+                    }
+                    (Overlay::AddTarget { address, .. }, ActiveField::AddTargetAddress) => {
+                        address.pop();
+                    }
+                    (Overlay::AddTarget { location, .. }, ActiveField::AddTargetLocation) => {
+                        location.pop();
+                    }
+                    (
+                        Overlay::EditTarget { display_name, .. },
+                        ActiveField::EditTargetDisplayName,
+                    ) => {
+                        display_name.pop();
+                    }
+                    (Overlay::EditTarget { address, .. }, ActiveField::EditTargetAddress) => {
+                        address.pop();
+                    }
+                    (Overlay::EditTarget { location, .. }, ActiveField::EditTargetLocation) => {
                         location.pop();
                     }
                     _ => {}
@@ -1983,6 +2730,38 @@ impl ControllerApp {
                             display_name.push_str(text);
                         }
                         (Overlay::EditDevice { location, .. }, ActiveField::EditDeviceLocation)
+                            if location.len() + text.len() <= 128 =>
+                        {
+                            location.push_str(text);
+                        }
+                        (
+                            Overlay::AddTarget { display_name, .. },
+                            ActiveField::AddTargetDisplayName,
+                        ) if display_name.len() + text.len() <= 128 => {
+                            display_name.push_str(text);
+                        }
+                        (Overlay::AddTarget { address, .. }, ActiveField::AddTargetAddress)
+                            if address.len() + text.len() <= 128 =>
+                        {
+                            address.push_str(text);
+                        }
+                        (Overlay::AddTarget { location, .. }, ActiveField::AddTargetLocation)
+                            if location.len() + text.len() <= 128 =>
+                        {
+                            location.push_str(text);
+                        }
+                        (
+                            Overlay::EditTarget { display_name, .. },
+                            ActiveField::EditTargetDisplayName,
+                        ) if display_name.len() + text.len() <= 128 => {
+                            display_name.push_str(text);
+                        }
+                        (Overlay::EditTarget { address, .. }, ActiveField::EditTargetAddress)
+                            if address.len() + text.len() <= 128 =>
+                        {
+                            address.push_str(text);
+                        }
+                        (Overlay::EditTarget { location, .. }, ActiveField::EditTargetLocation)
                             if location.len() + text.len() <= 128 =>
                         {
                             location.push_str(text);
@@ -2521,12 +3300,32 @@ impl Render for ControllerApp {
 
                 // The Fleet Inventory is visible to both roles and derives
                 // online status from heartbeat freshness on the Server.
-                let mut fleet_list = div()
-                    .mt_4()
+                let mut fleet_list = div().mt_4().flex().flex_col().gap_2();
+
+                let mut title_bar = div()
                     .flex()
-                    .flex_col()
-                    .gap_2()
+                    .justify_between()
+                    .items_center()
                     .child(div().text_xl().child("Fleet Inventory"));
+                if is_admin {
+                    title_bar = title_bar.child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .bg(rgb(0x2d884d))
+                            .text_color(rgb(0xffffff))
+                            .rounded_md()
+                            .text_sm()
+                            .cursor_pointer()
+                            .id("add-target-btn")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_add_target(cx);
+                            }))
+                            .child("+ Add Target"),
+                    );
+                }
+                fleet_list = fleet_list.child(title_bar);
+
                 if devices.is_empty() {
                     fleet_list = fleet_list.child(div().text_sm().text_color(rgb(0x8899aa)).child(
                         if server_version == "Unavailable" {
@@ -2544,90 +3343,156 @@ impl Render for ControllerApp {
                         .border_color(rgb(0x334455))
                         .text_sm()
                         .text_color(rgb(0x8899aa))
-                        .child(div().w(gpui::px(200.0)).child("Device"))
+                        .child(div().w(gpui::px(180.0)).child("Device"))
                         .child(div().w(gpui::px(80.0)).child("Type"))
-                        .child(div().w(gpui::px(140.0)).child("Location"))
-                        .child(div().w(gpui::px(160.0)).child("Last Address"))
+                        .child(div().w(gpui::px(120.0)).child("Location"))
+                        .child(div().w(gpui::px(140.0)).child("Last Address"))
+                        .child(div().w(gpui::px(140.0)).child("Config Address"))
                         .child(div().w(gpui::px(90.0)).child("Status"))
-                        .child(div().w(gpui::px(130.0)).child("Last Seen"));
+                        .child(div().w(gpui::px(100.0)).child("Last Seen"));
                     if is_admin {
-                        header_row = header_row.child(div().w(gpui::px(70.0)).child("Actions"));
+                        header_row = header_row.child(div().w(gpui::px(130.0)).child("Actions"));
                     }
                     fleet_list = fleet_list.child(header_row);
 
                     for device in devices {
+                        let vm = format_device_row(device);
                         let dev_id = device.device_id.clone();
                         let dev_name = device.display_name.clone();
                         let dev_loc = device.location.clone();
-                        let mut row =
-                            div()
-                                .flex()
-                                .gap_4()
-                                .items_center()
-                                .py_1()
-                                .child(div().w(gpui::px(200.0)).child(format!(
-                                    "{} ({})",
-                                    device.display_name, device.device_id
-                                )))
-                                .child(
-                                    div()
-                                        .w(gpui::px(80.0))
-                                        .text_color(rgb(0xaaaaaa))
-                                        .child(device.device_type.clone()),
-                                )
-                                .child(div().w(gpui::px(140.0)).text_color(rgb(0xaaaaaa)).child(
-                                    match &device.location {
-                                        Some(loc) if !loc.is_empty() => loc.clone(),
-                                        _ => "—".to_string(),
-                                    },
-                                ))
-                                .child(div().w(gpui::px(160.0)).text_color(rgb(0xaaaaaa)).child(
-                                    if device.last_address.is_empty() {
-                                        "—".to_string()
-                                    } else {
-                                        device.last_address.clone()
-                                    },
-                                ))
-                                .child(
-                                    div()
-                                        .w(gpui::px(90.0))
-                                        .text_color(if device.online {
-                                            rgb(0x44cc44)
-                                        } else {
-                                            rgb(0xff6b6b)
-                                        })
-                                        .child(if device.online { "Online" } else { "Offline" }),
-                                )
-                                .child(
+                        let is_tv_target = device.device_type == "android_tv";
+                        let configured_addr = device.configured_address.clone().unwrap_or_default();
+
+                        let status_color = if vm.status == "Unverified" {
+                            rgb(0xe0a838)
+                        } else if vm.status == "Online" {
+                            rgb(0x44cc44)
+                        } else {
+                            rgb(0xff6b6b)
+                        };
+
+                        let mut row = div()
+                            .flex()
+                            .gap_4()
+                            .items_center()
+                            .py_1()
+                            .child(
+                                div()
+                                    .w(gpui::px(180.0))
+                                    .child(format!("{} ({})", vm.display_name, vm.device_id)),
+                            )
+                            .child(
+                                div()
+                                    .w(gpui::px(80.0))
+                                    .text_color(rgb(0xaaaaaa))
+                                    .child(vm.device_type),
+                            )
+                            .child(
+                                div()
+                                    .w(gpui::px(120.0))
+                                    .text_color(rgb(0xaaaaaa))
+                                    .child(vm.location),
+                            )
+                            .child(
+                                div()
+                                    .w(gpui::px(140.0))
+                                    .text_color(rgb(0xaaaaaa))
+                                    .child(vm.last_address),
+                            )
+                            .child(
+                                div()
+                                    .w(gpui::px(140.0))
+                                    .text_color(rgb(0xaaaaaa))
+                                    .child(vm.configured_address),
+                            )
+                            .child(
+                                div()
+                                    .w(gpui::px(90.0))
+                                    .text_color(status_color)
+                                    .child(vm.status),
+                            )
+                            .child(
+                                div()
+                                    .w(gpui::px(100.0))
+                                    .text_color(rgb(0x8899aa))
+                                    .text_sm()
+                                    .child(vm.last_seen),
+                            );
+                        if is_admin {
+                            if is_tv_target {
+                                let dev_id_for_remove = dev_id.clone();
+                                row = row.child(
                                     div()
                                         .w(gpui::px(130.0))
-                                        .text_color(rgb(0x8899aa))
-                                        .text_sm()
-                                        .child(relative_last_seen(device.last_seen_unix_ms)),
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .bg(rgb(0x3a5a7a))
+                                                .text_color(rgb(0xffffff))
+                                                .rounded_md()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .id(format!("edit-target-btn-{}", device.device_id))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.open_edit_target(
+                                                        dev_id.clone(),
+                                                        dev_name.clone(),
+                                                        configured_addr.clone(),
+                                                        dev_loc.clone(),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child("Edit"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .bg(rgb(0x883333))
+                                                .text_color(rgb(0xffffff))
+                                                .rounded_md()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .id(format!(
+                                                    "remove-target-btn-{}",
+                                                    device.device_id
+                                                ))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.submit_remove_target(
+                                                        dev_id_for_remove.clone(),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child("Remove"),
+                                        ),
                                 );
-                        if is_admin {
-                            row = row.child(
-                                div().w(gpui::px(70.0)).child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x3a5a7a))
-                                        .text_color(rgb(0xffffff))
-                                        .rounded_md()
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .id(format!("edit-device-btn-{}", device.device_id))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.open_edit_device(
-                                                dev_id.clone(),
-                                                dev_name.clone(),
-                                                dev_loc.clone(),
-                                                cx,
-                                            );
-                                        }))
-                                        .child("Edit"),
-                                ),
-                            );
+                            } else {
+                                row = row.child(
+                                    div().w(gpui::px(130.0)).child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(0x3a5a7a))
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .id(format!("edit-device-btn-{}", device.device_id))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_edit_device(
+                                                    dev_id.clone(),
+                                                    dev_name.clone(),
+                                                    dev_loc.clone(),
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("Edit"),
+                                    ),
+                                );
+                            }
                         }
                         fleet_list = fleet_list.child(row);
                     }
@@ -2960,6 +3825,57 @@ impl Render for ControllerApp {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DeviceRowViewModel {
+    device_id: String,
+    display_name: String,
+    device_type: String,
+    location: String,
+    last_address: String,
+    configured_address: String,
+    status: String,
+    last_seen: String,
+}
+
+fn format_device_row(device: &FleetDeviceEntry) -> DeviceRowViewModel {
+    let is_tv_target = device.device_type == "android_tv";
+    let location = match &device.location {
+        Some(loc) if !loc.is_empty() => loc.clone(),
+        _ => "—".to_string(),
+    };
+    let last_address = if !device.last_address.is_empty() {
+        device.last_address.clone()
+    } else {
+        "—".to_string()
+    };
+    let configured_address = match &device.configured_address {
+        Some(addr) if !addr.is_empty() => addr.clone(),
+        _ => "—".to_string(),
+    };
+    let status = if is_tv_target || device.status == "unverified" {
+        "Unverified".to_string()
+    } else if device.online {
+        "Online".to_string()
+    } else {
+        "Offline".to_string()
+    };
+    let last_seen = if is_tv_target || device.last_seen_unix_ms == 0 {
+        "—".to_string()
+    } else {
+        relative_last_seen(device.last_seen_unix_ms)
+    };
+    DeviceRowViewModel {
+        device_id: device.device_id.clone(),
+        display_name: device.display_name.clone(),
+        device_type: device.device_type.clone(),
+        location,
+        last_address,
+        configured_address,
+        status,
+        last_seen,
+    }
+}
+
 fn relative_last_seen(last_seen_unix_ms: i64) -> String {
     let now_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3115,5 +4031,123 @@ mod tests {
             _ => false,
         };
         assert!(!is_diff_dev);
+    }
+
+    #[test]
+    fn add_target_overlay_form_matching_checks_request_id() {
+        let overlay = Overlay::AddTarget {
+            request_id: 10,
+            display_name: "Lobby TV".into(),
+            address: "192.168.1.150:5555".into(),
+            location: "Lobby".into(),
+            error: None,
+            in_flight: true,
+        };
+
+        let is_match = match &overlay {
+            Overlay::AddTarget { request_id, .. } => *request_id == 10,
+            _ => false,
+        };
+        assert!(is_match);
+
+        let is_stale = match &overlay {
+            Overlay::AddTarget { request_id, .. } => *request_id == 11,
+            _ => false,
+        };
+        assert!(!is_stale);
+    }
+
+    #[test]
+    fn edit_target_overlay_form_matching_checks_request_id_and_target_id() {
+        let overlay = Overlay::EditTarget {
+            request_id: 15,
+            target_id: "target-abc".into(),
+            display_name: "Lobby TV Updated".into(),
+            address: "192.168.1.151:5555".into(),
+            location: "Lobby West".into(),
+            error: None,
+            in_flight: true,
+        };
+
+        let is_match = match &overlay {
+            Overlay::EditTarget {
+                request_id,
+                target_id,
+                ..
+            } => *request_id == 15 && target_id == "target-abc",
+            _ => false,
+        };
+        assert!(is_match);
+
+        let is_stale_req = match &overlay {
+            Overlay::EditTarget {
+                request_id,
+                target_id,
+                ..
+            } => *request_id == 16 && target_id == "target-abc",
+            _ => false,
+        };
+        assert!(!is_stale_req);
+
+        let is_diff_target = match &overlay {
+            Overlay::EditTarget {
+                request_id,
+                target_id,
+                ..
+            } => *request_id == 15 && target_id == "target-xyz",
+            _ => false,
+        };
+        assert!(!is_diff_target);
+    }
+
+    #[test]
+    fn format_device_row_presents_android_tv_target_as_unverified_with_distinct_address_and_no_last_seen()
+     {
+        let entry = FleetDeviceEntry {
+            device_id: "tv-target-123".into(),
+            display_name: "Boardroom TV".into(),
+            online: false,
+            last_seen_unix_ms: 0,
+            last_address: String::new(),
+            location: Some("Floor 3".into()),
+            device_type: "android_tv".into(),
+            configured_address: Some("192.168.1.150:5555".into()),
+            status: "unverified".into(),
+        };
+
+        let vm = format_device_row(&entry);
+        assert_eq!(vm.device_id, "tv-target-123");
+        assert_eq!(vm.display_name, "Boardroom TV");
+        assert_eq!(vm.device_type, "android_tv");
+        assert_eq!(vm.location, "Floor 3");
+        assert_eq!(vm.last_address, "—");
+        assert_eq!(vm.configured_address, "192.168.1.150:5555");
+        assert_eq!(vm.status, "Unverified");
+        assert_eq!(vm.last_seen, "—");
+    }
+
+    #[test]
+    fn format_device_row_presents_windows_device_with_observed_address() {
+        let entry = FleetDeviceEntry {
+            device_id: "dev-win-456".into(),
+            display_name: "Reception PC".into(),
+            online: true,
+            last_seen_unix_ms: 1_700_000_000_000,
+            last_address: "10.0.0.42".into(),
+            location: None,
+            device_type: "windows".into(),
+            configured_address: None,
+            status: "online".into(),
+        };
+
+        let vm = format_device_row(&entry);
+        assert_eq!(vm.device_id, "dev-win-456");
+        assert_eq!(vm.display_name, "Reception PC");
+        assert_eq!(vm.device_type, "windows");
+        assert_eq!(vm.location, "—");
+        assert_eq!(vm.last_address, "10.0.0.42");
+        assert_eq!(vm.configured_address, "—");
+        assert_eq!(vm.status, "Online");
+        assert_ne!(vm.last_seen, "—");
     }
 }
