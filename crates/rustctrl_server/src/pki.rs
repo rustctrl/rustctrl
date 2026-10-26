@@ -2,7 +2,8 @@
 use anyhow::{Context, Result, ensure};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose, NameConstraints,
+    SanType,
 };
 use rustctrl_core::DeviceId;
 use std::{
@@ -86,6 +87,11 @@ pub fn initialize(options: &PkiOptions) -> Result<()> {
         KeyUsagePurpose::CrlSign,
         KeyUsagePurpose::DigitalSignature,
     ];
+    agent_ca_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    agent_ca_params.name_constraints = Some(NameConstraints {
+        permitted_subtrees: vec![GeneralSubtree::DnsName("agent.rustctrl.internal".into())],
+        excluded_subtrees: vec![],
+    });
     let agent_ca_key = KeyPair::generate()?;
     let agent_ca_cert = agent_ca_params.signed_by(&agent_ca_key, &ca)?;
     write_new(

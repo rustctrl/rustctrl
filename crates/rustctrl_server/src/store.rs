@@ -240,7 +240,12 @@ impl DeviceStore {
                 authorization_id TEXT NOT NULL,
                 enrolled_at_unix_ms INTEGER NOT NULL,
                 FOREIGN KEY(authorization_id) REFERENCES installation_authorizations(authorization_id)
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS known_device_identities (
+                device_id TEXT PRIMARY KEY
+            );
+            INSERT OR IGNORE INTO known_device_identities (device_id) SELECT device_id FROM bootstrap_devices;
+            INSERT OR IGNORE INTO known_device_identities (device_id) SELECT device_id FROM device_enrollments;",
         )?;
         // Existing databases predate account deactivation, remembered-session
         // expiry, and observed device addresses; add missing columns in place.
@@ -312,6 +317,10 @@ impl DeviceStore {
                 agent_version=excluded.agent_version, last_address=excluded.last_address, last_seen_unix_ms=excluded.last_seen_unix_ms",
                 params![id.to_string(), name, version, remote_address, now],
             )?;
+            let _ = connection.execute(
+                "INSERT OR IGNORE INTO known_device_identities (device_id) VALUES (?1)",
+                params![id.to_string()],
+            );
             Ok(now)
         })
         .await?
@@ -1907,32 +1916,66 @@ impl DeviceStore {
                 anyhow::bail!("device '{}' is blocked", device_id);
             }
 
-            let is_revoked: Option<Option<i64>> = tx
+            let existing_auth: Option<String> = tx
                 .query_row(
-                    "SELECT revoked_at_unix_ms FROM installation_authorizations WHERE authorization_id = ?1",
-                    params![authorization_id],
+                    "SELECT authorization_id FROM device_enrollments WHERE device_id = ?1",
+                    params![device_id.to_string()],
                     |row| row.get(0),
                 )
                 .optional()?;
-            match is_revoked {
-                None => anyhow::bail!("installation authorization not found"),
-                Some(Some(_)) => anyhow::bail!("installation authorization has been revoked"),
-                Some(None) => {}
-            }
 
-            let is_enrolled: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM device_enrollments WHERE device_id = ?1",
-                params![device_id.to_string()],
-                |row| row.get(0),
-            )?;
-            if is_enrolled > 0 {
-                anyhow::bail!("device '{}' is already enrolled", device_id);
-            }
+            if let Some(enrolled_auth) = &existing_auth {
+                if enrolled_auth != &authorization_id {
+                    anyhow::bail!(
+                        "device '{}' is already enrolled under a different authorization",
+                        device_id
+                    );
+                }
+            } else {
+                let is_bootstrap: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM bootstrap_devices WHERE device_id = ?1",
+                    params![device_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if is_bootstrap > 0 {
+                    anyhow::bail!(
+                        "device '{}' already exists in inventory as a bootstrap device",
+                        device_id
+                    );
+                }
 
-            tx.execute(
-                "INSERT INTO device_enrollments (device_id, authorization_id, enrolled_at_unix_ms) VALUES (?1, ?2, ?3)",
-                params![device_id.to_string(), authorization_id, now],
-            )?;
+                let is_known: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM known_device_identities WHERE device_id = ?1",
+                    params![device_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if is_known > 0 {
+                    anyhow::bail!("device '{}' already exists in inventory", device_id);
+                }
+
+                let is_revoked: Option<Option<i64>> = tx
+                    .query_row(
+                        "SELECT revoked_at_unix_ms FROM installation_authorizations WHERE authorization_id = ?1",
+                        params![authorization_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match is_revoked {
+                    None => anyhow::bail!("installation authorization not found"),
+                    Some(Some(_)) => anyhow::bail!("installation authorization has been revoked"),
+                    Some(None) => {}
+                }
+
+                tx.execute(
+                    "INSERT INTO device_enrollments (device_id, authorization_id, enrolled_at_unix_ms) VALUES (?1, ?2, ?3)",
+                    params![device_id.to_string(), authorization_id, now],
+                )?;
+
+                tx.execute(
+                    "INSERT OR IGNORE INTO known_device_identities (device_id) VALUES (?1)",
+                    params![device_id.to_string()],
+                )?;
+            }
 
             tx.execute(
                 "INSERT INTO bootstrap_devices (device_id, name, agent_version, last_address, last_seen_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -2743,8 +2786,8 @@ mod tests {
             .expect("dev2 must exist");
         assert_eq!(dev2_rec.name, "Dev 2");
 
-        // 5. Re-enrolling already enrolled device fails
-        let re_enroll_err = store
+        // 5. Resuming enrollment for dev1 under the same authorization succeeds (idempotent resumption)
+        store
             .record_device_enrollment(
                 dev1_id,
                 auth_id.into(),
@@ -2752,9 +2795,58 @@ mod tests {
                 "0.1.1".into(),
                 Some("10.0.0.1".into()),
             )
+            .await?;
+        let dev1_resumed = store
+            .get_device(&dev1_id.to_string())
+            .await?
+            .expect("dev1 must exist");
+        assert_eq!(dev1_resumed.name, "Dev 1 Renamed");
+
+        // 5b. Enrolling dev1 under a different authorization fails
+        let diff_auth_id = "diff-auth-uuid";
+        store
+            .create_installation_authorization(
+                diff_auth_id.into(),
+                "diff_hash".into(),
+                "admin_user".into(),
+            )
+            .await?;
+        let diff_enroll_err = store
+            .record_device_enrollment(
+                dev1_id,
+                diff_auth_id.into(),
+                "Dev 1 Hijack".into(),
+                "0.1.1".into(),
+                None,
+            )
             .await
             .unwrap_err();
-        assert!(re_enroll_err.to_string().contains("already enrolled"));
+        assert!(
+            diff_enroll_err
+                .to_string()
+                .contains("already enrolled under a different authorization")
+        );
+
+        // 5c. Enrolling a bootstrap device identity fails
+        let boot_id = DeviceId::new();
+        store
+            .heartbeat(boot_id, "Boot PC".into(), "1.0.0".into(), None)
+            .await?;
+        let boot_enroll_err = store
+            .record_device_enrollment(
+                boot_id,
+                diff_auth_id.into(),
+                "Boot Clone".into(),
+                "1.0.0".into(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            boot_enroll_err
+                .to_string()
+                .contains("already exists in inventory")
+        );
 
         // 6. Persistence across restart
         drop(store);
@@ -2771,7 +2863,7 @@ mod tests {
             .get_device(&dev1_id.to_string())
             .await?
             .expect("dev1 must persist");
-        assert_eq!(dev1_persisted.name, "Dev 1");
+        assert_eq!(dev1_persisted.name, "Dev 1 Renamed");
 
         // 7. Revoke authorization
         let revoked = store2.revoke_installation_authorization(auth_id).await?;
@@ -2796,6 +2888,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(enroll_err.to_string().contains("revoked"));
+
+        // 8b. Resuming previously enrolled dev1 even under revoked authorization succeeds
+        store2
+            .record_device_enrollment(
+                dev1_id,
+                auth_id.into(),
+                "Dev 1 After Revoke".into(),
+                "0.1.2".into(),
+                Some("10.0.0.1".into()),
+            )
+            .await?;
 
         Ok(())
     }

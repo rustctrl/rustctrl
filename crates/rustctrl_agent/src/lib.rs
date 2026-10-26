@@ -20,7 +20,23 @@ pub async fn enroll_or_load(
     }
 
     let artifact = AgentInstallationArtifact::load_from_file(artifact_path)?;
-    let device_id = DeviceId::new();
+    let pending_id_path = target_dir.join(".pending_device_id");
+    let device_id = if pending_id_path.exists() {
+        let content = std::fs::read_to_string(&pending_id_path)?;
+        content.trim().parse::<DeviceId>()?
+    } else {
+        std::fs::create_dir_all(target_dir)?;
+        let id = DeviceId::new();
+        std::fs::write(&pending_id_path, id.to_string().as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&pending_id_path, std::fs::Permissions::from_mode(0o600));
+        }
+        id
+    };
+
     let computer_name = name
         .filter(|n| !n.trim().is_empty())
         .or_else(|| std::env::var("COMPUTERNAME").ok())
@@ -68,17 +84,26 @@ pub async fn enroll_or_load(
         let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
     }
 
-    let config_content = format!(
-        "device_id = \"{}\"\nname = \"{}\"\nheartbeat_seconds = {}\nlog_file = \"agent.log\"\n\n[server]\nendpoint = \"{}\"\ndomain_name = \"{}\"\nca_certificate = \"ca.pem\"\ncertificate = \"cert.pem\"\nprivate_key = \"key.pem\"\n",
-        device_id, computer_name, heartbeat_seconds, artifact.server_endpoint, artifact.domain_name
-    );
-
-    std::fs::write(&config_path, config_content.as_bytes())?;
+    let agent_config = AgentConfig {
+        device_id,
+        name: computer_name,
+        heartbeat_seconds,
+        log_file: std::path::PathBuf::from("agent.log"),
+        server: rustctrl_core::ClientConfig {
+            endpoint: artifact.server_endpoint,
+            domain_name: artifact.domain_name,
+            ca_certificate: std::path::PathBuf::from("ca.pem"),
+            certificate: std::path::PathBuf::from("cert.pem"),
+            private_key: std::path::PathBuf::from("key.pem"),
+        },
+    };
+    agent_config.save(&config_path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
     }
+    let _ = std::fs::remove_file(&pending_id_path);
 
     tracing::info!(
         device_id = %device_id,
@@ -172,6 +197,37 @@ mod tests {
         assert_eq!(loaded.device_id, device_id);
         assert_eq!(loaded.name, "Existing Agent");
         assert_eq!(loaded.heartbeat_seconds, 15);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enroll_or_load_pending_device_id_persists_before_rpc() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target_dir = dir.path();
+        let pending_id_path = target_dir.join(".pending_device_id");
+
+        let device_id = DeviceId::new();
+        std::fs::write(&pending_id_path, device_id.to_string().as_bytes())?;
+
+        let artifact = AgentInstallationArtifact {
+            server_endpoint: "https://127.0.0.1:9".into(),
+            domain_name: "localhost".into(),
+            ca_certificate: "dummy ca".into(),
+            enrollment_certificate: "dummy cert".into(),
+            enrollment_private_key: "dummy key".into(),
+            authorization_id: "auth-123".into(),
+            installation_secret: "secret-123".into(),
+            created_at_unix_ms: 123456789,
+        };
+        let artifact_path = target_dir.join("artifact.toml");
+        artifact.save_to_file(&artifact_path)?;
+
+        // Connection will fail since endpoint is unreachable, but pending_id_path should be preserved with the same device_id
+        let _ = enroll_or_load(&artifact_path, target_dir, Some("Test PC".into()), 10).await;
+
+        assert!(pending_id_path.exists());
+        let content = std::fs::read_to_string(&pending_id_path)?;
+        assert_eq!(content.trim().parse::<DeviceId>()?, device_id);
         Ok(())
     }
 }

@@ -225,7 +225,17 @@ impl Bootstrap for BootstrapService {
             Err(e) => return Err(database_error(e)),
         };
 
-        if auth.revoked_at_unix_ms.is_some() {
+        let existing_enrollment = self
+            .store
+            .get_device_enrollment(&id.to_string())
+            .await
+            .map_err(database_error)?;
+
+        let is_resuming = existing_enrollment
+            .as_ref()
+            .is_some_and(|rec| rec.authorization_id == auth.authorization_id);
+
+        if auth.revoked_at_unix_ms.is_some() && !is_resuming {
             let _ = self
                 .store
                 .record_activity(

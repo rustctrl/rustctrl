@@ -235,7 +235,9 @@ async fn prepare_installation_artifact_enforces_admin_role_and_audit_logging() -
 async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let pki_dir = dir.path().join("pki");
-    pki::initialize(&pki_options(&pki_dir))?;
+    let pki_opts = pki_options(&pki_dir);
+    let bootstrap_id = pki_opts.device_id;
+    pki::initialize(&pki_opts)?;
 
     let db_path = dir.path().join("rustctrl.db");
     seed_staff(&db_path).await?;
@@ -330,7 +332,7 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
         .into_inner();
     assert!(hb1.received_at_unix_ms > 0);
 
-    // 5. Attempting to enroll again with the same device ID fails
+    // 5. Resuming enrollment for Agent 1 under the same authorization succeeds (idempotent resumption)
     let mut enrollment_client = rustctrl_network::connect_from_pem(
         &server.endpoint,
         "localhost",
@@ -339,16 +341,59 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
         artifact.enrollment_private_key.as_bytes(),
     )
     .await?;
-    let duplicate_err = enrollment_client
+    let resume1 = enrollment_client
         .enroll_agent(EnrollAgentRequest {
             device_id: dev1_id.to_string(),
-            name: "DESKTOP-ALICE-CLONE".into(),
+            name: "DESKTOP-ALICE-1".into(),
+            agent_version: "0.1.0".into(),
+            installation_secret: artifact.installation_secret.clone(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(resume1.device_id, dev1_id.to_string());
+
+    // 5b. Attempting to enroll an existing bootstrap device's ID fails
+    let bootstrap_cfg = client_config(&pki_dir, &server.endpoint, "agent");
+    let mut bootstrap_client = rustctrl_network::connect(&bootstrap_cfg).await?;
+    bootstrap_client
+        .send_heartbeat(HeartbeatRequest {
+            device_id: bootstrap_id.to_string(),
+            name: "BOOTSTRAP-AGENT".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await?;
+
+    let steal_bootstrap_err = enrollment_client
+        .enroll_agent(EnrollAgentRequest {
+            device_id: bootstrap_id.to_string(),
+            name: "BOOTSTRAP-STEAL".into(),
             agent_version: "0.1.0".into(),
             installation_secret: artifact.installation_secret.clone(),
         })
         .await
         .unwrap_err();
-    assert_eq!(duplicate_err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(steal_bootstrap_err.code(), tonic::Code::PermissionDenied);
+
+    // 5c. Attempting to enroll Agent 1 under a different authorization fails
+    let mut admin_req2 = tonic::Request::new(PrepareInstallationArtifactRequest {});
+    admin_req2
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {admin_token}").parse()?);
+    let reply2 = staff_client
+        .prepare_installation_artifact(admin_req2)
+        .await?
+        .into_inner();
+
+    let diff_auth_err = enrollment_client
+        .enroll_agent(EnrollAgentRequest {
+            device_id: dev1_id.to_string(),
+            name: "DESKTOP-ALICE-HIJACK".into(),
+            agent_version: "0.1.0".into(),
+            installation_secret: reply2.installation_secret,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(diff_auth_err.code(), tonic::Code::PermissionDenied);
 
     // 6. Enroll Agent 2 from same artifact -> receives distinct DeviceId
     let dev2_id = DeviceId::new();

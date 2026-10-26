@@ -41,7 +41,7 @@ impl FromStr for DeviceId {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub endpoint: String,
@@ -83,7 +83,7 @@ impl ControllerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub device_id: DeviceId,
@@ -101,6 +101,12 @@ fn default_log_file() -> PathBuf {
     PathBuf::from("agent.log")
 }
 impl AgentConfig {
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let content = toml::to_string_pretty(self).context("serialize agent config to toml")?;
+        fs::write(path, content).context("write agent config file")?;
+        Ok(())
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let mut config: Self = read_config(path)?;
         ensure!(
@@ -201,4 +207,39 @@ pub fn init_file_logging(path: &Path) -> Result<()> {
         .try_init()
         .map_err(|error| anyhow::anyhow!("initialize service logging: {error}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_config_save_and_load_escapes_special_characters() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        let id = DeviceId::new();
+        let special_name = r#"Office "Reception" \ A"#;
+
+        let config = AgentConfig {
+            device_id: id,
+            name: special_name.into(),
+            heartbeat_seconds: 15,
+            log_file: PathBuf::from("agent.log"),
+            server: ClientConfig {
+                endpoint: "https://localhost:9876".into(),
+                domain_name: "localhost".into(),
+                ca_certificate: PathBuf::from("ca.pem"),
+                certificate: PathBuf::from("cert.pem"),
+                private_key: PathBuf::from("key.pem"),
+            },
+        };
+
+        config.save(&path)?;
+
+        let loaded = AgentConfig::load(&path)?;
+        assert_eq!(loaded.device_id, id);
+        assert_eq!(loaded.name, special_name);
+        assert_eq!(loaded.heartbeat_seconds, 15);
+        Ok(())
+    }
 }
