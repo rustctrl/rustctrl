@@ -16,6 +16,8 @@ pub struct ServerConfig {
     pub staff_session: StaffSessionConfig,
     #[serde(default)]
     pub fleet: FleetConfig,
+    #[serde(default)]
+    pub enrollment: EnrollmentConfig,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +60,18 @@ impl Default for FleetConfig {
 pub fn default_offline_after_secs() -> u64 {
     60
 }
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentConfig {
+    pub server_endpoint: Option<String>,
+    pub domain_name: Option<String>,
+    pub agent_issuer_certificate: Option<PathBuf>,
+    pub agent_issuer_private_key: Option<PathBuf>,
+    pub enrollment_certificate: Option<PathBuf>,
+    pub enrollment_private_key: Option<PathBuf>,
+}
+
 impl ServerConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let mut config: Self = read_config(path)?;
@@ -66,6 +80,18 @@ impl ServerConfig {
         resolve(base, &mut config.tls.certificate);
         resolve(base, &mut config.tls.private_key);
         resolve(base, &mut config.tls.client_ca);
+        if let Some(ref mut p) = config.enrollment.agent_issuer_certificate {
+            resolve(base, p);
+        }
+        if let Some(ref mut p) = config.enrollment.agent_issuer_private_key {
+            resolve(base, p);
+        }
+        if let Some(ref mut p) = config.enrollment.enrollment_certificate {
+            resolve(base, p);
+        }
+        if let Some(ref mut p) = config.enrollment.enrollment_private_key {
+            resolve(base, p);
+        }
         Ok(config)
     }
 }

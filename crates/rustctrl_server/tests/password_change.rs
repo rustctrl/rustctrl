@@ -61,6 +61,7 @@ impl RunningServer {
             },
             staff_session: Default::default(),
             fleet: Default::default(),
+            enrollment: Default::default(),
         };
         let stop = CancellationToken::new();
         let signal = stop.clone();

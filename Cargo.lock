@@ -5193,12 +5193,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rusqlite",
  "rustctrl_core",
  "rustctrl_network",
  "rustctrl_protocol",
+ "rustctrl_server",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "tonic",
  "tracing",
+ "uuid",
  "windows-service",
 ]
 
@@ -5230,6 +5235,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "tempfile",
  "toml 1.1.8+spec-1.1.0",
  "tracing-subscriber",
  "uuid",
@@ -5280,6 +5286,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml 1.1.8+spec-1.1.0",
  "tonic",
  "tracing",
  "uuid",

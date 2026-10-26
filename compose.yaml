@@ -7,6 +7,9 @@ services:
       context: .
       dockerfile: packaging/server/Dockerfile
     command: ["serve", "--config", "/etc/rustctrl/server.toml"]
+    environment:
+      RUSTCTRL_SERVER_ENDPOINT: "${RUSTCTRL_SERVER_ENDPOINT:-https://localhost:9876}"
+      RUSTCTRL_SERVER_NAME: "${RUSTCTRL_SERVER_NAME:-localhost}"
     ports:
       - "${RUSTCTRL_LISTEN_ADDRESS:-127.0.0.1}:${RUSTCTRL_PORT:-9876}:9876"
     volumes:

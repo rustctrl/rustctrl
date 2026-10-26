@@ -41,7 +41,7 @@ impl FromStr for DeviceId {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub endpoint: String,
@@ -83,7 +83,7 @@ impl ControllerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub device_id: DeviceId,
@@ -101,6 +101,53 @@ fn default_log_file() -> PathBuf {
     PathBuf::from("agent.log")
 }
 impl AgentConfig {
+    pub fn save(&self, path: &Path) -> Result<()> {
+        ensure!(
+            !self.device_id.0.is_nil(),
+            "device_id must not be the nil UUID"
+        );
+        ensure!(
+            !self.name.trim().is_empty() && self.name.len() <= 128,
+            "name must contain 1 to 128 bytes"
+        );
+        ensure!(
+            (1..=3600).contains(&self.heartbeat_seconds),
+            "heartbeat_seconds must be between 1 and 3600"
+        );
+
+        let content = toml::to_string_pretty(self).context("serialize agent config to toml")?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let temp_path = parent.join(format!(
+            ".tmp.{}.{}",
+            uuid::Uuid::new_v4(),
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("config.toml")
+        ));
+
+        let write_res = (|| -> Result<()> {
+            fs::write(&temp_path, content.as_bytes())
+                .context("write temporary agent config file")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600));
+            }
+            fs::rename(&temp_path, path).context("atomically publish agent config file")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            }
+            Ok(())
+        })();
+
+        if write_res.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        write_res
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let mut config: Self = read_config(path)?;
         ensure!(
@@ -119,6 +166,48 @@ impl AgentConfig {
         resolve(config_base(path), &mut config.log_file);
         config.server.validate()?;
         Ok(config)
+    }
+}
+
+/// A deployment-specific installation artifact prepared by an Admin through the Controller.
+///
+/// Contains the server configuration, public trust material, an enrollment TLS credential,
+/// and an Installation Authorization secret token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstallationArtifact {
+    pub server_endpoint: String,
+    pub domain_name: String,
+    pub ca_certificate: String,
+    pub enrollment_certificate: String,
+    pub enrollment_private_key: String,
+    pub authorization_id: String,
+    pub installation_secret: String,
+    pub created_at_unix_ms: i64,
+}
+
+impl AgentInstallationArtifact {
+    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        let content =
+            toml::to_string_pretty(self).context("serialize installation artifact to toml")?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, content.as_bytes())
+            .with_context(|| format!("write installation artifact to {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    pub fn load_from_file(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("read installation artifact from {}", path.display()))?;
+        toml::from_str::<Self>(&content)
+            .with_context(|| format!("parse installation artifact from {}", path.display()))
     }
 }
 
@@ -159,4 +248,87 @@ pub fn init_file_logging(path: &Path) -> Result<()> {
         .try_init()
         .map_err(|error| anyhow::anyhow!("initialize service logging: {error}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_config_save_and_load_escapes_special_characters() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        let id = DeviceId::new();
+        let special_name = r#"Office "Reception" \ A"#;
+
+        let config = AgentConfig {
+            device_id: id,
+            name: special_name.into(),
+            heartbeat_seconds: 15,
+            log_file: PathBuf::from("agent.log"),
+            server: ClientConfig {
+                endpoint: "https://localhost:9876".into(),
+                domain_name: "localhost".into(),
+                ca_certificate: PathBuf::from("ca.pem"),
+                certificate: PathBuf::from("cert.pem"),
+                private_key: PathBuf::from("key.pem"),
+            },
+        };
+
+        config.save(&path)?;
+
+        let loaded = AgentConfig::load(&path)?;
+        assert_eq!(loaded.device_id, id);
+        assert_eq!(loaded.name, special_name);
+        assert_eq!(loaded.heartbeat_seconds, 15);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_config_save_validates_constraints() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+
+        let mut config = AgentConfig {
+            device_id: DeviceId::new(),
+            name: "Valid Agent".into(),
+            heartbeat_seconds: 15,
+            log_file: PathBuf::from("agent.log"),
+            server: ClientConfig {
+                endpoint: "https://localhost:9876".into(),
+                domain_name: "localhost".into(),
+                ca_certificate: PathBuf::from("ca.pem"),
+                certificate: PathBuf::from("cert.pem"),
+                private_key: PathBuf::from("key.pem"),
+            },
+        };
+
+        config.heartbeat_seconds = 0;
+        assert!(config.save(&path).is_err());
+        assert!(!path.exists());
+
+        config.heartbeat_seconds = 3601;
+        assert!(config.save(&path).is_err());
+        assert!(!path.exists());
+
+        config.heartbeat_seconds = 10;
+        config.name = "".into();
+        assert!(config.save(&path).is_err());
+        assert!(!path.exists());
+
+        config.name = "A".repeat(129);
+        assert!(config.save(&path).is_err());
+        assert!(!path.exists());
+
+        config.name = "Proper Agent".into();
+        config.device_id = DeviceId(uuid::Uuid::nil());
+        assert!(config.save(&path).is_err());
+        assert!(!path.exists());
+
+        config.device_id = DeviceId::new();
+        config.save(&path)?;
+        assert!(path.exists());
+
+        Ok(())
+    }
 }

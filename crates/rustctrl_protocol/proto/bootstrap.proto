@@ -4,6 +4,7 @@ package rustctrl.bootstrap.v1;
 service Bootstrap {
   rpc GetHealth(HealthRequest) returns (HealthReply);
   rpc SendHeartbeat(HeartbeatRequest) returns (HeartbeatReply);
+  rpc EnrollAgent(EnrollAgentRequest) returns (EnrollAgentReply);
 }
 message HealthRequest {}
 message HealthReply {
@@ -17,4 +18,20 @@ message HeartbeatRequest {
 }
 message HeartbeatReply {
   int64 received_at_unix_ms = 1;
+}
+
+message EnrollAgentRequest {
+  string device_id = 1;
+  string name = 2;
+  string installation_secret = 3;
+  string agent_version = 4;
+  string resumption_secret = 5;
+}
+
+message EnrollAgentReply {
+  string device_id = 1;
+  string certificate = 2;
+  string private_key = 3;
+  string ca_certificate = 4;
+  int64 enrolled_at_unix_ms = 5;
 }

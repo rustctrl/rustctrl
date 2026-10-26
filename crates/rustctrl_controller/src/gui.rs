@@ -8,10 +8,10 @@ use rustctrl_protocol::auth::{
     BlockDeviceRequest, ChangeOwnPasswordRequest, ChangeStaffRoleRequest,
     CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
     DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesRequest,
-    ListStaffAccountsRequest, LoginRequest, LogoutRequest, RemoveTargetRequest,
-    ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest,
-    StaffAccountEntry, StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest,
-    UpdateTargetRequest,
+    ListStaffAccountsRequest, LoginRequest, LogoutRequest, PrepareInstallationArtifactRequest,
+    RemoveTargetRequest, ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest,
+    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusRequest, UnblockDeviceRequest,
+    UpdateFleetDeviceRequest, UpdateTargetRequest,
 };
 use std::time::Duration;
 
@@ -35,6 +35,7 @@ enum ActiveField {
     EditTargetLocation,
     ReplaceDevicePriorId,
     ReplaceDeviceReplacementId,
+    PrepareArtifactOutputPath,
 }
 
 #[derive(Clone)]
@@ -85,6 +86,13 @@ enum Overlay {
         replacement_device_id: String,
         error: Option<String>,
         in_flight: bool,
+    },
+    PrepareInstallationArtifact {
+        request_id: u64,
+        output_path: String,
+        error: Option<String>,
+        in_flight: bool,
+        success: Option<String>,
     },
 }
 
@@ -140,6 +148,7 @@ struct ControllerApp {
     next_edit_device_request_id: u64,
     next_target_request_id: u64,
     next_replace_device_request_id: u64,
+    next_prepare_artifact_request_id: u64,
     _refresh: Task<()>,
     _restore: Option<Task<()>>,
 }
@@ -324,6 +333,7 @@ impl ControllerApp {
             next_edit_device_request_id: 0,
             next_target_request_id: 0,
             next_replace_device_request_id: 0,
+            next_prepare_artifact_request_id: 0,
             _refresh: refresh,
             _restore: Some(restore),
         }
@@ -1216,6 +1226,31 @@ impl ControllerApp {
                 in_flight: false,
             };
             self.active_field = active_field;
+            cx.notify();
+        }
+    }
+
+    fn open_prepare_installation_artifact(&mut self, cx: &mut Context<Self>) {
+        if let Overlay::PrepareInstallationArtifact {
+            in_flight: true, ..
+        } = self.overlay
+        {
+            return;
+        }
+        if let ScreenState::Connected { role, .. } = &self.state
+            && role == "admin"
+        {
+            self.next_prepare_artifact_request_id =
+                self.next_prepare_artifact_request_id.wrapping_add(1);
+            let request_id = self.next_prepare_artifact_request_id;
+            self.overlay = Overlay::PrepareInstallationArtifact {
+                request_id,
+                output_path: "agent-installation-artifact.toml".to_string(),
+                error: None,
+                in_flight: false,
+                success: None,
+            };
+            self.active_field = ActiveField::PrepareArtifactOutputPath;
             cx.notify();
         }
     }
@@ -2216,6 +2251,125 @@ impl ControllerApp {
         .detach();
     }
 
+    fn submit_prepare_installation_artifact(&mut self, cx: &mut Context<Self>) {
+        let (request_id, session_token, out_path) = match &mut self.overlay {
+            Overlay::PrepareInstallationArtifact {
+                request_id,
+                output_path,
+                error,
+                in_flight,
+                success,
+            } if !*in_flight => {
+                let p = output_path.trim();
+                if p.is_empty() {
+                    *error = Some("Output file path is required.".into());
+                    cx.notify();
+                    return;
+                }
+                let token = match &self.state {
+                    ScreenState::Connected { session_token, .. } => session_token.clone(),
+                    _ => return,
+                };
+                *in_flight = true;
+                *error = None;
+                *success = None;
+                (*request_id, token, p.to_string())
+            }
+            _ => return,
+        };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let out_file_path = out_path.clone();
+
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(PrepareInstallationArtifactRequest {});
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    let reply = client
+                        .prepare_installation_artifact(req)
+                        .await?
+                        .into_inner();
+                    let artifact = rustctrl_core::AgentInstallationArtifact {
+                        server_endpoint: reply.server_endpoint,
+                        domain_name: reply.domain_name,
+                        ca_certificate: reply.ca_certificate,
+                        enrollment_certificate: reply.enrollment_certificate,
+                        enrollment_private_key: reply.enrollment_private_key,
+                        authorization_id: reply.authorization_id.clone(),
+                        installation_secret: reply.installation_secret,
+                        created_at_unix_ms: reply.created_at_unix_ms,
+                    };
+                    artifact.save_to_file(std::path::Path::new(&out_file_path))?;
+                    Ok::<_, anyhow::Error>(reply.authorization_id)
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                let is_same_session = match &view.state {
+                    ScreenState::Connected { session_token, .. } => session_token == &tok_check,
+                    _ => false,
+                };
+                if !is_same_session {
+                    return;
+                }
+
+                let is_matching_form = match &view.overlay {
+                    Overlay::PrepareInstallationArtifact {
+                        request_id: current_req_id,
+                        ..
+                    } => *current_req_id == request_id,
+                    _ => false,
+                };
+
+                match res {
+                    Ok(Ok(auth_id)) => {
+                        if is_matching_form
+                            && let Overlay::PrepareInstallationArtifact {
+                                in_flight,
+                                success,
+                                error,
+                                ..
+                            } = &mut view.overlay
+                        {
+                            *in_flight = false;
+                            *success = Some(format!("Saved artifact ({auth_id}) to {out_path}"));
+                            *error = None;
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if is_matching_form
+                            && let Overlay::PrepareInstallationArtifact {
+                                error, in_flight, ..
+                            } = &mut view.overlay
+                        {
+                            *error = Some(err.to_string());
+                            *in_flight = false;
+                        }
+                    }
+                    Err(join_err) => {
+                        if is_matching_form
+                            && let Overlay::PrepareInstallationArtifact {
+                                error, in_flight, ..
+                            } = &mut view.overlay
+                        {
+                            *error = Some(format!("Join error: {join_err}"));
+                            *in_flight = false;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_overlay_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.overlay {
             Overlay::ChangePassword {
@@ -3113,6 +3267,118 @@ impl ControllerApp {
                     )
                     .into_any_element()
             }
+            Overlay::PrepareInstallationArtifact {
+                output_path,
+                error,
+                in_flight,
+                success,
+                ..
+            } => {
+                let path_active = self.active_field == ActiveField::PrepareArtifactOutputPath;
+                let mut container = div()
+                    .mt_4()
+                    .p_4()
+                    .bg(rgb(0x16212e))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x2a3b4c))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(gpui::px(520.0))
+                    .child(div().text_lg().child("Prepare Agent Installation Artifact"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8899aa))
+                            .child("Generate an authorization token and credentials package to enroll new fleet agents automatically."),
+                    )
+                    .child("Output File Path:")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(if path_active {
+                                rgb(0x203040)
+                            } else {
+                                rgb(0x101820)
+                            })
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if path_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x304050)
+                            })
+                            .cursor_pointer()
+                            .id("artifact-output-path-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::PrepareArtifactOutputPath;
+                                cx.notify();
+                            }))
+                            .child(if output_path.is_empty() {
+                                div().text_color(rgb(0x556677)).child("e.g. agent-artifact.toml")
+                            } else {
+                                div().child(output_path.clone())
+                            }),
+                    );
+
+                container = container.children(
+                    error
+                        .as_ref()
+                        .map(|err| div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())),
+                );
+
+                container = container.children(
+                    success
+                        .as_ref()
+                        .map(|msg| div().text_color(rgb(0x4eca78)).text_sm().child(msg.clone())),
+                );
+
+                container
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(if *in_flight {
+                                        rgb(0x556677)
+                                    } else {
+                                        rgb(0x2d884d)
+                                    })
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("generate-artifact-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_prepare_installation_artifact(cx);
+                                    }))
+                                    .child(if *in_flight {
+                                        "Generating..."
+                                    } else {
+                                        "Generate & Export"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(rgb(0x445566))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("close-artifact-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_overlay(cx);
+                                    }))
+                                    .child("Close"),
+                            ),
+                    )
+                    .into_any_element()
+            }
             Overlay::None => div().into_any_element(),
         }
     }
@@ -3125,7 +3391,8 @@ impl ControllerApp {
             | Overlay::EditDevice { in_flight, .. }
             | Overlay::AddTarget { in_flight, .. }
             | Overlay::EditTarget { in_flight, .. }
-            | Overlay::ReplaceDevice { in_flight, .. } => *in_flight,
+            | Overlay::ReplaceDevice { in_flight, .. }
+            | Overlay::PrepareInstallationArtifact { in_flight, .. } => *in_flight,
             Overlay::None => false,
         };
         if in_flight {
@@ -3139,6 +3406,9 @@ impl ControllerApp {
                 Overlay::AddTarget { .. } => self.submit_add_target(cx),
                 Overlay::EditTarget { .. } => self.submit_edit_target(cx),
                 Overlay::ReplaceDevice { .. } => self.submit_replace_device(cx),
+                Overlay::PrepareInstallationArtifact { .. } => {
+                    self.submit_prepare_installation_artifact(cx)
+                }
                 Overlay::None => {}
             },
             "tab" => {
@@ -3172,6 +3442,9 @@ impl ControllerApp {
                         }
                         _ => ActiveField::ReplaceDevicePriorId,
                     },
+                    Overlay::PrepareInstallationArtifact { .. } => {
+                        ActiveField::PrepareArtifactOutputPath
+                    }
                     Overlay::None => self.active_field,
                 };
                 cx.notify();
@@ -3262,6 +3535,12 @@ impl ControllerApp {
                         ActiveField::ReplaceDeviceReplacementId,
                     ) => {
                         replacement_device_id.pop();
+                    }
+                    (
+                        Overlay::PrepareInstallationArtifact { output_path, .. },
+                        ActiveField::PrepareArtifactOutputPath,
+                    ) => {
+                        output_path.pop();
                     }
                     _ => {}
                 }
@@ -3367,6 +3646,12 @@ impl ControllerApp {
                             ActiveField::ReplaceDeviceReplacementId,
                         ) if replacement_device_id.len() + text.len() <= 64 => {
                             replacement_device_id.push_str(text);
+                        }
+                        (
+                            Overlay::PrepareInstallationArtifact { output_path, .. },
+                            ActiveField::PrepareArtifactOutputPath,
+                        ) if output_path.len() + text.len() <= 256 => {
+                            output_path.push_str(text);
                         }
                         _ => {}
                     }
@@ -3928,6 +4213,21 @@ impl Render for ControllerApp {
                                         this.open_replace_device(String::new(), String::new(), cx);
                                     }))
                                     .child("Replace Device"),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x2a7a5a))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .id("open-prepare-artifact-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_prepare_installation_artifact(cx);
+                                    }))
+                                    .child("+ Installation Package"),
                             )
                             .child(
                                 div()
@@ -5005,5 +5305,28 @@ mod tests {
             !is_matching_form,
             "response from stale replace_device must not match active AddTarget overlay"
         );
+    }
+
+    #[test]
+    fn prepare_installation_artifact_overlay_form_matching_checks_request_id() {
+        let overlay = Overlay::PrepareInstallationArtifact {
+            request_id: 15,
+            output_path: "agent-artifact.toml".into(),
+            error: None,
+            in_flight: true,
+            success: None,
+        };
+
+        let is_match = match &overlay {
+            Overlay::PrepareInstallationArtifact { request_id, .. } => *request_id == 15,
+            _ => false,
+        };
+        assert!(is_match);
+
+        let is_stale = match &overlay {
+            Overlay::PrepareInstallationArtifact { request_id, .. } => *request_id == 16,
+            _ => false,
+        };
+        assert!(!is_stale);
     }
 }

@@ -5,9 +5,9 @@ use rustctrl_protocol::auth::{
     BlockDeviceRequest, ChangeOwnPasswordRequest, ChangeStaffRoleRequest,
     CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
     DeactivateStaffAccountRequest, ListFleetDevicesRequest, ListStaffAccountsRequest, LoginRequest,
-    LogoutRequest, RemoveTargetRequest, ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest,
-    ResetStaffPasswordRequest, StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest,
-    UpdateTargetRequest,
+    LogoutRequest, PrepareInstallationArtifactRequest, RemoveTargetRequest,
+    ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest,
+    StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
 };
 use rustctrl_protocol::bootstrap::HealthRequest;
 use std::path::PathBuf;
@@ -188,6 +188,14 @@ enum Command {
         password: String,
         #[arg(long)]
         target_id: String,
+    },
+    PrepareInstallationArtifact {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -991,6 +999,60 @@ fn main() -> Result<()> {
                 );
                 let reply = client.remove_target(req).await?.into_inner();
                 println!("Removed target {}: success={}", reply.target_id, reply.success);
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
+        Command::PrepareInstallationArtifact {
+            username,
+            password,
+            output,
+        } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest {
+                        username,
+                        password,
+                        remember: false,
+                    })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!(
+                        "temporary password must be replaced before preparing installation artifact"
+                    );
+                }
+                let mut req = tonic::Request::new(PrepareInstallationArtifactRequest {});
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client.prepare_installation_artifact(req).await?.into_inner();
+
+                let artifact = rustctrl_core::AgentInstallationArtifact {
+                    server_endpoint: reply.server_endpoint,
+                    domain_name: reply.domain_name,
+                    ca_certificate: reply.ca_certificate,
+                    enrollment_certificate: reply.enrollment_certificate,
+                    enrollment_private_key: reply.enrollment_private_key,
+                    authorization_id: reply.authorization_id.clone(),
+                    installation_secret: reply.installation_secret,
+                    created_at_unix_ms: reply.created_at_unix_ms,
+                };
+                artifact.save_to_file(&output)?;
+
+                println!(
+                    "Prepared installation artifact authorization_id={} output={}",
+                    reply.authorization_id,
+                    output.display()
+                );
+
                 let mut logout_req = tonic::Request::new(LogoutRequest {});
                 logout_req.metadata_mut().insert(
                     "authorization",
