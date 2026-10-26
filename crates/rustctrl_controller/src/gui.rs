@@ -3,14 +3,15 @@ use gpui::{
     App, Context, FocusHandle, IntoElement, KeyDownEvent, Render, Task, Window, WindowOptions, div,
     prelude::*, rgb,
 };
-use rustctrl_core::ControllerConfig;
+use rustctrl_core::{ControllerConfig, DeviceId};
 use rustctrl_protocol::auth::{
     BlockDeviceRequest, ChangeOwnPasswordRequest, ChangeStaffRoleRequest,
     CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
     DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesRequest,
     ListStaffAccountsRequest, LoginRequest, LogoutRequest, RemoveTargetRequest,
-    ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest, StaffAccountEntry,
-    StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
+    ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest,
+    StaffAccountEntry, StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest,
+    UpdateTargetRequest,
 };
 use std::time::Duration;
 
@@ -32,6 +33,8 @@ enum ActiveField {
     EditTargetDisplayName,
     EditTargetAddress,
     EditTargetLocation,
+    ReplaceDevicePriorId,
+    ReplaceDeviceReplacementId,
 }
 
 #[derive(Clone)]
@@ -73,6 +76,13 @@ enum Overlay {
         display_name: String,
         address: String,
         location: String,
+        error: Option<String>,
+        in_flight: bool,
+    },
+    ReplaceDevice {
+        request_id: u64,
+        prior_device_id: String,
+        replacement_device_id: String,
         error: Option<String>,
         in_flight: bool,
     },
@@ -129,6 +139,7 @@ struct ControllerApp {
     tokio_handle: tokio::runtime::Handle,
     next_edit_device_request_id: u64,
     next_target_request_id: u64,
+    next_replace_device_request_id: u64,
     _refresh: Task<()>,
     _restore: Option<Task<()>>,
 }
@@ -312,6 +323,7 @@ impl ControllerApp {
             tokio_handle,
             next_edit_device_request_id: 0,
             next_target_request_id: 0,
+            next_replace_device_request_id: 0,
             _refresh: refresh,
             _restore: Some(restore),
         }
@@ -1169,6 +1181,41 @@ impl ControllerApp {
                 in_flight: false,
             };
             self.active_field = ActiveField::EditTargetDisplayName;
+            cx.notify();
+        }
+    }
+
+    fn open_replace_device(
+        &mut self,
+        prior_device_id: String,
+        replacement_device_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Overlay::ReplaceDevice {
+            in_flight: true, ..
+        } = self.overlay
+        {
+            return;
+        }
+        if let ScreenState::Connected { role, .. } = &self.state
+            && role == "admin"
+        {
+            self.next_replace_device_request_id =
+                self.next_replace_device_request_id.wrapping_add(1);
+            let request_id = self.next_replace_device_request_id;
+            let active_field = if prior_device_id.is_empty() {
+                ActiveField::ReplaceDevicePriorId
+            } else {
+                ActiveField::ReplaceDeviceReplacementId
+            };
+            self.overlay = Overlay::ReplaceDevice {
+                request_id,
+                prior_device_id,
+                replacement_device_id,
+                error: None,
+                in_flight: false,
+            };
+            self.active_field = active_field;
             cx.notify();
         }
     }
@@ -2041,6 +2088,130 @@ impl ControllerApp {
         .detach();
     }
 
+    fn submit_replace_device(&mut self, cx: &mut Context<Self>) {
+        let (request_id, session_token, prior_id, replacement_id) = match &mut self.overlay {
+            Overlay::ReplaceDevice {
+                request_id,
+                prior_device_id,
+                replacement_device_id,
+                error,
+                in_flight,
+            } if !*in_flight => {
+                let p_id = prior_device_id.trim();
+                if p_id.is_empty() {
+                    *error = Some("Prior device ID is required.".into());
+                    cx.notify();
+                    return;
+                }
+                if p_id.parse::<DeviceId>().is_err() {
+                    *error = Some("Prior device ID must be a valid UUID.".into());
+                    cx.notify();
+                    return;
+                }
+                let r_id = replacement_device_id.trim();
+                if r_id.is_empty() {
+                    *error = Some("Replacement device ID is required.".into());
+                    cx.notify();
+                    return;
+                }
+                if r_id.parse::<DeviceId>().is_err() {
+                    *error = Some("Replacement device ID must be a valid UUID.".into());
+                    cx.notify();
+                    return;
+                }
+                if p_id == r_id {
+                    *error =
+                        Some("Prior and replacement device identities must be different.".into());
+                    cx.notify();
+                    return;
+                }
+                let token = match &self.state {
+                    ScreenState::Connected { session_token, .. } => session_token.clone(),
+                    _ => return,
+                };
+                *in_flight = true;
+                *error = None;
+                (*request_id, token, p_id.to_string(), r_id.to_string())
+            }
+            _ => return,
+        };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let prior_label = prior_id.clone();
+        let replacement_label = replacement_id.clone();
+
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(ReplaceFleetDeviceRequest {
+                        prior_device_id: prior_id,
+                        replacement_device_id: replacement_id,
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    let reply = client.replace_fleet_device(req).await?.into_inner();
+                    Ok::<_, anyhow::Error>(reply)
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                let is_same_session = match &view.state {
+                    ScreenState::Connected { session_token, .. } => session_token == &tok_check,
+                    _ => false,
+                };
+                if !is_same_session {
+                    return;
+                }
+
+                match res {
+                    Ok(Ok(_reply)) => {
+                        view.overlay = Overlay::None;
+                        if let ScreenState::Connected { notice, .. } = &mut view.state {
+                            *notice = Some(format!(
+                                "Replaced device '{prior_label}' with '{replacement_label}'."
+                            ));
+                            let token = tok_check.clone();
+                            view.fetch_status(token, cx);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if let Overlay::ReplaceDevice {
+                            request_id: current_req_id,
+                            error,
+                            in_flight,
+                            ..
+                        } = &mut view.overlay
+                            && *current_req_id == request_id
+                        {
+                            *error = Some(err.to_string());
+                            *in_flight = false;
+                        }
+                    }
+                    Err(join_err) => {
+                        if let Overlay::ReplaceDevice {
+                            request_id: current_req_id,
+                            error,
+                            in_flight,
+                            ..
+                        } = &mut view.overlay
+                            && *current_req_id == request_id
+                        {
+                            *error = Some(format!("Join error: {join_err}"));
+                            *in_flight = false;
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_overlay_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.overlay {
             Overlay::ChangePassword {
@@ -2740,6 +2911,204 @@ impl ControllerApp {
                     )
                     .into_any_element()
             }
+            Overlay::ReplaceDevice {
+                prior_device_id,
+                replacement_device_id,
+                error,
+                in_flight,
+                ..
+            } => {
+                let prior_active = self.active_field == ActiveField::ReplaceDevicePriorId;
+                let rep_active = self.active_field == ActiveField::ReplaceDeviceReplacementId;
+
+                let (devices_list, _is_admin) = match &self.state {
+                    ScreenState::Connected { devices, role, .. } => {
+                        (devices.clone(), role == "admin")
+                    }
+                    _ => (Vec::new(), false),
+                };
+
+                let prior_info = devices_list
+                    .iter()
+                    .find(|d| &d.device_id == prior_device_id);
+                let rep_info = devices_list
+                    .iter()
+                    .find(|d| &d.device_id == replacement_device_id);
+
+                let mut container = div()
+                    .mt_4()
+                    .p_4()
+                    .bg(rgb(0x16212e))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x2a3b4c))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(gpui::px(520.0))
+                    .child(div().text_lg().child("Reconcile Device Replacement"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8899aa))
+                            .child("Select prior (old) identity and replacement (new) identity after a Windows reinstall."),
+                    )
+                    .child("Prior Device ID (Old Identity):")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if prior_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("rep-prior-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::ReplaceDevicePriorId;
+                                cx.notify();
+                            }))
+                            .child(if prior_device_id.is_empty() {
+                                "Enter or click a device below...".to_string()
+                            } else if let Some(d) = prior_info {
+                                format!("{} ({})", d.display_name, d.device_id)
+                            } else {
+                                prior_device_id.clone()
+                            }),
+                    )
+                    .child("Replacement Device ID (New Identity):")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x1a2634))
+                            .border_1()
+                            .border_color(if rep_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x334455)
+                            })
+                            .rounded_md()
+                            .id("rep-replacement-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::ReplaceDeviceReplacementId;
+                                cx.notify();
+                            }))
+                            .child(if replacement_device_id.is_empty() {
+                                "Enter or click a device below...".to_string()
+                            } else if let Some(d) = rep_info {
+                                format!("{} ({})", d.display_name, d.device_id)
+                            } else {
+                                replacement_device_id.clone()
+                            }),
+                    );
+
+                let windows_devices: Vec<_> = devices_list
+                    .iter()
+                    .filter(|d| d.device_type == "windows")
+                    .collect();
+
+                if !windows_devices.is_empty() {
+                    let mut chips_div = div().flex().flex_col().gap_1().child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x8899aa))
+                            .child("Click a device to populate the active field:"),
+                    );
+                    let mut chip_row = div().flex().flex_wrap().gap_2();
+                    for dev in windows_devices {
+                        let dev_id_clone = dev.device_id.clone();
+                        let chip_text = format!(
+                            "{}: {}",
+                            dev.display_name,
+                            &dev.device_id[..dev.device_id.len().min(8)]
+                        );
+                        chip_row = chip_row.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .bg(rgb(0x2a3b4c))
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .id(format!("select-candidate-{}", dev.device_id))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Overlay::ReplaceDevice {
+                                        prior_device_id,
+                                        replacement_device_id,
+                                        ..
+                                    } = &mut this.overlay
+                                    {
+                                        if this.active_field == ActiveField::ReplaceDevicePriorId {
+                                            *prior_device_id = dev_id_clone.clone();
+                                            this.active_field =
+                                                ActiveField::ReplaceDeviceReplacementId;
+                                        } else {
+                                            *replacement_device_id = dev_id_clone.clone();
+                                        }
+                                        cx.notify();
+                                    }
+                                }))
+                                .child(chip_text),
+                        );
+                    }
+                    chips_div = chips_div.child(chip_row);
+                    container = container.child(chips_div);
+                }
+
+                container = container.children(
+                    error
+                        .as_ref()
+                        .map(|err| div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())),
+                );
+
+                container
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(if *in_flight {
+                                        rgb(0x556677)
+                                    } else {
+                                        rgb(0x4a90e2)
+                                    })
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("confirm-replace-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_replace_device(cx);
+                                    }))
+                                    .child(if *in_flight {
+                                        "Reconciling..."
+                                    } else {
+                                        "Reconcile Replacement"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .bg(rgb(0x445566))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .id("cancel-replace-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_overlay(cx);
+                                    }))
+                                    .child("Cancel"),
+                            ),
+                    )
+                    .into_any_element()
+            }
             Overlay::None => div().into_any_element(),
         }
     }
@@ -2751,7 +3120,8 @@ impl ControllerApp {
             | Overlay::ResetPassword { in_flight, .. }
             | Overlay::EditDevice { in_flight, .. }
             | Overlay::AddTarget { in_flight, .. }
-            | Overlay::EditTarget { in_flight, .. } => *in_flight,
+            | Overlay::EditTarget { in_flight, .. }
+            | Overlay::ReplaceDevice { in_flight, .. } => *in_flight,
             Overlay::None => false,
         };
         if in_flight {
@@ -2764,6 +3134,7 @@ impl ControllerApp {
                 Overlay::EditDevice { .. } => self.submit_edit_device(cx),
                 Overlay::AddTarget { .. } => self.submit_add_target(cx),
                 Overlay::EditTarget { .. } => self.submit_edit_target(cx),
+                Overlay::ReplaceDevice { .. } => self.submit_replace_device(cx),
                 Overlay::None => {}
             },
             "tab" => {
@@ -2790,6 +3161,12 @@ impl ControllerApp {
                         ActiveField::EditTargetDisplayName => ActiveField::EditTargetAddress,
                         ActiveField::EditTargetAddress => ActiveField::EditTargetLocation,
                         _ => ActiveField::EditTargetDisplayName,
+                    },
+                    Overlay::ReplaceDevice { .. } => match self.active_field {
+                        ActiveField::ReplaceDevicePriorId => {
+                            ActiveField::ReplaceDeviceReplacementId
+                        }
+                        _ => ActiveField::ReplaceDevicePriorId,
                     },
                     Overlay::None => self.active_field,
                 };
@@ -2864,6 +3241,23 @@ impl ControllerApp {
                     }
                     (Overlay::EditTarget { location, .. }, ActiveField::EditTargetLocation) => {
                         location.pop();
+                    }
+                    (
+                        Overlay::ReplaceDevice {
+                            prior_device_id, ..
+                        },
+                        ActiveField::ReplaceDevicePriorId,
+                    ) => {
+                        prior_device_id.pop();
+                    }
+                    (
+                        Overlay::ReplaceDevice {
+                            replacement_device_id,
+                            ..
+                        },
+                        ActiveField::ReplaceDeviceReplacementId,
+                    ) => {
+                        replacement_device_id.pop();
                     }
                     _ => {}
                 }
@@ -2952,6 +3346,23 @@ impl ControllerApp {
                             if location.len() + text.len() <= 128 =>
                         {
                             location.push_str(text);
+                        }
+                        (
+                            Overlay::ReplaceDevice {
+                                prior_device_id, ..
+                            },
+                            ActiveField::ReplaceDevicePriorId,
+                        ) if prior_device_id.len() + text.len() <= 64 => {
+                            prior_device_id.push_str(text);
+                        }
+                        (
+                            Overlay::ReplaceDevice {
+                                replacement_device_id,
+                                ..
+                            },
+                            ActiveField::ReplaceDeviceReplacementId,
+                        ) if replacement_device_id.len() + text.len() <= 64 => {
+                            replacement_device_id.push_str(text);
                         }
                         _ => {}
                     }
@@ -3497,18 +3908,38 @@ impl Render for ControllerApp {
                 if is_admin {
                     title_bar = title_bar.child(
                         div()
-                            .px_3()
-                            .py_1()
-                            .bg(rgb(0x2d884d))
-                            .text_color(rgb(0xffffff))
-                            .rounded_md()
-                            .text_sm()
-                            .cursor_pointer()
-                            .id("add-target-btn")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_add_target(cx);
-                            }))
-                            .child("+ Add Target"),
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x3a5a7a))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .id("open-replace-device-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_replace_device(String::new(), String::new(), cx);
+                                    }))
+                                    .child("Replace Device"),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x2d884d))
+                                    .text_color(rgb(0xffffff))
+                                    .rounded_md()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .id("add-target-btn")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_add_target(cx);
+                                    }))
+                                    .child("+ Add Target"),
+                            ),
                     );
                 }
                 fleet_list = fleet_list.child(title_bar);
@@ -3538,7 +3969,7 @@ impl Render for ControllerApp {
                         .child(div().w(gpui::px(90.0)).child("Status"))
                         .child(div().w(gpui::px(100.0)).child("Last Seen"));
                     if is_admin {
-                        header_row = header_row.child(div().w(gpui::px(260.0)).child("Actions"));
+                        header_row = header_row.child(div().w(gpui::px(340.0)).child("Actions"));
                     }
                     fleet_list = fleet_list.child(header_row);
 
@@ -3612,7 +4043,7 @@ impl Render for ControllerApp {
                                 let dev_id_for_remove = dev_id.clone();
                                 row = row.child(
                                     div()
-                                        .w(gpui::px(260.0))
+                                        .w(gpui::px(340.0))
                                         .flex()
                                         .gap_2()
                                         .child(
@@ -3661,8 +4092,9 @@ impl Render for ControllerApp {
                             } else {
                                 let is_blocked = device.blocked || device.status == "blocked";
                                 let dev_id_for_edit = dev_id.clone();
+                                let dev_id_for_replace = dev_id.clone();
                                 let mut actions_div =
-                                    div().w(gpui::px(260.0)).flex().gap_2().child(
+                                    div().w(gpui::px(340.0)).flex().gap_2().child(
                                         div()
                                             .px_2()
                                             .py_1()
@@ -3749,6 +4181,26 @@ impl Render for ControllerApp {
                                         );
                                     }
                                 }
+
+                                actions_div = actions_div.child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .bg(rgb(0x4a6a8a))
+                                        .text_color(rgb(0xffffff))
+                                        .rounded_md()
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .id(format!("replace-device-btn-{}", device.device_id))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.open_replace_device(
+                                                dev_id_for_replace.clone(),
+                                                String::new(),
+                                                cx,
+                                            );
+                                        }))
+                                        .child("Replace"),
+                                );
 
                                 row = row.child(actions_div);
                             }
@@ -4488,5 +4940,45 @@ mod tests {
             vm.last_seen, "—",
             "last_seen timestamp must be formatted for offline device"
         );
+    }
+
+    #[test]
+    fn replace_device_overlay_form_matching_checks_request_id_and_device_ids() {
+        let overlay = Overlay::ReplaceDevice {
+            request_id: 30,
+            prior_device_id: "prior-uuid-10".into(),
+            replacement_device_id: "rep-uuid-20".into(),
+            error: None,
+            in_flight: true,
+        };
+
+        let is_match = match &overlay {
+            Overlay::ReplaceDevice {
+                request_id,
+                prior_device_id,
+                replacement_device_id,
+                ..
+            } => {
+                *request_id == 30
+                    && prior_device_id == "prior-uuid-10"
+                    && replacement_device_id == "rep-uuid-20"
+            }
+            _ => false,
+        };
+        assert!(is_match);
+
+        let is_stale_req = match &overlay {
+            Overlay::ReplaceDevice { request_id, .. } => *request_id == 31,
+            _ => false,
+        };
+        assert!(!is_stale_req);
+
+        let is_diff_prior = match &overlay {
+            Overlay::ReplaceDevice {
+                prior_device_id, ..
+            } => prior_device_id == "different-uuid",
+            _ => false,
+        };
+        assert!(!is_diff_prior);
     }
 }

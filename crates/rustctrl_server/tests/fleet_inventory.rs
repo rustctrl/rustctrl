@@ -2,9 +2,9 @@ use anyhow::Result;
 use rustctrl_core::{ClientConfig, DeviceId};
 use rustctrl_protocol::auth::{
     BlockDeviceRequest, CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
-    ListFleetDevicesRequest, LoginRequest, RemoveTargetRequest, ReplaceTemporaryPasswordRequest,
-    StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
-    staff_auth_client::StaffAuthClient,
+    ListFleetDevicesRequest, LoginRequest, RemoveTargetRequest, ReplaceFleetDeviceRequest,
+    ReplaceTemporaryPasswordRequest, StaffStatusRequest, UnblockDeviceRequest,
+    UpdateFleetDeviceRequest, UpdateTargetRequest, staff_auth_client::StaffAuthClient,
 };
 use rustctrl_protocol::bootstrap::HeartbeatRequest;
 use rustctrl_server::{
@@ -19,6 +19,62 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, transport::Channel};
+
+fn issue_agent_identity(pki_dir: &Path, agent_dir: &Path, device_id: DeviceId) -> Result<()> {
+    use rcgen::{
+        CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+        KeyUsagePurpose, SanType,
+    };
+    use std::fs;
+
+    let ca_dir = pki_dir.join("ca");
+    let ca_cert_pem = fs::read_to_string(ca_dir.join("cert.pem"))?;
+    let ca_key_pem = fs::read_to_string(ca_dir.join("key.pem"))?;
+
+    let key_pair = KeyPair::from_pem(&ca_key_pem)?;
+    let issuer = rcgen::Issuer::from_ca_cert_pem(&ca_cert_pem, key_pair)?;
+
+    fs::create_dir_all(agent_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(agent_dir, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let client_key = KeyPair::generate()?;
+    let identity = device_id.certificate_name();
+    let mut client_params = CertificateParams::default();
+    client_params.distinguished_name = DistinguishedName::new();
+    client_params
+        .distinguished_name
+        .push(DnType::CommonName, &identity);
+    client_params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    client_params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+    client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    client_params
+        .subject_alt_names
+        .push(SanType::DnsName(identity.try_into()?));
+
+    let certificate = client_params.signed_by(&client_key, &issuer)?;
+    fs::write(agent_dir.join("cert.pem"), certificate.pem().as_bytes())?;
+    fs::write(
+        agent_dir.join("key.pem"),
+        client_key.serialize_pem().as_bytes(),
+    )?;
+    fs::write(agent_dir.join("ca.pem"), ca_cert_pem.as_bytes())?;
+    Ok(())
+}
+
+fn agent_config_for_dir(dir: &Path, endpoint: &str) -> ClientConfig {
+    ClientConfig {
+        endpoint: endpoint.into(),
+        domain_name: "localhost".into(),
+        ca_certificate: dir.join("ca.pem"),
+        certificate: dir.join("cert.pem"),
+        private_key: dir.join("key.pem"),
+    }
+}
 
 fn client_config(root: &Path, endpoint: &str, role: &str) -> ClientConfig {
     let dir = root.join("clients").join(role);
@@ -2609,5 +2665,564 @@ async fn admin_manages_device_cleanup_via_controller_cli() -> Result<()> {
         "Controller CLI must report connection failure during server outage"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_replaces_inventory_entry_after_device_identity_loss_with_preserved_attribution_and_blocks()
+-> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pki_dir = temp.path().join("pki");
+    let device_id = DeviceId::new();
+    initialize(&PkiOptions {
+        output: pki_dir.clone(),
+        server_output: None,
+        server_names: vec!["localhost".into()],
+        server_ips: vec!["127.0.0.1".parse().unwrap()],
+        endpoint: "https://localhost:9876".into(),
+        domain_name: "localhost".into(),
+        device_id,
+    })?;
+    let config_path = pki_dir.join("server.toml");
+    let db_path = temp.path().join("rustctrl.db");
+    let exe = env!("CARGO_BIN_EXE_rustctrl-server");
+
+    bootstrap_admin(exe, &config_path, "alice", "AliceTemp123!").await;
+
+    let server = RunningServer::start(&pki_dir, db_path.clone()).await?;
+    let mut admin = connect(&pki_dir, &server.endpoint).await?;
+
+    let alice_login = admin
+        .login(LoginRequest {
+            username: "alice".into(),
+            password: "AliceTemp123!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    admin
+        .replace_temporary_password(authorized(
+            &alice_login.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "AlicePermanent123!".into(),
+            },
+        ))
+        .await?;
+    let alice_session = login(&mut admin, "alice", "AlicePermanent123!").await?;
+
+    // Create an Operator (Bob) to test access restrictions.
+    admin
+        .create_staff_account(authorized(
+            &alice_session,
+            CreateStaffAccountRequest {
+                username: "bob".into(),
+                role: "operator".into(),
+                temporary_password: "BobTemp123!".into(),
+            },
+        ))
+        .await?;
+    let bob_login = admin
+        .login(LoginRequest {
+            username: "bob".into(),
+            password: "BobTemp123!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    admin
+        .replace_temporary_password(authorized(
+            &bob_login.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "BobPermanent123!".into(),
+            },
+        ))
+        .await?;
+    let mut operator_client = connect(&pki_dir, &server.endpoint).await?;
+    let bob_session = login(&mut operator_client, "bob", "BobPermanent123!").await?;
+
+    // 1. Two independently provisioned Agent identities with the SAME hostname/address.
+    let prior_id = DeviceId::new();
+    let replacement_id = DeviceId::new();
+    let agent1_dir = temp.path().join("agent1");
+    let agent2_dir = temp.path().join("agent2");
+    issue_agent_identity(&pki_dir, &agent1_dir, prior_id)?;
+    issue_agent_identity(&pki_dir, &agent2_dir, replacement_id)?;
+
+    // Register prior device (simulating machine before Windows reinstall).
+    let mut agent1 =
+        rustctrl_network::connect(&agent_config_for_dir(&agent1_dir, &server.endpoint)).await?;
+    agent1
+        .send_heartbeat(HeartbeatRequest {
+            device_id: prior_id.to_string(),
+            name: "WORKSTATION-01".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await?;
+
+    // Admin Alice edits prior device display name and location.
+    admin
+        .update_fleet_device(authorized(
+            &alice_session,
+            UpdateFleetDeviceRequest {
+                device_id: prior_id.to_string(),
+                display_name: "Reception PC".into(),
+                location: Some("Floor 1 Reception".into()),
+            },
+        ))
+        .await?;
+
+    // Admin Alice blocks prior device (to verify that block is preserved across replacement).
+    admin
+        .block_device(authorized(
+            &alice_session,
+            BlockDeviceRequest {
+                device_id: prior_id.to_string(),
+            },
+        ))
+        .await?;
+
+    // Now, Windows is reinstalled on the computer, losing its identity and generating a new Agent identity.
+    // The new Agent registers with the SAME hostname ("WORKSTATION-01").
+    let mut agent2 =
+        rustctrl_network::connect(&agent_config_for_dir(&agent2_dir, &server.endpoint)).await?;
+    agent2
+        .send_heartbeat(HeartbeatRequest {
+            device_id: replacement_id.to_string(),
+            name: "WORKSTATION-01".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await?;
+
+    // 2. Acceptance Criterion: A different valid Device identity creates a distinct entry even when
+    // hostname/IP matches a previously known Device. No hardware-fingerprint or hostname/IP auto-merge is introduced.
+    let list_distinct = admin
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(
+        list_distinct.devices.len(),
+        2,
+        "both prior and replacement devices must exist as distinct entries"
+    );
+    let dev1_entry = list_distinct
+        .devices
+        .iter()
+        .find(|d| d.device_id == prior_id.to_string())
+        .expect("prior device must be listed");
+    assert_eq!(dev1_entry.display_name, "Reception PC");
+    assert!(dev1_entry.blocked);
+    assert_eq!(dev1_entry.status, "blocked");
+
+    let dev2_entry = list_distinct
+        .devices
+        .iter()
+        .find(|d| d.device_id == replacement_id.to_string())
+        .expect("replacement device must be listed");
+    assert_eq!(dev2_entry.display_name, "WORKSTATION-01");
+    assert!(!dev2_entry.blocked);
+    assert_eq!(dev2_entry.status, "online");
+
+    // 3. Operator Bob attempts replacement -> MUST fail with permission denied.
+    let op_err = operator_client
+        .replace_fleet_device(authorized(
+            &bob_session,
+            ReplaceFleetDeviceRequest {
+                prior_device_id: prior_id.to_string(),
+                replacement_device_id: replacement_id.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(op_err.code(), Code::PermissionDenied);
+
+    // 4. Invalid replacement requests by Admin Alice:
+    // a. Same device ID -> invalid argument.
+    let same_err = admin
+        .replace_fleet_device(authorized(
+            &alice_session,
+            ReplaceFleetDeviceRequest {
+                prior_device_id: prior_id.to_string(),
+                replacement_device_id: prior_id.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(same_err.code(), Code::InvalidArgument);
+
+    // b. Non-existent prior device ID -> not found.
+    let missing_err = admin
+        .replace_fleet_device(authorized(
+            &alice_session,
+            ReplaceFleetDeviceRequest {
+                prior_device_id: DeviceId::new().to_string(),
+                replacement_device_id: replacement_id.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(missing_err.code(), Code::NotFound);
+
+    // c. Connection target as prior or replacement -> failed precondition.
+    let target = admin
+        .create_target(authorized(
+            &alice_session,
+            CreateTargetRequest {
+                display_name: "Lobby TV".into(),
+                address: "192.168.1.55:5555".into(),
+                location: None,
+                target_type: Some("android_tv".into()),
+            },
+        ))
+        .await?
+        .into_inner();
+    let target_err = admin
+        .replace_fleet_device(authorized(
+            &alice_session,
+            ReplaceFleetDeviceRequest {
+                prior_device_id: target.target.unwrap().device_id,
+                replacement_device_id: replacement_id.to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(target_err.code(), Code::FailedPrecondition);
+
+    // 5. Admin Alice executes explicit reconciliation replacement operation.
+    let replace_reply = admin
+        .replace_fleet_device(authorized(
+            &alice_session,
+            ReplaceFleetDeviceRequest {
+                prior_device_id: prior_id.to_string(),
+                replacement_device_id: replacement_id.to_string(),
+            },
+        ))
+        .await?
+        .into_inner();
+
+    assert_eq!(replace_reply.prior_device_id, prior_id.to_string());
+    assert_eq!(
+        replace_reply.replacement_device_id,
+        replacement_id.to_string()
+    );
+    let reconciled = replace_reply.device.expect("reconciled device entry");
+    assert_eq!(reconciled.device_id, replacement_id.to_string());
+    assert_eq!(
+        reconciled.display_name, "Reception PC",
+        "curated display name must transfer to replacement device"
+    );
+    assert_eq!(
+        reconciled.location.as_deref(),
+        Some("Floor 1 Reception"),
+        "curated location must transfer"
+    );
+    assert!(
+        reconciled.blocked,
+        "Device Block must be preserved on replacement, not silently cleared"
+    );
+    assert_eq!(reconciled.status, "blocked");
+
+    // 6. Visible Fleet Inventory reconciliation:
+    // Only the replacement device is present; the prior device is no longer visible!
+    let list_after_replace = admin
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert!(
+        !list_after_replace
+            .devices
+            .iter()
+            .any(|d| d.device_id == prior_id.to_string()),
+        "prior device must be removed from visible inventory"
+    );
+    let rep_in_list = list_after_replace
+        .devices
+        .iter()
+        .find(|d| d.device_id == replacement_id.to_string())
+        .expect("replacement device must be in inventory");
+    assert_eq!(rep_in_list.display_name, "Reception PC");
+    assert!(rep_in_list.blocked);
+
+    // 7. Replaced prior agent CANNOT reconnect or send heartbeats!
+    let prior_hb_err = agent1
+        .send_heartbeat(HeartbeatRequest {
+            device_id: prior_id.to_string(),
+            name: "WORKSTATION-01".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        prior_hb_err.message().contains("replaced"),
+        "heartbeat from replaced prior device must be rejected: {prior_hb_err}"
+    );
+
+    // 8. Unblock the replacement device explicitly via Admin action.
+    admin
+        .unblock_device(authorized(
+            &alice_session,
+            UnblockDeviceRequest {
+                device_id: replacement_id.to_string(),
+            },
+        ))
+        .await?;
+
+    // Agent 2 sends heartbeat under its own operational identity -> succeeds and updates status to online.
+    agent2
+        .send_heartbeat(HeartbeatRequest {
+            device_id: replacement_id.to_string(),
+            name: "WORKSTATION-01".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await?;
+
+    let list_unblocked = admin
+        .list_fleet_devices(authorized(&alice_session, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    let rep_unblocked = list_unblocked
+        .devices
+        .iter()
+        .find(|d| d.device_id == replacement_id.to_string())
+        .unwrap();
+    assert_eq!(rep_unblocked.status, "online");
+    assert!(!rep_unblocked.blocked);
+
+    // 9. Server restart -> replacement and association persist across Server restart.
+    server.shutdown().await?;
+    let restarted = RunningServer::start(&pki_dir, db_path).await?;
+    let mut admin_restarted = connect(&pki_dir, &restarted.endpoint).await?;
+    let alice_restarted = login(&mut admin_restarted, "alice", "AlicePermanent123!").await?;
+
+    let list_persisted = admin_restarted
+        .list_fleet_devices(authorized(&alice_restarted, ListFleetDevicesRequest {}))
+        .await?
+        .into_inner();
+    assert!(
+        !list_persisted
+            .devices
+            .iter()
+            .any(|d| d.device_id == prior_id.to_string()),
+        "prior device must remain removed across server restart"
+    );
+    let rep_persisted = list_persisted
+        .devices
+        .iter()
+        .find(|d| d.device_id == replacement_id.to_string())
+        .expect("replacement device must persist across server restart");
+    assert_eq!(rep_persisted.display_name, "Reception PC");
+    assert_eq!(rep_persisted.location.as_deref(), Some("Floor 1 Reception"));
+
+    // Replaced prior agent heartbeat still rejected after server restart.
+    let mut agent1_restarted =
+        rustctrl_network::connect(&agent_config_for_dir(&agent1_dir, &restarted.endpoint)).await?;
+    let prior_hb_restarted_err = agent1_restarted
+        .send_heartbeat(HeartbeatRequest {
+            device_id: prior_id.to_string(),
+            name: "WORKSTATION-01".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(prior_hb_restarted_err.message().contains("replaced"));
+
+    // 10. Verify central activity log records actor, both identities, server time, result, and preserves past attribution.
+    let activity = list_activity(exe, &config_path).await;
+    assert!(
+        activity.contains("action=replace_fleet_device")
+            && activity.contains("actor=alice")
+            && activity.contains("result=success")
+            && activity.contains(&prior_id.to_string())
+            && activity.contains(&replacement_id.to_string()),
+        "activity log must record alice replace_fleet_device success with both identities: {activity}"
+    );
+    assert!(
+        activity.contains("action=replace_fleet_device")
+            && activity.contains("actor=bob")
+            && activity.contains("result=rejected"),
+        "activity log must record bob replace_fleet_device rejection: {activity}"
+    );
+    assert!(
+        activity.contains("action=update_fleet_device") && activity.contains(&prior_id.to_string()),
+        "historical activity attribution for prior_id must be preserved: {activity}"
+    );
+    assert!(
+        !activity.contains("AlicePermanent123!") && !activity.contains("BobPermanent123!"),
+        "activity log must not contain credentials or secrets"
+    );
+
+    restarted.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_manages_device_replacement_via_controller_cli() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let pki_dir = temp.path().join("pki");
+    let device_id = DeviceId::new();
+    initialize(&PkiOptions {
+        output: pki_dir.clone(),
+        server_output: None,
+        server_names: vec!["localhost".into()],
+        server_ips: vec!["127.0.0.1".parse().unwrap()],
+        endpoint: "https://localhost:9876".into(),
+        domain_name: "localhost".into(),
+        device_id,
+    })?;
+    let config_path = pki_dir.join("server.toml");
+    let controller_config_path = pki_dir.join("clients/controller/config.toml");
+    let db_path = temp.path().join("rustctrl.db");
+
+    let server_exe = env!("CARGO_BIN_EXE_rustctrl-server");
+    let ext = std::env::consts::EXE_SUFFIX;
+    let controller_exe = Path::new(server_exe)
+        .parent()
+        .unwrap()
+        .join(format!("rustctrl-controller{ext}"));
+    if !controller_exe.is_file() {
+        eprintln!(
+            "Skipping controller CLI test: binary not found at {:?}",
+            controller_exe
+        );
+        return Ok(());
+    }
+
+    bootstrap_admin(server_exe, &config_path, "alice", "AliceTemp123!").await;
+
+    let server = RunningServer::start(&pki_dir, db_path).await?;
+    let mut admin = connect(&pki_dir, &server.endpoint).await?;
+
+    let alice_login = admin
+        .login(LoginRequest {
+            username: "alice".into(),
+            password: "AliceTemp123!".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    admin
+        .replace_temporary_password(authorized(
+            &alice_login.session_token,
+            ReplaceTemporaryPasswordRequest {
+                new_password: "AlicePermanent123!".into(),
+            },
+        ))
+        .await?;
+
+    let controller_toml = format!(
+        "[server]\nendpoint = \"{}\"\ndomain_name = \"localhost\"\nca_certificate = \"ca.pem\"\ncertificate = \"cert.pem\"\nprivate_key = \"key.pem\"\n",
+        server.endpoint
+    );
+    std::fs::write(&controller_config_path, controller_toml)?;
+
+    let run_controller = |args: &[&str]| {
+        let exe = controller_exe.clone();
+        let config = controller_config_path.clone();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let mut cmd = Command::new(&exe);
+                cmd.arg("--config").arg(&config);
+                for arg in &args {
+                    cmd.arg(arg);
+                }
+                cmd.output().expect("run rustctrl-controller CLI")
+            })
+            .await
+            .expect("join rustctrl-controller CLI")
+        }
+    };
+
+    let prior_id = DeviceId::new();
+    let replacement_id = DeviceId::new();
+    let agent1_dir = temp.path().join("agent1");
+    let agent2_dir = temp.path().join("agent2");
+    issue_agent_identity(&pki_dir, &agent1_dir, prior_id)?;
+    issue_agent_identity(&pki_dir, &agent2_dir, replacement_id)?;
+
+    // Register prior device and set display name.
+    let mut agent1 =
+        rustctrl_network::connect(&agent_config_for_dir(&agent1_dir, &server.endpoint)).await?;
+    agent1
+        .send_heartbeat(HeartbeatRequest {
+            device_id: prior_id.to_string(),
+            name: "FINANCE-DESKTOP".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await?;
+
+    let edit_res = run_controller(&[
+        "edit-device",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--device-id",
+        &prior_id.to_string(),
+        "--display-name",
+        "Finance PC",
+        "--location",
+        "Floor 2 Finance",
+    ])
+    .await;
+    assert!(edit_res.status.success());
+
+    // Register replacement device with same hostname.
+    let mut agent2 =
+        rustctrl_network::connect(&agent_config_for_dir(&agent2_dir, &server.endpoint)).await?;
+    agent2
+        .send_heartbeat(HeartbeatRequest {
+            device_id: replacement_id.to_string(),
+            name: "FINANCE-DESKTOP".into(),
+            agent_version: "0.1.0".into(),
+        })
+        .await?;
+
+    // Admin replaces device via Controller CLI.
+    let replace_res = run_controller(&[
+        "replace-device",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+        "--prior-device-id",
+        &prior_id.to_string(),
+        "--replacement-device-id",
+        &replacement_id.to_string(),
+    ])
+    .await;
+    assert!(
+        replace_res.status.success(),
+        "controller replace-device failed: {}",
+        String::from_utf8_lossy(&replace_res.stderr)
+    );
+    let replace_out = String::from_utf8_lossy(&replace_res.stdout);
+    assert!(
+        replace_out.contains(&prior_id.to_string())
+            && replace_out.contains(&replacement_id.to_string())
+            && replace_out.contains("name=Finance PC"),
+        "unexpected replace output: {replace_out}"
+    );
+
+    // List devices via Controller CLI -> prior is gone, replacement is present with Finance PC.
+    let list_res = run_controller(&[
+        "list-devices",
+        "--username",
+        "alice",
+        "--password",
+        "AlicePermanent123!",
+    ])
+    .await;
+    assert!(list_res.status.success());
+    let list_out = String::from_utf8_lossy(&list_res.stdout);
+    assert!(
+        !list_out.contains(&prior_id.to_string()),
+        "prior device must not appear in list-devices: {list_out}"
+    );
+    assert!(
+        list_out.contains(&replacement_id.to_string()) && list_out.contains("Finance PC"),
+        "replacement device must appear in list-devices: {list_out}"
+    );
+
+    server.shutdown().await?;
     Ok(())
 }

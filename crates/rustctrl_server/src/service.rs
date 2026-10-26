@@ -12,10 +12,11 @@ use rustctrl_protocol::auth::{
     DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesReply,
     ListFleetDevicesRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
     LoginRequest, LogoutReply, LogoutRequest, RemoveTargetReply, RemoveTargetRequest,
-    ReplaceTemporaryPasswordReply, ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply,
-    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusReply, StaffStatusRequest,
-    UnblockDeviceReply, UnblockDeviceRequest, UpdateFleetDeviceReply, UpdateFleetDeviceRequest,
-    UpdateTargetReply, UpdateTargetRequest,
+    ReplaceFleetDeviceReply, ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordReply,
+    ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply, ResetStaffPasswordRequest,
+    StaffAccountEntry, StaffStatusReply, StaffStatusRequest, UnblockDeviceReply,
+    UnblockDeviceRequest, UpdateFleetDeviceReply, UpdateFleetDeviceRequest, UpdateTargetReply,
+    UpdateTargetRequest,
     staff_auth_server::{StaffAuth, StaffAuthServer},
 };
 use rustctrl_protocol::bootstrap::{
@@ -89,6 +90,16 @@ impl Bootstrap for BootstrapService {
             return Err(Status::permission_denied(
                 "certificate does not identify this device",
             ));
+        }
+
+        if self
+            .store
+            .get_device_replacement(&id.to_string())
+            .await
+            .map_err(database_error)?
+            .is_some()
+        {
+            return Err(Status::permission_denied("device has been replaced"));
         }
 
         if self
@@ -972,6 +983,73 @@ impl StaffAuth for StaffAuthService {
                 if err_msg.contains("not found") {
                     Err(Status::not_found(err_msg))
                 } else if err_msg.contains("blocked") || err_msg.contains("online") {
+                    Err(Status::failed_precondition(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
+    }
+
+    async fn replace_fleet_device(
+        &self,
+        request: Request<ReplaceFleetDeviceRequest>,
+    ) -> Result<Response<ReplaceFleetDeviceReply>, Status> {
+        let body = request.get_ref();
+        let prior_device_id = body.prior_device_id.trim().to_string();
+        let replacement_device_id = body.replacement_device_id.trim().to_string();
+        let target_label = format!("{prior_device_id} -> {replacement_device_id}");
+        let session = self
+            .authenticate_admin(&request, "replace_fleet_device", Some(&target_label))
+            .await?;
+
+        match self
+            .store
+            .replace_device(&prior_device_id, &replacement_device_id, &session.username)
+            .await
+        {
+            Ok(reconciled) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "replace_fleet_device".into(),
+                        "success".into(),
+                        format!(
+                            "replaced prior device '{prior_device_id}' with replacement device '{replacement_device_id}'"
+                        ),
+                    )
+                    .await;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_default();
+                let window_ms =
+                    i64::try_from(self.offline_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+                Ok(Response::new(ReplaceFleetDeviceReply {
+                    device: Some(to_fleet_device_entry(reconciled, now_ms, window_ms)),
+                    prior_device_id,
+                    replacement_device_id,
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "replace_fleet_device".into(),
+                        "rejected".into(),
+                        format!(
+                            "failed to replace prior device '{prior_device_id}' with replacement device '{replacement_device_id}': {err_msg}"
+                        ),
+                    )
+                    .await;
+                if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else if err_msg.contains("already been replaced")
+                    || err_msg.contains("connection target")
+                {
                     Err(Status::failed_precondition(err_msg))
                 } else {
                     Err(Status::invalid_argument(err_msg))
