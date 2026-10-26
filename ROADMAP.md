@@ -37,5 +37,6 @@ Design decisions:
 - [Trusted automatic Agent enrollment](docs/adr/0004-enroll-agents-through-trusted-installation.md).
 - [Revocable remembered staff access](docs/adr/0005-keep-remembered-staff-access-revocable.md).
 - [Separate inventory cleanup and Device blocking](docs/adr/0006-separate-inventory-cleanup-from-device-blocking.md).
+- [Provision Agent credentials through a scoped issuing authority](docs/adr/0007-provision-agent-credentials-via-scoped-issuing-authority.md).
 
 Domain terms are defined in [CONTEXT.md](CONTEXT.md). The [initial brief](SPEC.md) supplies background, not an implementation ticket for the entire project.

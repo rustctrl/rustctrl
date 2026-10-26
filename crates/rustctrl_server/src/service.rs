@@ -1,8 +1,10 @@
 use crate::{
     config::ServerConfig,
+    issuer::AgentIssuer,
     store::{DeviceRecord, DeviceStore, TargetRecord},
 };
 use anyhow::{Context, Result};
+use ring::rand::SecureRandom;
 use rustctrl_core::DeviceId;
 use rustctrl_protocol::auth::{
     BlockDeviceReply, BlockDeviceRequest, ChangeOwnPasswordReply, ChangeOwnPasswordRequest,
@@ -11,7 +13,8 @@ use rustctrl_protocol::auth::{
     CreateTargetReply, CreateTargetRequest, DeactivateStaffAccountReply,
     DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesReply,
     ListFleetDevicesRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
-    LoginRequest, LogoutReply, LogoutRequest, RemoveTargetReply, RemoveTargetRequest,
+    LoginRequest, LogoutReply, LogoutRequest, PrepareInstallationArtifactReply,
+    PrepareInstallationArtifactRequest, RemoveTargetReply, RemoveTargetRequest,
     ReplaceFleetDeviceReply, ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordReply,
     ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply, ResetStaffPasswordRequest,
     StaffAccountEntry, StaffStatusReply, StaffStatusRequest, UnblockDeviceReply,
@@ -20,22 +23,47 @@ use rustctrl_protocol::auth::{
     staff_auth_server::{StaffAuth, StaffAuthServer},
 };
 use rustctrl_protocol::bootstrap::{
-    HealthReply, HealthRequest, HeartbeatReply, HeartbeatRequest,
+    EnrollAgentReply, EnrollAgentRequest, HealthReply, HealthRequest, HeartbeatReply,
+    HeartbeatRequest,
     bootstrap_server::{Bootstrap, BootstrapServer},
 };
-use std::{fs, future::Future};
+use std::{fs, future::Future, sync::Arc};
 use tonic::{
     Request, Response, Status,
     transport::{Certificate, Identity, Server, ServerTlsConfig},
 };
 use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
+fn hash_secret(secret: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, secret.as_bytes());
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn generate_secret() -> Result<String, Status> {
+    let mut bytes = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| Status::internal("failed to generate random secret"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 pub struct BootstrapService {
     store: DeviceStore,
+    issuer: Option<Arc<AgentIssuer>>,
 }
 impl BootstrapService {
     pub fn new(store: DeviceStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            issuer: None,
+        }
+    }
+
+    pub fn with_issuer(store: DeviceStore, issuer: Arc<AgentIssuer>) -> Self {
+        Self {
+            store,
+            issuer: Some(issuer),
+        }
     }
 }
 
@@ -123,12 +151,160 @@ impl Bootstrap for BootstrapService {
             received_at_unix_ms: timestamp,
         }))
     }
+
+    async fn enroll_agent(
+        &self,
+        request: Request<EnrollAgentRequest>,
+    ) -> Result<Response<EnrollAgentReply>, Status> {
+        let body = request.get_ref();
+        let id: DeviceId = body
+            .device_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid device_id"))?;
+
+        if body.name.trim().is_empty()
+            || body.name.len() > 128
+            || body.agent_version.is_empty()
+            || body.agent_version.len() > 64
+        {
+            return Err(Status::invalid_argument("invalid name or agent_version"));
+        }
+
+        if body.installation_secret.trim().is_empty() {
+            return Err(Status::unauthenticated("installation secret is required"));
+        }
+
+        let certs = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let leaf = certs
+            .first()
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        let (_, cert) = parse_x509_certificate(leaf.as_ref())
+            .map_err(|_| Status::unauthenticated("invalid client certificate"))?;
+        let san = cert
+            .subject_alternative_name()
+            .map_err(|_| Status::unauthenticated("invalid certificate SAN"))?;
+        let matches = san.is_some_and(|extension| {
+            extension.value.general_names.iter().any(|name| {
+                matches!(
+                    name,
+                    GeneralName::DNSName(value) if *value == "enrollment.rustctrl.internal"
+                )
+            })
+        });
+        if !matches {
+            return Err(Status::permission_denied(
+                "certificate does not authorize agent enrollment",
+            ));
+        }
+
+        let secret_hash = hash_secret(body.installation_secret.trim());
+        let auth = match self
+            .store
+            .find_installation_authorization_by_hash(&secret_hash)
+            .await
+        {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        id.to_string(),
+                        "enroll_agent".into(),
+                        "rejected".into(),
+                        format!(
+                            "enrollment rejected for device '{id}': invalid installation secret"
+                        ),
+                    )
+                    .await;
+                return Err(Status::unauthenticated(
+                    "invalid installation authorization",
+                ));
+            }
+            Err(e) => return Err(database_error(e)),
+        };
+
+        if auth.revoked_at_unix_ms.is_some() {
+            let _ = self
+                .store
+                .record_activity(
+                    id.to_string(),
+                    "enroll_agent".into(),
+                    "rejected".into(),
+                    format!("enrollment rejected for device '{id}': installation authorization has been revoked"),
+                )
+                .await;
+            return Err(Status::permission_denied(
+                "installation authorization has been revoked",
+            ));
+        }
+
+        let remote_addr = request.remote_addr().map(|a| a.to_string());
+        let enrolled_at = match self
+            .store
+            .record_device_enrollment(
+                id,
+                auth.authorization_id.clone(),
+                body.name.clone(),
+                body.agent_version.clone(),
+                remote_addr,
+            )
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        id.to_string(),
+                        "enroll_agent".into(),
+                        "rejected".into(),
+                        format!("enrollment rejected for device '{id}': {err_msg}"),
+                    )
+                    .await;
+                return Err(Status::permission_denied(err_msg));
+            }
+        };
+
+        let issuer = self
+            .issuer
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("agent issuer not configured"))?;
+
+        let (cert_pem, key_pem) = issuer
+            .issue_agent_certificate(id)
+            .map_err(|e| Status::internal(format!("failed to issue agent certificate: {e}")))?;
+
+        let _ = self
+            .store
+            .record_activity(
+                id.to_string(),
+                "enroll_agent".into(),
+                "success".into(),
+                format!(
+                    "enrolled agent '{id}' using authorization '{}'",
+                    auth.authorization_id
+                ),
+            )
+            .await;
+
+        Ok(Response::new(EnrollAgentReply {
+            device_id: id.to_string(),
+            certificate: cert_pem,
+            private_key: key_pem,
+            ca_certificate: issuer.ca_cert_pem.clone(),
+            enrolled_at_unix_ms: enrolled_at,
+        }))
+    }
 }
 
 pub struct StaffAuthService {
     store: DeviceStore,
     remembered_lifetime_secs: u64,
     offline_after_secs: u64,
+    issuer: Option<Arc<AgentIssuer>>,
 }
 
 impl StaffAuthService {
@@ -137,6 +313,21 @@ impl StaffAuthService {
             store,
             remembered_lifetime_secs,
             offline_after_secs,
+            issuer: None,
+        }
+    }
+
+    pub fn with_issuer(
+        store: DeviceStore,
+        remembered_lifetime_secs: u64,
+        offline_after_secs: u64,
+        issuer: Arc<AgentIssuer>,
+    ) -> Self {
+        Self {
+            store,
+            remembered_lifetime_secs,
+            offline_after_secs,
+            issuer: Some(issuer),
         }
     }
 
@@ -1232,6 +1423,55 @@ impl StaffAuth for StaffAuthService {
             }
         }
     }
+
+    async fn prepare_installation_artifact(
+        &self,
+        request: Request<PrepareInstallationArtifactRequest>,
+    ) -> Result<Response<PrepareInstallationArtifactReply>, Status> {
+        let session = self
+            .authenticate_admin(&request, "prepare_installation_artifact", None)
+            .await?;
+
+        let issuer = self
+            .issuer
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("agent issuer not configured"))?;
+
+        let authorization_id = uuid::Uuid::new_v4().to_string();
+        let installation_secret = generate_secret()?;
+        let secret_hash = hash_secret(&installation_secret);
+
+        let auth = self
+            .store
+            .create_installation_authorization(
+                authorization_id.clone(),
+                secret_hash,
+                session.username.clone(),
+            )
+            .await
+            .map_err(database_error)?;
+
+        let _ = self
+            .store
+            .record_activity(
+                session.username,
+                "create_installation_authorization".into(),
+                "success".into(),
+                format!("created installation authorization '{authorization_id}'"),
+            )
+            .await;
+
+        Ok(Response::new(PrepareInstallationArtifactReply {
+            authorization_id,
+            server_endpoint: issuer.server_endpoint.clone(),
+            domain_name: issuer.domain_name.clone(),
+            ca_certificate: issuer.ca_cert_pem.clone(),
+            enrollment_certificate: issuer.enrollment_cert_pem.clone(),
+            enrollment_private_key: issuer.enrollment_key_pem.clone(),
+            installation_secret,
+            created_at_unix_ms: auth.created_at_unix_ms,
+        }))
+    }
 }
 
 fn to_fleet_device_entry(device: DeviceRecord, now_ms: i64, window_ms: i64) -> FleetDeviceEntry {
@@ -1308,14 +1548,92 @@ pub async fn serve_on(
         .identity(Identity::from_pem(certificate, private_key))
         .client_ca_root(Certificate::from_pem(ca));
     tracing::info!(listen = %config.listen, "starting RustCtrl bootstrap server with required client certificates");
-    Server::builder()
-        .tls_config(tls)?
-        .add_service(BootstrapServer::new(BootstrapService::new(store.clone())))
-        .add_service(StaffAuthServer::new(StaffAuthService::new(
+
+    let tls_dir = config
+        .tls
+        .certificate
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let agent_ca_cert_path = config
+        .enrollment
+        .agent_issuer_certificate
+        .clone()
+        .unwrap_or_else(|| tls_dir.join("agent-ca/cert.pem"));
+    let agent_ca_key_path = config
+        .enrollment
+        .agent_issuer_private_key
+        .clone()
+        .unwrap_or_else(|| tls_dir.join("agent-ca/key.pem"));
+    let enrollment_cert_path = config
+        .enrollment
+        .enrollment_certificate
+        .clone()
+        .unwrap_or_else(|| tls_dir.join("enrollment/cert.pem"));
+    let enrollment_key_path = config
+        .enrollment
+        .enrollment_private_key
+        .clone()
+        .unwrap_or_else(|| tls_dir.join("enrollment/key.pem"));
+
+    let agent_issuer = if agent_ca_cert_path.exists()
+        && agent_ca_key_path.exists()
+        && enrollment_cert_path.exists()
+        && enrollment_key_path.exists()
+    {
+        let ca_cert_pem = fs::read_to_string(&config.tls.client_ca).context("read client CA")?;
+        let issuer_cert_pem =
+            fs::read_to_string(&agent_ca_cert_path).context("read agent CA cert")?;
+        let issuer_key_pem = fs::read_to_string(&agent_ca_key_path).context("read agent CA key")?;
+        let enrollment_cert_pem =
+            fs::read_to_string(&enrollment_cert_path).context("read enrollment cert")?;
+        let enrollment_key_pem =
+            fs::read_to_string(&enrollment_key_path).context("read enrollment key")?;
+        let server_endpoint = config
+            .enrollment
+            .server_endpoint
+            .clone()
+            .unwrap_or_else(|| format!("https://localhost:{}", config.listen.port()));
+        let domain_name = config
+            .enrollment
+            .domain_name
+            .clone()
+            .unwrap_or_else(|| "localhost".into());
+
+        Some(Arc::new(AgentIssuer::new(
+            server_endpoint,
+            domain_name,
+            ca_cert_pem,
+            issuer_cert_pem,
+            issuer_key_pem,
+            enrollment_cert_pem,
+            enrollment_key_pem,
+        )))
+    } else {
+        None
+    };
+
+    let bootstrap_service = match &agent_issuer {
+        Some(issuer) => BootstrapService::with_issuer(store.clone(), issuer.clone()),
+        None => BootstrapService::new(store.clone()),
+    };
+    let staff_auth_service = match &agent_issuer {
+        Some(issuer) => StaffAuthService::with_issuer(
             store,
             config.staff_session.remembered_lifetime_secs,
             config.fleet.offline_after_secs,
-        )))
+            issuer.clone(),
+        ),
+        None => StaffAuthService::new(
+            store,
+            config.staff_session.remembered_lifetime_secs,
+            config.fleet.offline_after_secs,
+        ),
+    };
+
+    Server::builder()
+        .tls_config(tls)?
+        .add_service(BootstrapServer::new(bootstrap_service))
+        .add_service(StaffAuthServer::new(staff_auth_service))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             shutdown,

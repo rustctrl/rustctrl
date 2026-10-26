@@ -110,6 +110,7 @@ impl RunningServer {
             fleet: FleetConfig {
                 offline_after_secs: 1,
             },
+            enrollment: Default::default(),
         };
         let stop = CancellationToken::new();
         let signal = stop.clone();

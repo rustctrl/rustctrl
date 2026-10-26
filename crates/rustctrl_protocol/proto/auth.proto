@@ -21,6 +21,7 @@ service StaffAuth {
   rpc ListStaffAccounts(ListStaffAccountsRequest) returns (ListStaffAccountsReply);
   rpc CreateStaffAccount(CreateStaffAccountRequest) returns (CreateStaffAccountReply);
   rpc ChangeStaffRole(ChangeStaffRoleRequest) returns (ChangeStaffRoleReply);
+  rpc PrepareInstallationArtifact(PrepareInstallationArtifactRequest) returns (PrepareInstallationArtifactReply);
 }
 
 message LoginRequest {
@@ -217,5 +218,18 @@ message ChangeStaffRoleReply {
   string username = 1;
   string role = 2;
   int64 updated_at_unix_ms = 3;
+}
+
+message PrepareInstallationArtifactRequest {}
+
+message PrepareInstallationArtifactReply {
+  string authorization_id = 1;
+  string server_endpoint = 2;
+  string domain_name = 3;
+  string ca_certificate = 4;
+  string enrollment_certificate = 5;
+  string enrollment_private_key = 6;
+  string installation_secret = 7;
+  int64 created_at_unix_ms = 8;
 }
 

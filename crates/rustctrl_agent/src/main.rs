@@ -1,12 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use rustctrl_agent::{enroll_or_load, run_agent};
 use rustctrl_core::{AgentConfig, init_logging};
-use rustctrl_protocol::bootstrap::HeartbeatRequest;
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
-
-#[cfg(windows)]
-mod service;
 
 #[derive(Parser)]
 #[command(
@@ -17,12 +14,21 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
 #[derive(Subcommand)]
 enum Command {
     /// Run in the foreground. Also available on Linux for protocol diagnostics.
     Console {
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
+        #[arg(long)]
+        artifact: Option<PathBuf>,
+        #[arg(long, default_value = ".")]
+        target_dir: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        heartbeat_seconds: u64,
         #[arg(long)]
         once: bool,
     },
@@ -32,19 +38,40 @@ enum Command {
         config: PathBuf,
     },
 }
+
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Console { config, once } => {
+        Command::Console {
+            config,
+            artifact,
+            target_dir,
+            name,
+            heartbeat_seconds,
+            once,
+        } => {
             init_logging();
-            let config = AgentConfig::load(&config)?;
             tokio::runtime::Runtime::new()?.block_on(async move {
+                let agent_config = match (config, artifact) {
+                    (Some(cfg_path), _) => AgentConfig::load(&cfg_path)?,
+                    (None, Some(art_path)) => {
+                        enroll_or_load(&art_path, &target_dir, name, heartbeat_seconds).await?
+                    }
+                    (None, None) => {
+                        let default_cfg = target_dir.join("config.toml");
+                        if default_cfg.exists() {
+                            AgentConfig::load(&default_cfg)?
+                        } else {
+                            anyhow::bail!("either --config or --artifact must be specified");
+                        }
+                    }
+                };
                 let stop = CancellationToken::new();
                 let signal = stop.clone();
                 tokio::spawn(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     signal.cancel();
                 });
-                run_agent(config, stop, once).await
+                run_agent(agent_config, stop, once).await
             })
         }
         Command::Service { config } => {
@@ -52,7 +79,7 @@ fn main() -> Result<()> {
             {
                 let config = AgentConfig::load(&config)?;
                 rustctrl_core::init_file_logging(&config.log_file)?;
-                service::dispatch(config)
+                rustctrl_agent::service::dispatch(config)
             }
             #[cfg(not(windows))]
             {
@@ -62,54 +89,5 @@ fn main() -> Result<()> {
                 )
             }
         }
-    }
-}
-
-pub(crate) async fn run_agent(
-    config: AgentConfig,
-    stop: CancellationToken,
-    once: bool,
-) -> Result<()> {
-    let mut retry_seconds = 1_u64;
-    loop {
-        let attempt: Result<()> = async {
-            let mut client = tokio::select! {
-                _ = stop.cancelled() => return Ok(()),
-                result = rustctrl_network::connect(&config.server) => result?,
-            };
-            let mut interval = tokio::time::interval(Duration::from_secs(config.heartbeat_seconds));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = stop.cancelled() => return Ok(()),
-                    _ = interval.tick() => {}
-                }
-                let heartbeat = HeartbeatRequest {
-                    device_id: config.device_id.to_string(), name: config.name.clone(),
-                    agent_version: env!("CARGO_PKG_VERSION").into(),
-                };
-                let reply = tokio::select! {
-                    _ = stop.cancelled() => return Ok(()),
-                    result = client.send_heartbeat(heartbeat) => result?.into_inner(),
-                };
-                tracing::info!(device_id = %config.device_id, received_at = reply.received_at_unix_ms, "heartbeat acknowledged");
-                retry_seconds = 1;
-                if once { return Ok(()); }
-            }
-        }.await;
-        if stop.is_cancelled() {
-            return Ok(());
-        }
-        if once {
-            return attempt;
-        }
-        if let Err(error) = attempt {
-            tracing::warn!(%error, retry_seconds, "agent connection interrupted");
-        }
-        tokio::select! {
-            _ = stop.cancelled() => return Ok(()),
-            _ = tokio::time::sleep(Duration::from_secs(retry_seconds)) => {}
-        }
-        retry_seconds = (retry_seconds * 2).min(60);
     }
 }

@@ -64,6 +64,7 @@ impl RunningServer {
                 remembered_lifetime_secs: lifetime_secs,
             },
             fleet: Default::default(),
+            enrollment: Default::default(),
         };
         let stop = CancellationToken::new();
         let signal = stop.clone();

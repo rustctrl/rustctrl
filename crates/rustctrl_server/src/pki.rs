@@ -44,7 +44,7 @@ pub fn initialize(options: &PkiOptions) -> Result<()> {
         private_dir(dir)?;
     }
     let mut ca_params = params("RustCtrl local CA", true);
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     ca_params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::CrlSign,
@@ -73,6 +73,31 @@ pub fn initialize(options: &PkiOptions) -> Result<()> {
     issue(&server_dir, server_params, &ca)?;
     let health_dir = server_dir.join("health");
     issue_client(&health_dir, "health.rustctrl.internal", &ca)?;
+
+    let enrollment_dir = server_dir.join("enrollment");
+    issue_client(&enrollment_dir, "enrollment.rustctrl.internal", &ca)?;
+
+    let agent_ca_dir = server_dir.join("agent-ca");
+    private_dir(&agent_ca_dir)?;
+    let mut agent_ca_params = params("RustCtrl Agent Issuing CA", true);
+    agent_ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    agent_ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let agent_ca_key = KeyPair::generate()?;
+    let agent_ca_cert = agent_ca_params.signed_by(&agent_ca_key, &ca)?;
+    write_new(
+        &agent_ca_dir.join("cert.pem"),
+        agent_ca_cert.pem().as_bytes(),
+    )?;
+    write_new(
+        &agent_ca_dir.join("key.pem"),
+        agent_ca_key.serialize_pem().as_bytes(),
+    )?;
+    write_new(&agent_ca_dir.join("ca.pem"), ca.pem().as_bytes())?;
+
     let clients = options.output.join("clients");
     let controller_dir = clients.join("controller");
     let agent_dir = clients.join("agent");
@@ -91,10 +116,16 @@ pub fn initialize(options: &PkiOptions) -> Result<()> {
     write_new(&agent_dir.join("config.toml"), agent.as_bytes())?;
     let server_path = server_dir.canonicalize()?;
     let native_config = format!(
-        "listen = \"127.0.0.1:9876\"\ndatabase = \"../rustctrl.db\"\n\n[tls]\ncertificate = {}\nprivate_key = {}\nclient_ca = {}\n",
+        "listen = \"127.0.0.1:9876\"\ndatabase = \"../rustctrl.db\"\n\n[tls]\ncertificate = {}\nprivate_key = {}\nclient_ca = {}\n\n[enrollment]\nserver_endpoint = {}\ndomain_name = {}\nagent_issuer_certificate = {}\nagent_issuer_private_key = {}\nenrollment_certificate = {}\nenrollment_private_key = {}\n",
         quoted(&server_path.join("cert.pem").to_string_lossy()),
         quoted(&server_path.join("key.pem").to_string_lossy()),
-        quoted(&server_path.join("ca.pem").to_string_lossy())
+        quoted(&server_path.join("ca.pem").to_string_lossy()),
+        quoted(&options.endpoint),
+        quoted(&options.domain_name),
+        quoted(&server_path.join("agent-ca/cert.pem").to_string_lossy()),
+        quoted(&server_path.join("agent-ca/key.pem").to_string_lossy()),
+        quoted(&server_path.join("enrollment/cert.pem").to_string_lossy()),
+        quoted(&server_path.join("enrollment/key.pem").to_string_lossy())
     );
     write_new(
         &options.output.join("server.toml"),

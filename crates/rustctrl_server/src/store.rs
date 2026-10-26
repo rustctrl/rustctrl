@@ -137,6 +137,22 @@ pub struct DeviceReplacementRecord {
     pub replaced_by: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallationAuthorizationRecord {
+    pub authorization_id: String,
+    pub secret_hash: String,
+    pub created_at_unix_ms: i64,
+    pub created_by: String,
+    pub revoked_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEnrollmentRecord {
+    pub device_id: String,
+    pub authorization_id: String,
+    pub enrolled_at_unix_ms: i64,
+}
+
 #[derive(Clone)]
 pub struct DeviceStore(Arc<Mutex<Connection>>);
 
@@ -210,6 +226,20 @@ impl DeviceStore {
                 replacement_device_id TEXT NOT NULL,
                 replaced_at_unix_ms INTEGER NOT NULL,
                 replaced_by TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS installation_authorizations (
+                authorization_id TEXT PRIMARY KEY,
+                secret_hash TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                created_by TEXT NOT NULL,
+                revoked_at_unix_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_installation_authorizations_secret_hash ON installation_authorizations(secret_hash);
+            CREATE TABLE IF NOT EXISTS device_enrollments (
+                device_id TEXT PRIMARY KEY,
+                authorization_id TEXT NOT NULL,
+                enrolled_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(authorization_id) REFERENCES installation_authorizations(authorization_id)
             );",
         )?;
         // Existing databases predate account deactivation, remembered-session
@@ -1735,6 +1765,214 @@ impl DeviceStore {
         })
         .await?
     }
+
+    pub async fn create_installation_authorization(
+        &self,
+        authorization_id: String,
+        secret_hash: String,
+        created_by: String,
+    ) -> Result<InstallationAuthorizationRecord> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            connection.execute(
+                "INSERT INTO installation_authorizations (authorization_id, secret_hash, created_at_unix_ms, created_by, revoked_at_unix_ms) VALUES (?1, ?2, ?3, ?4, NULL)",
+                params![authorization_id, secret_hash, now, created_by],
+            )?;
+            Ok(InstallationAuthorizationRecord {
+                authorization_id,
+                secret_hash,
+                created_at_unix_ms: now,
+                created_by,
+                revoked_at_unix_ms: None,
+            })
+        })
+        .await?
+    }
+
+    pub async fn get_installation_authorization(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<InstallationAuthorizationRecord>> {
+        let store = self.clone();
+        let authorization_id = authorization_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let mut stmt = connection.prepare(
+                "SELECT authorization_id, secret_hash, created_at_unix_ms, created_by, revoked_at_unix_ms FROM installation_authorizations WHERE authorization_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![authorization_id])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(InstallationAuthorizationRecord {
+                    authorization_id: row.get(0)?,
+                    secret_hash: row.get(1)?,
+                    created_at_unix_ms: row.get(2)?,
+                    created_by: row.get(3)?,
+                    revoked_at_unix_ms: row.get(4)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
+    }
+
+    pub async fn find_installation_authorization_by_hash(
+        &self,
+        secret_hash: &str,
+    ) -> Result<Option<InstallationAuthorizationRecord>> {
+        let store = self.clone();
+        let secret_hash = secret_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let mut stmt = connection.prepare(
+                "SELECT authorization_id, secret_hash, created_at_unix_ms, created_by, revoked_at_unix_ms FROM installation_authorizations WHERE secret_hash = ?1",
+            )?;
+            let mut rows = stmt.query(params![secret_hash])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(InstallationAuthorizationRecord {
+                    authorization_id: row.get(0)?,
+                    secret_hash: row.get(1)?,
+                    created_at_unix_ms: row.get(2)?,
+                    created_by: row.get(3)?,
+                    revoked_at_unix_ms: row.get(4)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
+    }
+
+    pub async fn revoke_installation_authorization(&self, authorization_id: &str) -> Result<bool> {
+        let store = self.clone();
+        let authorization_id = authorization_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let changed = connection.execute(
+                "UPDATE installation_authorizations SET revoked_at_unix_ms = ?1 WHERE authorization_id = ?2 AND revoked_at_unix_ms IS NULL",
+                params![now, authorization_id],
+            )?;
+            Ok(changed > 0)
+        })
+        .await?
+    }
+
+    pub async fn record_device_enrollment(
+        &self,
+        device_id: DeviceId,
+        authorization_id: String,
+        name: String,
+        agent_version: String,
+        remote_address: Option<String>,
+    ) -> Result<i64> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let now = current_time_ms()?;
+            let tx = connection.transaction()?;
+
+            let is_replaced: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM device_replacements WHERE prior_device_id = ?1",
+                params![device_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if is_replaced > 0 {
+                anyhow::bail!("device '{}' has been replaced", device_id);
+            }
+
+            let is_blocked: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM blocked_devices WHERE device_id = ?1",
+                params![device_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if is_blocked > 0 {
+                anyhow::bail!("device '{}' is blocked", device_id);
+            }
+
+            let is_revoked: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT revoked_at_unix_ms FROM installation_authorizations WHERE authorization_id = ?1",
+                    params![authorization_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match is_revoked {
+                None => anyhow::bail!("installation authorization not found"),
+                Some(Some(_)) => anyhow::bail!("installation authorization has been revoked"),
+                Some(None) => {}
+            }
+
+            let is_enrolled: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM device_enrollments WHERE device_id = ?1",
+                params![device_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if is_enrolled > 0 {
+                anyhow::bail!("device '{}' is already enrolled", device_id);
+            }
+
+            tx.execute(
+                "INSERT INTO device_enrollments (device_id, authorization_id, enrolled_at_unix_ms) VALUES (?1, ?2, ?3)",
+                params![device_id.to_string(), authorization_id, now],
+            )?;
+
+            tx.execute(
+                "INSERT INTO bootstrap_devices (device_id, name, agent_version, last_address, last_seen_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(device_id) DO UPDATE SET name = excluded.name, agent_version = excluded.agent_version, last_address = excluded.last_address, last_seen_unix_ms = excluded.last_seen_unix_ms",
+                params![device_id.to_string(), name, agent_version, remote_address, now],
+            )?;
+
+            tx.commit()?;
+            Ok(now)
+        })
+        .await?
+    }
+
+    pub async fn get_device_enrollment(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<DeviceEnrollmentRecord>> {
+        let store = self.clone();
+        let device_id = device_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let mut stmt = connection.prepare(
+                "SELECT device_id, authorization_id, enrolled_at_unix_ms FROM device_enrollments WHERE device_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![device_id])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(DeviceEnrollmentRecord {
+                    device_id: row.get(0)?,
+                    authorization_id: row.get(1)?,
+                    enrolled_at_unix_ms: row.get(2)?,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
+    }
 }
 
 #[cfg(test)]
@@ -2424,6 +2662,140 @@ mod tests {
             .await
             .unwrap_err();
         assert!(heartbeat_err2.to_string().contains("replaced"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installation_authorization_and_device_enrollment_lifecycle() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("test.db");
+        let store = DeviceStore::open(&db_path)?;
+
+        // 1. Create installation authorization
+        let auth_id = "auth-123";
+        let secret_hash = "hash-abc-def";
+        let auth = store
+            .create_installation_authorization(
+                auth_id.into(),
+                secret_hash.into(),
+                "admin_user".into(),
+            )
+            .await?;
+        assert_eq!(auth.authorization_id, auth_id);
+        assert_eq!(auth.secret_hash, secret_hash);
+        assert_eq!(auth.created_by, "admin_user");
+        assert!(auth.revoked_at_unix_ms.is_none());
+
+        // 2. Query authorization by ID and by hash
+        let found = store
+            .get_installation_authorization(auth_id)
+            .await?
+            .expect("should find by id");
+        assert_eq!(found.authorization_id, auth_id);
+
+        let found_hash = store
+            .find_installation_authorization_by_hash(secret_hash)
+            .await?
+            .expect("should find by hash");
+        assert_eq!(found_hash.authorization_id, auth_id);
+
+        // 3. Enroll device 1
+        let dev1_id = DeviceId::new();
+        store
+            .record_device_enrollment(
+                dev1_id,
+                auth_id.into(),
+                "Dev 1".into(),
+                "0.1.0".into(),
+                Some("10.0.0.1".into()),
+            )
+            .await?;
+
+        let dev1_rec = store
+            .get_device(&dev1_id.to_string())
+            .await?
+            .expect("dev1 must exist");
+        assert_eq!(dev1_rec.name, "Dev 1");
+        assert_eq!(dev1_rec.last_address.as_deref(), Some("10.0.0.1"));
+
+        let dev1_enroll = store
+            .get_device_enrollment(&dev1_id.to_string())
+            .await?
+            .expect("dev1 enrollment must exist");
+        assert_eq!(dev1_enroll.device_id, dev1_id.to_string());
+        assert_eq!(dev1_enroll.authorization_id, auth_id);
+
+        // 4. Enroll device 2 under same authorization
+        let dev2_id = DeviceId::new();
+        store
+            .record_device_enrollment(
+                dev2_id,
+                auth_id.into(),
+                "Dev 2".into(),
+                "0.1.0".into(),
+                Some("10.0.0.2".into()),
+            )
+            .await?;
+        let dev2_rec = store
+            .get_device(&dev2_id.to_string())
+            .await?
+            .expect("dev2 must exist");
+        assert_eq!(dev2_rec.name, "Dev 2");
+
+        // 5. Re-enrolling already enrolled device fails
+        let re_enroll_err = store
+            .record_device_enrollment(
+                dev1_id,
+                auth_id.into(),
+                "Dev 1 Renamed".into(),
+                "0.1.1".into(),
+                Some("10.0.0.1".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(re_enroll_err.to_string().contains("already enrolled"));
+
+        // 6. Persistence across restart
+        drop(store);
+        let store2 = DeviceStore::open(&db_path)?;
+
+        let auth_persisted = store2
+            .get_installation_authorization(auth_id)
+            .await?
+            .expect("auth must persist");
+        assert_eq!(auth_persisted.authorization_id, auth_id);
+        assert!(auth_persisted.revoked_at_unix_ms.is_none());
+
+        let dev1_persisted = store2
+            .get_device(&dev1_id.to_string())
+            .await?
+            .expect("dev1 must persist");
+        assert_eq!(dev1_persisted.name, "Dev 1");
+
+        // 7. Revoke authorization
+        let revoked = store2.revoke_installation_authorization(auth_id).await?;
+        assert!(revoked);
+
+        let auth_revoked = store2
+            .get_installation_authorization(auth_id)
+            .await?
+            .expect("auth must exist");
+        assert!(auth_revoked.revoked_at_unix_ms.is_some());
+
+        // 8. Enrolling new device with revoked authorization fails
+        let dev3_id = DeviceId::new();
+        let enroll_err = store2
+            .record_device_enrollment(
+                dev3_id,
+                auth_id.into(),
+                "Dev 3".into(),
+                "0.1.0".into(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(enroll_err.to_string().contains("revoked"));
 
         Ok(())
     }

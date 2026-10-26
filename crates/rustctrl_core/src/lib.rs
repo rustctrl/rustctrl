@@ -122,6 +122,48 @@ impl AgentConfig {
     }
 }
 
+/// A deployment-specific installation artifact prepared by an Admin through the Controller.
+///
+/// Contains the server configuration, public trust material, an enrollment TLS credential,
+/// and an Installation Authorization secret token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstallationArtifact {
+    pub server_endpoint: String,
+    pub domain_name: String,
+    pub ca_certificate: String,
+    pub enrollment_certificate: String,
+    pub enrollment_private_key: String,
+    pub authorization_id: String,
+    pub installation_secret: String,
+    pub created_at_unix_ms: i64,
+}
+
+impl AgentInstallationArtifact {
+    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        let content =
+            toml::to_string_pretty(self).context("serialize installation artifact to toml")?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, content.as_bytes())
+            .with_context(|| format!("write installation artifact to {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    pub fn load_from_file(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("read installation artifact from {}", path.display()))?;
+        toml::from_str::<Self>(&content)
+            .with_context(|| format!("parse installation artifact from {}", path.display()))
+    }
+}
+
 pub fn read_config<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let body = fs::read_to_string(path)
         .with_context(|| format!("read configuration {}", path.display()))?;
