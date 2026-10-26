@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use rustctrl_core::DeviceId;
 use std::{
     path::Path,
@@ -129,6 +129,14 @@ pub struct TargetRecord {
     pub updated_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceReplacementRecord {
+    pub prior_device_id: String,
+    pub replacement_device_id: String,
+    pub replaced_at_unix_ms: i64,
+    pub replaced_by: String,
+}
+
 #[derive(Clone)]
 pub struct DeviceStore(Arc<Mutex<Connection>>);
 
@@ -196,6 +204,12 @@ impl DeviceStore {
                 device_id TEXT PRIMARY KEY,
                 blocked_at_unix_ms INTEGER NOT NULL,
                 blocked_by TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS device_replacements (
+                prior_device_id TEXT PRIMARY KEY,
+                replacement_device_id TEXT NOT NULL,
+                replaced_at_unix_ms INTEGER NOT NULL,
+                replaced_by TEXT NOT NULL
             );",
         )?;
         // Existing databases predate account deactivation, remembered-session
@@ -246,6 +260,14 @@ impl DeviceStore {
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let is_replaced: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM device_replacements WHERE prior_device_id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )?;
+            if is_replaced > 0 {
+                anyhow::bail!("device '{}' has been replaced", id);
+            }
             let is_blocked: i64 = connection.query_row(
                 "SELECT COUNT(*) FROM blocked_devices WHERE device_id = ?1",
                 params![id.to_string()],
@@ -637,6 +659,245 @@ impl DeviceStore {
             tx.commit()?;
 
             Ok(device_id)
+        })
+        .await?
+    }
+
+    pub async fn replace_device(
+        &self,
+        prior_device_id: &str,
+        replacement_device_id: &str,
+        replaced_by: &str,
+    ) -> Result<DeviceRecord> {
+        let prior_device_id = prior_device_id.trim();
+        let _: DeviceId = prior_device_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid prior_device_id"))?;
+        let replacement_device_id = replacement_device_id.trim();
+        let _: DeviceId = replacement_device_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid replacement_device_id"))?;
+        anyhow::ensure!(
+            prior_device_id != replacement_device_id,
+            "prior and replacement device identities must be different"
+        );
+        let replaced_by = replaced_by.trim();
+        anyhow::ensure!(!replaced_by.is_empty(), "replaced_by cannot be empty");
+
+        let store = self.clone();
+        let prior_device_id = prior_device_id.to_string();
+        let replacement_device_id = replacement_device_id.to_string();
+        let replaced_by = replaced_by.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+
+            // 1. Check if either is a connection target
+            let prior_is_target: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM connection_targets WHERE target_id = ?1",
+                params![prior_device_id],
+                |row| row.get(0),
+            )?;
+            if prior_is_target > 0 {
+                anyhow::bail!(
+                    "prior device '{prior_device_id}' is a connection target; replacement applies only to Windows fleet devices"
+                );
+            }
+            let replacement_is_target: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM connection_targets WHERE target_id = ?1",
+                params![replacement_device_id],
+                |row| row.get(0),
+            )?;
+            if replacement_is_target > 0 {
+                anyhow::bail!(
+                    "replacement device '{replacement_device_id}' is a connection target; replacement applies only to Windows fleet devices"
+                );
+            }
+
+            // 2. Check prior device existence in bootstrap_devices
+            let prior_exists: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM bootstrap_devices WHERE device_id = ?1",
+                params![prior_device_id],
+                |row| row.get(0),
+            )?;
+            if prior_exists == 0 {
+                let was_replaced: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM device_replacements WHERE prior_device_id = ?1",
+                    params![prior_device_id],
+                    |row| row.get(0),
+                )?;
+                if was_replaced > 0 {
+                    anyhow::bail!("prior device '{prior_device_id}' has already been replaced");
+                }
+                anyhow::bail!("prior device '{prior_device_id}' not found");
+            }
+
+            // 3. Check replacement device existence in bootstrap_devices
+            let replacement_exists: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM bootstrap_devices WHERE device_id = ?1",
+                params![replacement_device_id],
+                |row| row.get(0),
+            )?;
+            if replacement_exists == 0 {
+                let was_replaced: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM device_replacements WHERE prior_device_id = ?1",
+                    params![replacement_device_id],
+                    |row| row.get(0),
+                )?;
+                if was_replaced > 0 {
+                    anyhow::bail!(
+                        "replacement device '{replacement_device_id}' has already been replaced"
+                    );
+                }
+                anyhow::bail!("replacement device '{replacement_device_id}' not found");
+            }
+
+            // 4. Ensure replacement has not been recorded as already replaced
+            let replacement_was_replaced: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM device_replacements WHERE prior_device_id = ?1",
+                params![replacement_device_id],
+                |row| row.get(0),
+            )?;
+            if replacement_was_replaced > 0 {
+                anyhow::bail!(
+                    "replacement device '{replacement_device_id}' has already been replaced"
+                );
+            }
+
+            // 5. Read prior's curated metadata or bootstrap name
+            let (prior_display_name, prior_location): (String, Option<String>) = match connection
+                .query_row(
+                    "SELECT display_name, location FROM device_metadata WHERE device_id = ?1",
+                    params![prior_device_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ) {
+                Ok((name, loc)) => (name, loc),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    let name: String = connection.query_row(
+                        "SELECT name FROM bootstrap_devices WHERE device_id = ?1",
+                        params![prior_device_id],
+                        |row| row.get(0),
+                    )?;
+                    (name, None)
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            // 6. Check if prior is blocked
+            let prior_block: Option<(i64, String)> = connection
+                .query_row(
+                    "SELECT blocked_at_unix_ms, blocked_by FROM blocked_devices WHERE device_id = ?1",
+                    params![prior_device_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+
+            // 7. Atomic transaction
+            let tx = connection.transaction()?;
+
+            // Transfer curated metadata to replacement device
+            tx.execute(
+                "INSERT INTO device_metadata (device_id, display_name, location, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                     display_name = excluded.display_name,
+                     location = excluded.location,
+                     updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![
+                    replacement_device_id,
+                    prior_display_name,
+                    prior_location,
+                    now
+                ],
+            )?;
+
+            // If prior was blocked, preserve the block on replacement device
+            if let Some((blocked_at, blocked_by)) = prior_block {
+                tx.execute(
+                    "INSERT INTO blocked_devices (device_id, blocked_at_unix_ms, blocked_by)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(device_id) DO NOTHING",
+                    params![replacement_device_id, blocked_at, blocked_by],
+                )?;
+            }
+
+            // Record replacement association
+            tx.execute(
+                "INSERT INTO device_replacements (prior_device_id, replacement_device_id, replaced_at_unix_ms, replaced_by)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![prior_device_id, replacement_device_id, now, replaced_by],
+            )?;
+
+            // Remove prior from device_metadata and bootstrap_devices (reconciling inventory)
+            tx.execute(
+                "DELETE FROM device_metadata WHERE device_id = ?1",
+                params![prior_device_id],
+            )?;
+            tx.execute(
+                "DELETE FROM bootstrap_devices WHERE device_id = ?1",
+                params![prior_device_id],
+            )?;
+
+            tx.commit()?;
+
+            // Fetch and return the reconciled replacement DeviceRecord
+            let record = connection.query_row(
+                "SELECT b.device_id, COALESCE(m.display_name, b.name), b.agent_version, b.last_address, b.last_seen_unix_ms, m.location, 'windows', NULL, CASE WHEN bl.device_id IS NOT NULL THEN 1 ELSE 0 END
+                 FROM bootstrap_devices b
+                 LEFT JOIN device_metadata m ON b.device_id = m.device_id
+                 LEFT JOIN blocked_devices bl ON b.device_id = bl.device_id
+                 WHERE b.device_id = ?1",
+                params![replacement_device_id],
+                |row| {
+                    Ok(DeviceRecord {
+                        device_id: row.get(0)?,
+                        name: row.get(1)?,
+                        agent_version: row.get(2)?,
+                        last_address: row.get(3)?,
+                        last_seen_unix_ms: row.get(4)?,
+                        location: row.get(5)?,
+                        device_type: row.get(6)?,
+                        configured_address: row.get(7)?,
+                        blocked: row.get::<_, i64>(8)? != 0,
+                    })
+                },
+            )?;
+
+            Ok(record)
+        })
+        .await?
+    }
+
+    pub async fn get_device_replacement(
+        &self,
+        prior_device_id: &str,
+    ) -> Result<Option<DeviceReplacementRecord>> {
+        let prior_device_id = prior_device_id.trim().to_string();
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let mut stmt = connection.prepare(
+                "SELECT prior_device_id, replacement_device_id, replaced_at_unix_ms, replaced_by
+                 FROM device_replacements WHERE prior_device_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![prior_device_id])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(DeviceReplacementRecord {
+                    prior_device_id: row.get(0)?,
+                    replacement_device_id: row.get(1)?,
+                    replaced_at_unix_ms: row.get(2)?,
+                    replaced_by: row.get(3)?,
+                }))
+            } else {
+                Ok(None)
+            }
         })
         .await?
     }
@@ -1914,6 +2175,255 @@ mod tests {
                 .any(|a| a.detail.contains(&dev_id.to_string()) && a.action == "test_action"),
             "historical activity attribution must be preserved after cleanup and restoration"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_device_reconciles_inventory_transfers_metadata_preserves_blocks_and_association()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("store.db");
+        let store = DeviceStore::open(&db_path)?;
+        let prior_id = DeviceId::new();
+        let replacement_id = DeviceId::new();
+
+        // 1. Invalid prior or replacement device ID fails.
+        let invalid_err = store
+            .replace_device("not-a-uuid", &replacement_id.to_string(), "alice")
+            .await
+            .unwrap_err();
+        assert!(invalid_err.to_string().contains("invalid prior_device_id"));
+
+        let invalid_rep_err = store
+            .replace_device(&prior_id.to_string(), "not-a-uuid", "alice")
+            .await
+            .unwrap_err();
+        assert!(
+            invalid_rep_err
+                .to_string()
+                .contains("invalid replacement_device_id")
+        );
+
+        // 2. Same device ID fails.
+        let same_err = store
+            .replace_device(&prior_id.to_string(), &prior_id.to_string(), "alice")
+            .await
+            .unwrap_err();
+        assert!(same_err.to_string().contains("must be different"));
+
+        // 3. Non-existent prior or replacement fails.
+        let not_found_prior = store
+            .replace_device(&prior_id.to_string(), &replacement_id.to_string(), "alice")
+            .await
+            .unwrap_err();
+        assert!(
+            not_found_prior.to_string().contains("prior device")
+                && not_found_prior.to_string().contains("not found")
+        );
+
+        // Register prior device.
+        store
+            .heartbeat(
+                prior_id,
+                "OLD-HOSTNAME".into(),
+                "1.0.0".into(),
+                Some("192.168.1.50:5000".into()),
+            )
+            .await?;
+        store
+            .update_device_metadata(
+                &prior_id.to_string(),
+                "Reception PC",
+                Some("Floor 1 Reception"),
+            )
+            .await?;
+
+        // Prior device has audit history.
+        store
+            .record_activity(
+                "alice".into(),
+                "update_fleet_device".into(),
+                "success".into(),
+                format!("updated device '{prior_id}' display name"),
+            )
+            .await?;
+
+        let not_found_rep = store
+            .replace_device(&prior_id.to_string(), &replacement_id.to_string(), "alice")
+            .await
+            .unwrap_err();
+        assert!(
+            not_found_rep.to_string().contains("replacement device")
+                && not_found_rep.to_string().contains("not found")
+        );
+
+        // 4. Connection target cannot be replaced or used as replacement.
+        let target = store
+            .create_target("Lobby TV", "192.168.1.60:5555", Some("android_tv"), None)
+            .await?;
+        let target_prior_err = store
+            .replace_device(&target.target_id, &replacement_id.to_string(), "alice")
+            .await
+            .unwrap_err();
+        assert!(target_prior_err.to_string().contains("connection target"));
+
+        // Register replacement device with same hostname/address as the reinstalled machine.
+        store
+            .heartbeat(
+                replacement_id,
+                "OLD-HOSTNAME".into(),
+                "1.0.0".into(),
+                Some("192.168.1.50:5000".into()),
+            )
+            .await?;
+
+        let target_rep_err = store
+            .replace_device(&prior_id.to_string(), &target.target_id, "alice")
+            .await
+            .unwrap_err();
+        assert!(target_rep_err.to_string().contains("connection target"));
+
+        // 5. Block prior device to test that block is preserved across replacement.
+        store.block_device(&prior_id.to_string(), "alice").await?;
+
+        // Both devices currently exist distinctly before replacement (no auto-merge).
+        let list_before = store.list_devices().await?;
+        assert_eq!(
+            list_before
+                .iter()
+                .filter(|d| d.device_id == prior_id.to_string()
+                    || d.device_id == replacement_id.to_string())
+                .count(),
+            2,
+            "both prior and replacement devices must exist distinctly before replacement"
+        );
+
+        // 6. Explicit replacement.
+        let reconciled = store
+            .replace_device(&prior_id.to_string(), &replacement_id.to_string(), "alice")
+            .await?;
+        assert_eq!(reconciled.device_id, replacement_id.to_string());
+        assert_eq!(
+            reconciled.name, "Reception PC",
+            "curated display name must transfer to replacement"
+        );
+        assert_eq!(
+            reconciled.location.as_deref(),
+            Some("Floor 1 Reception"),
+            "location must transfer"
+        );
+        assert!(
+            reconciled.blocked,
+            "block must be preserved on replacement device"
+        );
+
+        // 7. Prior device is removed from visible inventory, replacement is present.
+        assert!(store.get_device(&prior_id.to_string()).await?.is_none());
+        let list_after = store.list_devices().await?;
+        assert!(
+            !list_after
+                .iter()
+                .any(|d| d.device_id == prior_id.to_string()),
+            "prior device must not appear in list_devices"
+        );
+        let rep_in_list = list_after
+            .iter()
+            .find(|d| d.device_id == replacement_id.to_string())
+            .expect("replacement device must be in list_devices");
+        assert_eq!(rep_in_list.name, "Reception PC");
+        assert!(rep_in_list.blocked);
+
+        // 8. Replaced prior device cannot reconnect/send heartbeat.
+        let heartbeat_err = store
+            .heartbeat(
+                prior_id,
+                "OLD-HOSTNAME".into(),
+                "1.0.0".into(),
+                Some("192.168.1.50:5000".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            heartbeat_err.to_string().contains("replaced"),
+            "replaced prior device must not be able to heartbeat: {heartbeat_err}"
+        );
+
+        // 9. Association is preserved and queryable.
+        let repl_record = store
+            .get_device_replacement(&prior_id.to_string())
+            .await?
+            .expect("replacement association must exist");
+        assert_eq!(repl_record.prior_device_id, prior_id.to_string());
+        assert_eq!(
+            repl_record.replacement_device_id,
+            replacement_id.to_string()
+        );
+        assert_eq!(repl_record.replaced_by, "alice");
+
+        // 10. Replaced device cannot be replaced again.
+        let already_repl_err = store
+            .replace_device(&prior_id.to_string(), &replacement_id.to_string(), "alice")
+            .await
+            .unwrap_err();
+        assert!(
+            already_repl_err
+                .to_string()
+                .contains("already been replaced")
+                || already_repl_err.to_string().contains("not found")
+        );
+
+        // 11. Historical activity attribution is not rewritten.
+        let activities = store.list_activity().await?;
+        assert!(
+            activities
+                .iter()
+                .any(|a| a.detail.contains(&prior_id.to_string())
+                    && a.action == "update_fleet_device"),
+            "past activity must retain prior_device_id attribution"
+        );
+        assert!(
+            !activities
+                .iter()
+                .any(|a| a.detail.contains(&replacement_id.to_string())
+                    && a.action == "update_fleet_device"),
+            "past activity must not be rewritten to replacement_device_id"
+        );
+
+        // 12. Result and association persist across Server restart.
+        drop(store);
+        let store2 = DeviceStore::open(&db_path)?;
+
+        assert!(store2.get_device(&prior_id.to_string()).await?.is_none());
+        let rep_restarted = store2
+            .get_device(&replacement_id.to_string())
+            .await?
+            .expect("replacement device must persist");
+        assert_eq!(rep_restarted.name, "Reception PC");
+        assert_eq!(rep_restarted.location.as_deref(), Some("Floor 1 Reception"));
+        assert!(rep_restarted.blocked);
+
+        let repl_persisted = store2
+            .get_device_replacement(&prior_id.to_string())
+            .await?
+            .expect("replacement association must persist across restart");
+        assert_eq!(repl_persisted.prior_device_id, prior_id.to_string());
+        assert_eq!(
+            repl_persisted.replacement_device_id,
+            replacement_id.to_string()
+        );
+        assert_eq!(repl_persisted.replaced_by, "alice");
+
+        let heartbeat_err2 = store2
+            .heartbeat(
+                prior_id,
+                "OLD-HOSTNAME".into(),
+                "1.0.0".into(),
+                Some("192.168.1.50:5000".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(heartbeat_err2.to_string().contains("replaced"));
 
         Ok(())
     }

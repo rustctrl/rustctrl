@@ -5,8 +5,9 @@ use rustctrl_protocol::auth::{
     BlockDeviceRequest, ChangeOwnPasswordRequest, ChangeStaffRoleRequest,
     CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
     DeactivateStaffAccountRequest, ListFleetDevicesRequest, ListStaffAccountsRequest, LoginRequest,
-    LogoutRequest, RemoveTargetRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest,
-    StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
+    LogoutRequest, RemoveTargetRequest, ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest,
+    ResetStaffPasswordRequest, StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest,
+    UpdateTargetRequest,
 };
 use rustctrl_protocol::bootstrap::HealthRequest;
 use std::path::PathBuf;
@@ -143,6 +144,16 @@ enum Command {
         password: String,
         #[arg(long)]
         device_id: String,
+    },
+    ReplaceDevice {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        prior_device_id: String,
+        #[arg(long)]
+        replacement_device_id: String,
     },
     AddTarget {
         #[arg(long)]
@@ -796,6 +807,54 @@ fn main() -> Result<()> {
                 );
                 let reply = client.clean_offline_device(req).await?.into_inner();
                 println!("Cleaned offline device {}", reply.device_id);
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
+        Command::ReplaceDevice {
+            username,
+            password,
+            prior_device_id,
+            replacement_device_id,
+        } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest {
+                        username,
+                        password,
+                        remember: false,
+                    })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!("temporary password must be replaced before replacing device");
+                }
+                let mut req = tonic::Request::new(ReplaceFleetDeviceRequest {
+                    prior_device_id: prior_device_id.clone(),
+                    replacement_device_id: replacement_device_id.clone(),
+                });
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client.replace_fleet_device(req).await?.into_inner();
+                if let Some(device) = reply.device {
+                    println!(
+                        "Replaced device {} with {}: name={} status={}",
+                        prior_device_id, replacement_device_id, device.display_name, device.status
+                    );
+                } else {
+                    println!(
+                        "Replaced device {} with {}",
+                        prior_device_id, replacement_device_id
+                    );
+                }
                 let mut logout_req = tonic::Request::new(LogoutRequest {});
                 logout_req.metadata_mut().insert(
                     "authorization",
