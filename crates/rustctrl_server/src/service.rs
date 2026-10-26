@@ -6,8 +6,9 @@ use anyhow::{Context, Result};
 use rustctrl_core::DeviceId;
 use rustctrl_protocol::auth::{
     BlockDeviceReply, BlockDeviceRequest, ChangeOwnPasswordReply, ChangeOwnPasswordRequest,
-    ChangeStaffRoleReply, ChangeStaffRoleRequest, CreateStaffAccountReply,
-    CreateStaffAccountRequest, CreateTargetReply, CreateTargetRequest, DeactivateStaffAccountReply,
+    ChangeStaffRoleReply, ChangeStaffRoleRequest, CleanOfflineDeviceReply,
+    CleanOfflineDeviceRequest, CreateStaffAccountReply, CreateStaffAccountRequest,
+    CreateTargetReply, CreateTargetRequest, DeactivateStaffAccountReply,
     DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesReply,
     ListFleetDevicesRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
     LoginRequest, LogoutReply, LogoutRequest, RemoveTargetReply, RemoveTargetRequest,
@@ -919,6 +920,58 @@ impl StaffAuth for StaffAuthService {
                 if err_msg.contains("not found") {
                     Err(Status::not_found(err_msg))
                 } else if err_msg.contains("not blocked") {
+                    Err(Status::failed_precondition(err_msg))
+                } else {
+                    Err(Status::invalid_argument(err_msg))
+                }
+            }
+        }
+    }
+
+    async fn clean_offline_device(
+        &self,
+        request: Request<CleanOfflineDeviceRequest>,
+    ) -> Result<Response<CleanOfflineDeviceReply>, Status> {
+        let body = request.get_ref();
+        let target_device_id = body.device_id.trim().to_string();
+        let session = self
+            .authenticate_admin(&request, "clean_offline_device", Some(&target_device_id))
+            .await?;
+
+        match self
+            .store
+            .clean_offline_device(&target_device_id, self.offline_after_secs)
+            .await
+        {
+            Ok(cleaned_id) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "clean_offline_device".into(),
+                        "success".into(),
+                        format!("cleaned offline device '{target_device_id}'"),
+                    )
+                    .await;
+                Ok(Response::new(CleanOfflineDeviceReply {
+                    success: true,
+                    device_id: cleaned_id,
+                }))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "clean_offline_device".into(),
+                        "rejected".into(),
+                        format!("failed to clean offline device '{target_device_id}': {err_msg}"),
+                    )
+                    .await;
+                if err_msg.contains("not found") {
+                    Err(Status::not_found(err_msg))
+                } else if err_msg.contains("blocked") || err_msg.contains("online") {
                     Err(Status::failed_precondition(err_msg))
                 } else {
                     Err(Status::invalid_argument(err_msg))

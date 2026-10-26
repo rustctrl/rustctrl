@@ -570,6 +570,77 @@ impl DeviceStore {
         .await?
     }
 
+    pub async fn clean_offline_device(
+        &self,
+        device_id: &str,
+        offline_after_secs: u64,
+    ) -> Result<String> {
+        let device_id = device_id.trim();
+        let _: DeviceId = device_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid device_id"))?;
+        let store = self.clone();
+        let device_id = device_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let now = current_time_ms()?;
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+
+            let last_seen_unix_ms: i64 = match connection.query_row(
+                "SELECT last_seen_unix_ms FROM bootstrap_devices WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            ) {
+                Ok(ms) => ms,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    let is_target: i64 = connection.query_row(
+                        "SELECT COUNT(*) FROM connection_targets WHERE target_id = ?1",
+                        params![device_id],
+                        |row| row.get(0),
+                    )?;
+                    if is_target > 0 {
+                        anyhow::bail!(
+                            "device '{device_id}' is a connection target; use remove-target instead"
+                        );
+                    }
+                    anyhow::bail!("device '{device_id}' not found");
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            let is_blocked: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM blocked_devices WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get(0),
+            )?;
+            if is_blocked > 0 {
+                anyhow::bail!("cannot clean up blocked device '{device_id}'");
+            }
+
+            let window_ms =
+                i64::try_from(offline_after_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+            if now.saturating_sub(last_seen_unix_ms) <= window_ms {
+                anyhow::bail!("cannot clean up online device '{device_id}'");
+            }
+
+            let tx = connection.transaction()?;
+            tx.execute(
+                "DELETE FROM device_metadata WHERE device_id = ?1",
+                params![device_id],
+            )?;
+            tx.execute(
+                "DELETE FROM bootstrap_devices WHERE device_id = ?1",
+                params![device_id],
+            )?;
+            tx.commit()?;
+
+            Ok(device_id)
+        })
+        .await?
+    }
+
     pub async fn create_target(
         &self,
         display_name: &str,
@@ -1695,6 +1766,154 @@ mod tests {
             .await
             .unwrap_err();
         assert!(invalid_id_err.to_string().contains("invalid device_id"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clean_offline_device_removes_entry_without_revoking_access_and_preserves_attribution()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("store.db");
+        let store = DeviceStore::open(&db_path)?;
+        let dev_id = DeviceId::new();
+
+        // 1. Invalid device ID fails.
+        let invalid_err = store
+            .clean_offline_device("not-a-uuid", 60)
+            .await
+            .unwrap_err();
+        assert!(invalid_err.to_string().contains("invalid device_id"));
+
+        // 2. Non-existent device fails.
+        let not_found_err = store
+            .clean_offline_device(&dev_id.to_string(), 60)
+            .await
+            .unwrap_err();
+        assert!(not_found_err.to_string().contains("not found"));
+
+        // 3. Connection target cannot be cleaned via clean_offline_device.
+        let target = store
+            .create_target(
+                "Boardroom TV",
+                "192.168.1.50:5555",
+                Some("android_tv"),
+                None,
+            )
+            .await?;
+        let target_clean_err = store
+            .clean_offline_device(&target.target_id, 60)
+            .await
+            .unwrap_err();
+        assert!(
+            target_clean_err.to_string().contains("connection target"),
+            "cleaning a connection target must fail: {target_clean_err}"
+        );
+
+        // 4. Register a Windows device and update metadata.
+        store
+            .heartbeat(
+                dev_id,
+                "WORKSTATION-01".into(),
+                "1.0.0".into(),
+                Some("192.168.1.100:5000".into()),
+            )
+            .await?;
+        store
+            .update_device_metadata(&dev_id.to_string(), "Finance PC", Some("Floor 2"))
+            .await?;
+        store
+            .record_activity(
+                "alice".into(),
+                "test_action".into(),
+                "success".into(),
+                format!("attributed to device '{dev_id}'"),
+            )
+            .await?;
+
+        // 5. Attempting to clean online device fails.
+        let online_clean_err = store
+            .clean_offline_device(&dev_id.to_string(), 60)
+            .await
+            .unwrap_err();
+        assert!(
+            online_clean_err.to_string().contains("online"),
+            "online device must not be cleaned: {online_clean_err}"
+        );
+
+        // 6. Block device: even if offline window is 0, cleaning a blocked device must fail.
+        store.block_device(&dev_id.to_string(), "alice").await?;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let blocked_clean_err = store
+            .clean_offline_device(&dev_id.to_string(), 0)
+            .await
+            .unwrap_err();
+        assert!(
+            blocked_clean_err.to_string().contains("blocked"),
+            "blocked device cannot be cleaned up: {blocked_clean_err}"
+        );
+
+        // 7. Unblock device.
+        store.unblock_device(&dev_id.to_string()).await?;
+
+        // 8. Offline cleanup succeeds with window = 0 after brief sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let cleaned_id = store.clean_offline_device(&dev_id.to_string(), 0).await?;
+        assert_eq!(cleaned_id, dev_id.to_string());
+
+        // 9. Entry is removed from inventory and metadata.
+        assert!(
+            store.get_device(&dev_id.to_string()).await?.is_none(),
+            "cleaned device must not be returned by get_device"
+        );
+        let list_after_clean = store.list_devices().await?;
+        assert!(
+            !list_after_clean
+                .iter()
+                .any(|d| d.device_id == dev_id.to_string()),
+            "cleaned device must not be in list_devices"
+        );
+
+        // 10. Removal persists across store reopen.
+        drop(store);
+        let store2 = DeviceStore::open(&db_path)?;
+        assert!(
+            store2.get_device(&dev_id.to_string()).await?.is_none(),
+            "cleaned device must remain removed across restart"
+        );
+
+        // 11. Still-authorized agent reconnects and restores entry under SAME identity without duplicate.
+        store2
+            .heartbeat(
+                dev_id,
+                "WORKSTATION-01".into(),
+                "1.0.0".into(),
+                Some("192.168.1.105:5000".into()),
+            )
+            .await?;
+        let restored_dev = store2
+            .get_device(&dev_id.to_string())
+            .await?
+            .expect("restored device must exist");
+        assert_eq!(restored_dev.device_id, dev_id.to_string());
+        assert_eq!(restored_dev.name, "WORKSTATION-01");
+        assert!(!restored_dev.blocked);
+
+        let list_restored = store2.list_devices().await?;
+        let matching: Vec<_> = list_restored
+            .iter()
+            .filter(|d| d.device_id == dev_id.to_string())
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one device record must exist");
+
+        // 12. Historical activity attribution remains intact.
+        let activities = store2.list_activity().await?;
+        assert!(
+            activities
+                .iter()
+                .any(|a| a.detail.contains(&dev_id.to_string()) && a.action == "test_action"),
+            "historical activity attribution must be preserved after cleanup and restoration"
+        );
 
         Ok(())
     }
