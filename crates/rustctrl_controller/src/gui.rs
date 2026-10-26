@@ -2168,9 +2168,19 @@ impl ControllerApp {
                     return;
                 }
 
+                let is_matching_form = match &view.overlay {
+                    Overlay::ReplaceDevice {
+                        request_id: current_req_id,
+                        ..
+                    } => *current_req_id == request_id,
+                    _ => false,
+                };
+
                 match res {
                     Ok(Ok(_reply)) => {
-                        view.overlay = Overlay::None;
+                        if is_matching_form {
+                            view.close_overlay(cx);
+                        }
                         if let ScreenState::Connected { notice, .. } = &mut view.state {
                             *notice = Some(format!(
                                 "Replaced device '{prior_label}' with '{replacement_label}'."
@@ -2180,26 +2190,20 @@ impl ControllerApp {
                         }
                     }
                     Ok(Err(err)) => {
-                        if let Overlay::ReplaceDevice {
-                            request_id: current_req_id,
-                            error,
-                            in_flight,
-                            ..
-                        } = &mut view.overlay
-                            && *current_req_id == request_id
+                        if is_matching_form
+                            && let Overlay::ReplaceDevice {
+                                error, in_flight, ..
+                            } = &mut view.overlay
                         {
                             *error = Some(err.to_string());
                             *in_flight = false;
                         }
                     }
                     Err(join_err) => {
-                        if let Overlay::ReplaceDevice {
-                            request_id: current_req_id,
-                            error,
-                            in_flight,
-                            ..
-                        } = &mut view.overlay
-                            && *current_req_id == request_id
+                        if is_matching_form
+                            && let Overlay::ReplaceDevice {
+                                error, in_flight, ..
+                            } = &mut view.overlay
                         {
                             *error = Some(format!("Join error: {join_err}"));
                             *in_flight = false;
@@ -4980,5 +4984,26 @@ mod tests {
             _ => false,
         };
         assert!(!is_diff_prior);
+    }
+
+    #[test]
+    fn replace_device_completion_does_not_close_superseded_or_different_overlay() {
+        let active_overlay = Overlay::AddTarget {
+            request_id: 31,
+            display_name: "Lobby TV".into(),
+            address: "192.168.1.50:5555".into(),
+            location: String::new(),
+            error: None,
+            in_flight: false,
+        };
+
+        let is_matching_form = match &active_overlay {
+            Overlay::ReplaceDevice { request_id, .. } => *request_id == 30,
+            _ => false,
+        };
+        assert!(
+            !is_matching_form,
+            "response from stale replace_device must not match active AddTarget overlay"
+        );
     }
 }
