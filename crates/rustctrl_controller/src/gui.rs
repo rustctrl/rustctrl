@@ -36,6 +36,7 @@ enum ActiveField {
     ReplaceDevicePriorId,
     ReplaceDeviceReplacementId,
     PrepareArtifactOutputPath,
+    PreparePackageAgentBinary,
 }
 
 #[derive(Clone)]
@@ -90,6 +91,7 @@ enum Overlay {
     PrepareInstallationArtifact {
         request_id: u64,
         output_path: String,
+        agent_binary_path: String,
         error: Option<String>,
         in_flight: bool,
         success: Option<String>,
@@ -1245,7 +1247,8 @@ impl ControllerApp {
             let request_id = self.next_prepare_artifact_request_id;
             self.overlay = Overlay::PrepareInstallationArtifact {
                 request_id,
-                output_path: "agent-installation-artifact.toml".to_string(),
+                output_path: "rustctrl-agent-windows.zip".to_string(),
+                agent_binary_path: "rustctrl-agent.exe".to_string(),
                 error: None,
                 in_flight: false,
                 success: None,
@@ -2252,10 +2255,11 @@ impl ControllerApp {
     }
 
     fn submit_prepare_installation_artifact(&mut self, cx: &mut Context<Self>) {
-        let (request_id, session_token, out_path) = match &mut self.overlay {
+        let (request_id, session_token, out_path, agent_bin_path) = match &mut self.overlay {
             Overlay::PrepareInstallationArtifact {
                 request_id,
                 output_path,
+                agent_binary_path,
                 error,
                 in_flight,
                 success,
@@ -2273,7 +2277,12 @@ impl ControllerApp {
                 *in_flight = true;
                 *error = None;
                 *success = None;
-                (*request_id, token, p.to_string())
+                (
+                    *request_id,
+                    token,
+                    p.to_string(),
+                    agent_binary_path.trim().to_string(),
+                )
             }
             _ => return,
         };
@@ -2284,6 +2293,7 @@ impl ControllerApp {
         let tok = session_token.clone();
         let tok_check = session_token;
         let out_file_path = out_path.clone();
+        let agent_bin_str = agent_bin_path;
 
         cx.spawn(async move |this, cx| {
             let res = handle
@@ -2306,8 +2316,35 @@ impl ControllerApp {
                         installation_secret: reply.installation_secret,
                         created_at_unix_ms: reply.created_at_unix_ms,
                     };
-                    artifact.save_to_file(std::path::Path::new(&out_file_path))?;
-                    Ok::<_, anyhow::Error>(reply.authorization_id)
+
+                    let out_path_ref = std::path::Path::new(&out_file_path);
+                    let is_zip = out_path_ref
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.eq_ignore_ascii_case("zip"))
+                        .unwrap_or(false);
+                    let is_toml = out_path_ref
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.eq_ignore_ascii_case("toml"))
+                        .unwrap_or(false);
+
+                    let is_package = is_zip || !is_toml;
+                    if is_package {
+                        let explicit_bin = if agent_bin_str.is_empty() {
+                            None
+                        } else {
+                            Some(std::path::Path::new(&agent_bin_str))
+                        };
+                        let resolved_bin = rustctrl_core::resolve_agent_binary(explicit_bin)?;
+                        let binary_data = std::fs::read(&resolved_bin)?;
+                        let package =
+                            rustctrl_core::AgentInstallationPackage::new(artifact, binary_data)?;
+                        package.export(out_path_ref)?;
+                    } else {
+                        artifact.save_to_file(out_path_ref)?;
+                    }
+                    Ok::<_, anyhow::Error>((reply.authorization_id, is_package))
                 })
                 .await;
 
@@ -2329,7 +2366,7 @@ impl ControllerApp {
                 };
 
                 match res {
-                    Ok(Ok(auth_id)) => {
+                    Ok(Ok((auth_id, is_package))) => {
                         if is_matching_form
                             && let Overlay::PrepareInstallationArtifact {
                                 in_flight,
@@ -2339,7 +2376,12 @@ impl ControllerApp {
                             } = &mut view.overlay
                         {
                             *in_flight = false;
-                            *success = Some(format!("Saved artifact ({auth_id}) to {out_path}"));
+                            let action = if is_package {
+                                "Exported package"
+                            } else {
+                                "Saved artifact"
+                            };
+                            *success = Some(format!("{action} ({auth_id}) to {out_path}"));
                             *error = None;
                         }
                     }
@@ -3269,12 +3311,14 @@ impl ControllerApp {
             }
             Overlay::PrepareInstallationArtifact {
                 output_path,
+                agent_binary_path,
                 error,
                 in_flight,
                 success,
                 ..
             } => {
                 let path_active = self.active_field == ActiveField::PrepareArtifactOutputPath;
+                let bin_active = self.active_field == ActiveField::PreparePackageAgentBinary;
                 let mut container = div()
                     .mt_4()
                     .p_4()
@@ -3286,14 +3330,14 @@ impl ControllerApp {
                     .flex_col()
                     .gap_3()
                     .max_w(gpui::px(520.0))
-                    .child(div().text_lg().child("Prepare Agent Installation Artifact"))
+                    .child(div().text_lg().child("Prepare Agent Installation Package"))
                     .child(
                         div()
                             .text_sm()
                             .text_color(rgb(0x8899aa))
-                            .child("Generate an authorization token and credentials package to enroll new fleet agents automatically."),
+                            .child("Generate an authorization token and export a ready-to-install package to enroll new fleet agents automatically."),
                     )
-                    .child("Output File Path:")
+                    .child("Package Output Path (.zip or folder):")
                     .child(
                         div()
                             .px_3()
@@ -3317,9 +3361,38 @@ impl ControllerApp {
                                 cx.notify();
                             }))
                             .child(if output_path.is_empty() {
-                                div().text_color(rgb(0x556677)).child("e.g. agent-artifact.toml")
+                                div().text_color(rgb(0x556677)).child("e.g. rustctrl-agent-windows.zip")
                             } else {
                                 div().child(output_path.clone())
+                            }),
+                    )
+                    .child("Agent Executable Path (optional):")
+                    .child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .bg(if bin_active {
+                                rgb(0x203040)
+                            } else {
+                                rgb(0x101820)
+                            })
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if bin_active {
+                                rgb(0x4a90e2)
+                            } else {
+                                rgb(0x304050)
+                            })
+                            .cursor_pointer()
+                            .id("artifact-agent-binary-input")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_field = ActiveField::PreparePackageAgentBinary;
+                                cx.notify();
+                            }))
+                            .child(if agent_binary_path.is_empty() {
+                                div().text_color(rgb(0x556677)).child("e.g. rustctrl-agent.exe (auto-detected if omitted)")
+                            } else {
+                                div().child(agent_binary_path.clone())
                             }),
                     );
 
@@ -3357,9 +3430,9 @@ impl ControllerApp {
                                         this.submit_prepare_installation_artifact(cx);
                                     }))
                                     .child(if *in_flight {
-                                        "Generating..."
+                                        "Exporting..."
                                     } else {
-                                        "Generate & Export"
+                                        "Export Package"
                                     }),
                             )
                             .child(
@@ -3442,9 +3515,12 @@ impl ControllerApp {
                         }
                         _ => ActiveField::ReplaceDevicePriorId,
                     },
-                    Overlay::PrepareInstallationArtifact { .. } => {
-                        ActiveField::PrepareArtifactOutputPath
-                    }
+                    Overlay::PrepareInstallationArtifact { .. } => match self.active_field {
+                        ActiveField::PrepareArtifactOutputPath => {
+                            ActiveField::PreparePackageAgentBinary
+                        }
+                        _ => ActiveField::PrepareArtifactOutputPath,
+                    },
                     Overlay::None => self.active_field,
                 };
                 cx.notify();
@@ -3541,6 +3617,14 @@ impl ControllerApp {
                         ActiveField::PrepareArtifactOutputPath,
                     ) => {
                         output_path.pop();
+                    }
+                    (
+                        Overlay::PrepareInstallationArtifact {
+                            agent_binary_path, ..
+                        },
+                        ActiveField::PreparePackageAgentBinary,
+                    ) => {
+                        agent_binary_path.pop();
                     }
                     _ => {}
                 }
@@ -3652,6 +3736,14 @@ impl ControllerApp {
                             ActiveField::PrepareArtifactOutputPath,
                         ) if output_path.len() + text.len() <= 256 => {
                             output_path.push_str(text);
+                        }
+                        (
+                            Overlay::PrepareInstallationArtifact {
+                                agent_binary_path, ..
+                            },
+                            ActiveField::PreparePackageAgentBinary,
+                        ) if agent_binary_path.len() + text.len() <= 256 => {
+                            agent_binary_path.push_str(text);
                         }
                         _ => {}
                     }
@@ -5312,6 +5404,7 @@ mod tests {
         let overlay = Overlay::PrepareInstallationArtifact {
             request_id: 15,
             output_path: "agent-artifact.toml".into(),
+            agent_binary_path: "rustctrl-agent.exe".into(),
             error: None,
             in_flight: true,
             success: None,

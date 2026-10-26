@@ -67,7 +67,37 @@ Stop-Service RustCtrlAgent
 sc.exe delete RustCtrlAgent
 ```
 
-Use absolute paths. Protect the client key with filesystem ACLs and allow the service account to read its bundle. Service mode logs to `log_file`, which defaults to `agent.log` beside the configuration. Console mode logs to stdout. Service logging is a bootstrap append-only file; configure collection and retention before long-running deployments.
+Alternatively, manage the service using `rustctrl-agent` subcommands:
+
+```powershell
+.\target\debug\rustctrl-agent.exe install --config $config
+.\target\debug\rustctrl-agent.exe status
+.\target\debug\rustctrl-agent.exe start
+.\target\debug\rustctrl-agent.exe stop
+.\target\debug\rustctrl-agent.exe uninstall
+```
+
+For fleet deployments, prefer exporting a ready-to-install package from the Controller:
+
+```sh
+cargo run --locked -p rustctrl_controller -- export-agent-package \
+  --username admin_alice --password "AdminPass123!@#" \
+  --output .local/rustctrl-agent-windows.zip
+```
+
+Technicians install the package on Windows PCs by extracting the zip and running:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The script copies the executable, applies SYSTEM and Administrators ACLs (`*S-1-5-18`, `*S-1-5-32-544`), configures failure restart actions, and starts the service. To remove the service cleanly without revoking inventory records:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
+```
+
+Use absolute paths when registering services directly. Protect the client key with filesystem ACLs and allow the service account to read its bundle. Service mode logs to `log_file`, which defaults to `agent.log` beside the configuration. Console mode logs to stdout. Service logging is a bootstrap append-only file; configure collection and retention before long-running deployments.
 
 The service currently maintains its authenticated heartbeat connection. Interactive desktop helpers, capture, UAC, and input handling are feature work.
 

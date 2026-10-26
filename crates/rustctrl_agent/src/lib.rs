@@ -7,6 +7,68 @@ use tokio_util::sync::CancellationToken;
 #[cfg(windows)]
 pub mod service;
 
+/// Runtime options for running the Agent as a Windows Service or service daemon.
+#[derive(Debug, Clone)]
+pub struct ServiceOptions {
+    pub config: Option<std::path::PathBuf>,
+    pub artifact: Option<std::path::PathBuf>,
+    pub target_dir: std::path::PathBuf,
+    pub name: Option<String>,
+    pub heartbeat_seconds: u64,
+}
+
+impl ServiceOptions {
+    pub async fn load_or_enroll(&self, stop: CancellationToken) -> Result<AgentConfig> {
+        let config_path = self
+            .config
+            .clone()
+            .unwrap_or_else(|| self.target_dir.join("config.toml"));
+        if config_path.exists() {
+            tracing::info!(path = %config_path.display(), "using existing agent configuration");
+            return AgentConfig::load(&config_path);
+        }
+
+        let artifact_path = self
+            .artifact
+            .clone()
+            .unwrap_or_else(|| self.target_dir.join("artifact.toml"));
+        if !artifact_path.exists() {
+            anyhow::bail!(
+                "neither agent configuration ({}) nor installation artifact ({}) was found",
+                config_path.display(),
+                artifact_path.display()
+            );
+        }
+
+        tracing::info!(
+            artifact = %artifact_path.display(),
+            target_dir = %self.target_dir.display(),
+            "starting automatic agent enrollment"
+        );
+
+        let mut retry_delay = Duration::from_secs(2);
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => anyhow::bail!("enrollment cancelled during service shutdown"),
+                res = enroll_or_load(&artifact_path, &self.target_dir, self.name.clone(), self.heartbeat_seconds) => {
+                    match res {
+                        Ok(cfg) => return Ok(cfg),
+                        Err(err) => {
+                            tracing::warn!(%err, retry_secs = retry_delay.as_secs(), "enrollment attempt failed; retrying");
+                        }
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = stop.cancelled() => anyhow::bail!("enrollment cancelled during service shutdown"),
+                _ = tokio::time::sleep(retry_delay) => {}
+            }
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+        }
+    }
+}
+
 fn write_pending_enrollment(path: &Path, id: DeviceId, secret: &str) -> Result<()> {
     let body = format!("{id}\n{secret}\n");
     std::fs::write(path, body.as_bytes())?;
@@ -324,6 +386,59 @@ mod tests {
 
         assert!(!target_dir.join(".pending_enrollment").exists());
         assert!(!target_dir.join("config.toml").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_options_loads_existing_config_without_artifact() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target_dir = dir.path();
+        let config_path = target_dir.join("config.toml");
+
+        let device_id = DeviceId::new();
+        std::fs::write(target_dir.join("ca.pem"), "dummy ca")?;
+        std::fs::write(target_dir.join("cert.pem"), "dummy cert")?;
+        std::fs::write(target_dir.join("key.pem"), "dummy key")?;
+
+        let initial_config = format!(
+            "device_id = \"{}\"\nname = \"Existing Service Agent\"\nheartbeat_seconds = 20\nlog_file = \"agent.log\"\n\n[server]\nendpoint = \"https://localhost:9876\"\ndomain_name = \"localhost\"\nca_certificate = \"ca.pem\"\ncertificate = \"cert.pem\"\nprivate_key = \"key.pem\"\n",
+            device_id
+        );
+        std::fs::write(&config_path, initial_config)?;
+
+        let opts = ServiceOptions {
+            config: None,
+            artifact: None,
+            target_dir: target_dir.to_path_buf(),
+            name: None,
+            heartbeat_seconds: 10,
+        };
+
+        let stop = CancellationToken::new();
+        let loaded = opts.load_or_enroll(stop).await?;
+
+        assert_eq!(loaded.device_id, device_id);
+        assert_eq!(loaded.name, "Existing Service Agent");
+        assert_eq!(loaded.heartbeat_seconds, 20);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_options_fails_when_neither_config_nor_artifact_exists() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target_dir = dir.path();
+
+        let opts = ServiceOptions {
+            config: None,
+            artifact: None,
+            target_dir: target_dir.to_path_buf(),
+            name: None,
+            heartbeat_seconds: 10,
+        };
+
+        let stop = CancellationToken::new();
+        let err = opts.load_or_enroll(stop).await.unwrap_err();
+        assert!(err.to_string().contains("neither agent configuration"));
         Ok(())
     }
 }

@@ -40,3 +40,24 @@ Environment: AlmaLinux 10.2 x86_64, Rust 1.98.1, Podman 5.8.2, and podman-compos
 - The Server image built successfully. Compose initialized credentials, started a non-root Server, passed TLS health checks, accepted an Agent heartbeat, and retained its bootstrap record after restart. This was tested through Podman Compose, not Docker Engine.
 - Stable graphical startup remains pending on a real desktop. An isolated Weston/Xwayland test reached Vulkan initialization, but the virtual compositor failed before a stable frame could be inspected. This is not a visual acceptance pass.
 - Native Windows builds and Service Control Manager start/stop checks remain pending on a Windows runner. The CI workflow is configured, but was not triggered during this local setup.
+
+## Issue #14 Verification on 2026-10-26 (Windows Agent Package & Service Lifecycle)
+
+Environment: Linux x86_64, Rust 1.98.1 pinned toolchain.
+
+- **Package Generation**: Verified Controller CLI (`export-agent-package`) and GUI modal overlay (`Export Package`) packaging logic. Generates compliant PKZIP 2.0 uncompressed archives and directory trees containing `rustctrl-agent.exe`, `artifact.toml`, `install.ps1`, `uninstall.ps1`, and `README.txt`.
+- **Packaging and Lifecycle Tests**: `crates/rustctrl_agent/tests/enrollment.rs` (`controller_package_export_to_agent_service_lifecycle_restart_and_update`) verified:
+  - Admin authentication and Installation Authorization preparation via StaffAuth gRPC.
+  - Package export to `.zip` with CRC-32 verification and entry inspection.
+  - Service installation and automatic enrollment via `ServiceOptions::load_or_enroll`.
+  - Heartbeat and inventory appearance on Server.
+  - Service restart and computer reboot simulation reusing existing `config.toml` (retaining Device ID).
+  - Identity-preserving binary update (replacing executable retains local identity without duplicate inventory entries).
+  - Distinct multi-PC enrollment from the same package producing distinct Device IDs in Fleet Inventory.
+- **Service Management & Hardening**:
+  - `install_service` enforces Windows ACLs (`*S-1-5-18`, `*S-1-5-32-544`) restricting directory access to SYSTEM and BUILTIN\Administrators.
+  - `install.ps1` configures Windows service `RustCtrlAgent` with `Automatic` startup and restart failure recovery.
+  - `uninstall.ps1` and `uninstall` command stop and remove the service from SCM while preserving local credentials and Device identity; endpoint remains offline in Fleet Inventory until Admin cleanup.
+- **Platform Limitations & Evidence**:
+  - Linux builds, tests, and headless controller diagnostics (`cargo test --locked --workspace --exclude rustctrl_controller`, `cargo test --locked -p rustctrl_controller`, `cargo clippy`, `cargo fmt`) passed locally.
+  - Physical Windows PC execution with desktop GUI and interactive Windows Service Control Manager was unavailable in this Linux host and was not run locally; Windows SCM lifecycle is gated and validated via the `windows-latest` GitHub Actions workflow.

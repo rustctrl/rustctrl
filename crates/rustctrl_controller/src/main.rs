@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rustctrl_core::{ControllerConfig, init_logging};
 use rustctrl_protocol::auth::{
@@ -196,6 +196,18 @@ enum Command {
         password: String,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        agent_binary: Option<PathBuf>,
+    },
+    ExportAgentPackage {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        agent_binary: Option<PathBuf>,
     },
 }
 
@@ -1012,56 +1024,34 @@ fn main() -> Result<()> {
             username,
             password,
             output,
-        } => {
-            tokio::runtime::Runtime::new()?.block_on(async {
-                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
-                let login_reply = client
-                    .login(LoginRequest {
-                        username,
-                        password,
-                        remember: false,
-                    })
-                    .await?
-                    .into_inner();
-                if login_reply.must_change_password {
-                    anyhow::bail!(
-                        "temporary password must be replaced before preparing installation artifact"
-                    );
-                }
-                let mut req = tonic::Request::new(PrepareInstallationArtifactRequest {});
-                req.metadata_mut().insert(
-                    "authorization",
-                    format!("Bearer {}", login_reply.session_token).parse()?,
-                );
-                let reply = client.prepare_installation_artifact(req).await?.into_inner();
-
-                let artifact = rustctrl_core::AgentInstallationArtifact {
-                    server_endpoint: reply.server_endpoint,
-                    domain_name: reply.domain_name,
-                    ca_certificate: reply.ca_certificate,
-                    enrollment_certificate: reply.enrollment_certificate,
-                    enrollment_private_key: reply.enrollment_private_key,
-                    authorization_id: reply.authorization_id.clone(),
-                    installation_secret: reply.installation_secret,
-                    created_at_unix_ms: reply.created_at_unix_ms,
-                };
-                artifact.save_to_file(&output)?;
-
-                println!(
-                    "Prepared installation artifact authorization_id={} output={}",
-                    reply.authorization_id,
-                    output.display()
-                );
-
-                let mut logout_req = tonic::Request::new(LogoutRequest {});
-                logout_req.metadata_mut().insert(
-                    "authorization",
-                    format!("Bearer {}", login_reply.session_token).parse()?,
-                );
-                let _ = client.logout(logout_req).await;
-                Ok(())
-            })
-        }
+            agent_binary,
+        } => tokio::runtime::Runtime::new()?.block_on(async {
+            handle_prepare_package_or_artifact(
+                &config.server,
+                username,
+                password,
+                output,
+                agent_binary,
+                false,
+            )
+            .await
+        }),
+        Command::ExportAgentPackage {
+            username,
+            password,
+            output,
+            agent_binary,
+        } => tokio::runtime::Runtime::new()?.block_on(async {
+            handle_prepare_package_or_artifact(
+                &config.server,
+                username,
+                password,
+                output,
+                agent_binary,
+                true,
+            )
+            .await
+        }),
         Command::Gui => {
             #[cfg(feature = "gui")]
             {
@@ -1076,4 +1066,87 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+async fn handle_prepare_package_or_artifact(
+    server_config: &rustctrl_core::ClientConfig,
+    username: String,
+    password: String,
+    output: PathBuf,
+    agent_binary: Option<PathBuf>,
+    is_package_command: bool,
+) -> Result<()> {
+    let mut client = rustctrl_network::connect_staff_auth(server_config).await?;
+    let login_reply = client
+        .login(LoginRequest {
+            username,
+            password,
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    if login_reply.must_change_password {
+        anyhow::bail!("temporary password must be replaced before preparing installation artifact");
+    }
+    let mut req = tonic::Request::new(PrepareInstallationArtifactRequest {});
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", login_reply.session_token).parse()?,
+    );
+    let reply = client
+        .prepare_installation_artifact(req)
+        .await?
+        .into_inner();
+
+    let artifact = rustctrl_core::AgentInstallationArtifact {
+        server_endpoint: reply.server_endpoint,
+        domain_name: reply.domain_name,
+        ca_certificate: reply.ca_certificate,
+        enrollment_certificate: reply.enrollment_certificate,
+        enrollment_private_key: reply.enrollment_private_key,
+        authorization_id: reply.authorization_id.clone(),
+        installation_secret: reply.installation_secret,
+        created_at_unix_ms: reply.created_at_unix_ms,
+    };
+
+    let is_zip = output
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false);
+    let is_toml = output
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("toml"))
+        .unwrap_or(false);
+
+    let export_package = is_package_command || is_zip || !is_toml;
+
+    if export_package {
+        let binary_path = rustctrl_core::resolve_agent_binary(agent_binary.as_deref())?;
+        let binary_data = std::fs::read(&binary_path)
+            .with_context(|| format!("read agent binary from {}", binary_path.display()))?;
+        let package = rustctrl_core::AgentInstallationPackage::new(artifact, binary_data)?;
+        package.export(&output)?;
+        println!(
+            "Exported agent installation package authorization_id={} output={}",
+            reply.authorization_id,
+            output.display()
+        );
+    } else {
+        artifact.save_to_file(&output)?;
+        println!(
+            "Prepared installation artifact authorization_id={} output={}",
+            reply.authorization_id,
+            output.display()
+        );
+    }
+
+    let mut logout_req = tonic::Request::new(LogoutRequest {});
+    logout_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", login_reply.session_token).parse()?,
+    );
+    let _ = client.logout(logout_req).await;
+    Ok(())
 }

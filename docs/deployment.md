@@ -68,6 +68,60 @@ Run the native Controller or Agent with the exported `config.toml`. The CA priva
 
 An existing office CA can be used instead of the initializer. Supply a server-auth certificate with the proper DNS/IP SANs, a public CA bundle, and client-auth certificates trusted by that CA. Heartbeat clients also need a DNS SAN of `<device-id>.agent.rustctrl.internal` matching the configured UUID. Preserve the filenames and mount paths expected by `config/server.compose.example.toml`.
 
+## Windows Agent Installation Packages and Service Management
+
+Admins generate ready-to-install Windows Agent Installation Packages directly from the Controller:
+
+```sh
+# Via Controller CLI (outputs .zip archive or directory):
+cargo run --locked -p rustctrl_controller -- export-agent-package \
+  --username admin_alice --password "AdminPass123!@#" \
+  --output rustctrl-agent-windows.zip
+```
+
+Or click **Export Package** in the Controller GUI fleet inventory view.
+
+The package contains:
+- `rustctrl-agent.exe`: Pinned agent executable.
+- `artifact.toml`: Server endpoint, TLS trust certificate, and Installation Authorization secret.
+- `install.ps1`: Automated PowerShell installer script.
+- `uninstall.ps1`: Automated service removal script.
+- `README.txt`: Technician instructions.
+
+### Installation
+
+On the target Windows PC, a technician extracts the archive and runs:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The script:
+1. Creates the target directory (defaults to `$env:ProgramData\RustCtrl`).
+2. Applies ACLs restricting access exclusively to `NT AUTHORITY\SYSTEM` (`*S-1-5-18`) and `BUILTIN\Administrators` (`*S-1-5-32-544`).
+3. Copies `rustctrl-agent.exe` and `artifact.toml`.
+4. Registers the `RustCtrlAgent` Windows Service with `Automatic` startup and failure recovery actions.
+5. Starts the service immediately.
+
+The agent automatically contacts the Server, completes mutual-TLS enrollment, saves its permanent credentials in `config.toml`, and begins sending periodic heartbeats. The endpoint appears in the Controller Fleet Inventory as online.
+
+### Updates and Identity Persistence
+
+When updating an Agent binary:
+1. Re-running `install.ps1` with a newer package updates `rustctrl-agent.exe`.
+2. Existing local credentials (`config.toml`, `cert.pem`, `key.pem`) are preserved.
+3. The Agent restarts and resumes heartbeats under its existing Device ID without duplicating inventory entries.
+
+### Uninstallation
+
+Run from an elevated PowerShell session:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
+```
+
+The service is stopped and removed from Windows Service Control Manager. Local configuration is retained by default so the Device ID is preserved if reinstalled. The Device appears as offline in the Fleet Inventory until an Admin performs inventory cleanup. RustCtrl deliberately does not implement remote uninstall.
+
 ## Container smoke test
 
 After installing the Rust toolchain and container engine:
