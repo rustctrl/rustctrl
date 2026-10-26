@@ -225,15 +225,56 @@ impl Bootstrap for BootstrapService {
             Err(e) => return Err(database_error(e)),
         };
 
+        let resumption_secret = body.resumption_secret.trim();
+        if resumption_secret.is_empty() {
+            return Err(Status::invalid_argument("resumption_secret is required"));
+        }
+        let resumption_secret_hash = hash_secret(resumption_secret);
+
         let existing_enrollment = self
             .store
             .get_device_enrollment(&id.to_string())
             .await
             .map_err(database_error)?;
 
-        let is_resuming = existing_enrollment
-            .as_ref()
-            .is_some_and(|rec| rec.authorization_id == auth.authorization_id);
+        let is_resuming = match &existing_enrollment {
+            Some(rec) => {
+                if rec.authorization_id != auth.authorization_id {
+                    let _ = self
+                        .store
+                        .record_activity(
+                            id.to_string(),
+                            "enroll_agent".into(),
+                            "rejected".into(),
+                            format!(
+                                "enrollment rejected for device '{id}': already enrolled under a different authorization"
+                            ),
+                        )
+                        .await;
+                    return Err(Status::permission_denied(
+                        "device is already enrolled under a different authorization",
+                    ));
+                }
+                if rec.resumption_secret_hash.as_deref() != Some(&resumption_secret_hash) {
+                    let _ = self
+                        .store
+                        .record_activity(
+                            id.to_string(),
+                            "enroll_agent".into(),
+                            "rejected".into(),
+                            format!(
+                                "enrollment rejected for device '{id}': invalid resumption secret"
+                            ),
+                        )
+                        .await;
+                    return Err(Status::permission_denied(
+                        "resumption secret does not match enrolled device",
+                    ));
+                }
+                true
+            }
+            None => false,
+        };
 
         if auth.revoked_at_unix_ms.is_some() && !is_resuming {
             let _ = self
@@ -259,6 +300,7 @@ impl Bootstrap for BootstrapService {
                 body.name.clone(),
                 body.agent_version.clone(),
                 remote_addr,
+                resumption_secret_hash,
             )
             .await
         {
@@ -1598,16 +1640,44 @@ pub async fn serve_on(
             fs::read_to_string(&enrollment_cert_path).context("read enrollment cert")?;
         let enrollment_key_pem =
             fs::read_to_string(&enrollment_key_path).context("read enrollment key")?;
-        let server_endpoint = config
-            .enrollment
-            .server_endpoint
-            .clone()
+        let mut server_endpoint = config.enrollment.server_endpoint.clone();
+        let mut domain_name = config.enrollment.domain_name.clone();
+
+        if server_endpoint.is_none() {
+            server_endpoint = std::env::var("RUSTCTRL_SERVER_ENDPOINT").ok();
+        }
+        if domain_name.is_none() {
+            domain_name = std::env::var("RUSTCTRL_SERVER_NAME").ok();
+        }
+
+        let enrollment_toml_path = tls_dir.join("enrollment.toml");
+        let parsed_deployment = if (server_endpoint.is_none() || domain_name.is_none())
+            && enrollment_toml_path.exists()
+        {
+            fs::read_to_string(&enrollment_toml_path)
+                .ok()
+                .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
+        } else {
+            None
+        };
+        if let Some(parsed) = parsed_deployment {
+            if server_endpoint.is_none() {
+                server_endpoint = parsed
+                    .get("server_endpoint")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+            }
+            if domain_name.is_none() {
+                domain_name = parsed
+                    .get("domain_name")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+            }
+        }
+
+        let server_endpoint = server_endpoint
             .unwrap_or_else(|| format!("https://localhost:{}", config.listen.port()));
-        let domain_name = config
-            .enrollment
-            .domain_name
-            .clone()
-            .unwrap_or_else(|| "localhost".into());
+        let domain_name = domain_name.unwrap_or_else(|| "localhost".into());
 
         Some(Arc::new(AgentIssuer::new(
             server_endpoint,

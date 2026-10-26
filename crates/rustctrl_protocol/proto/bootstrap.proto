@@ -25,6 +25,7 @@ message EnrollAgentRequest {
   string name = 2;
   string installation_secret = 3;
   string agent_version = 4;
+  string resumption_secret = 5;
 }
 
 message EnrollAgentReply {

@@ -137,6 +137,15 @@ pub fn initialize(options: &PkiOptions) -> Result<()> {
         &options.output.join("server.toml"),
         native_config.as_bytes(),
     )?;
+    let deployment_toml = format!(
+        "server_endpoint = {}\ndomain_name = {}\n",
+        quoted(&options.endpoint),
+        quoted(&options.domain_name)
+    );
+    write_new(
+        &server_dir.join("enrollment.toml"),
+        deployment_toml.as_bytes(),
+    )?;
     tracing::info!(output = %options.output.display(), device_id = %options.device_id,
         "PKI initialized; keep the ca directory private and distribute only each client's own bundle");
     Ok(())

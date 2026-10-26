@@ -13,3 +13,14 @@ remembered_lifetime_secs = 2592000
 [fleet]
 # Heartbeat freshness window used to derive Device online status.
 offline_after_secs = 60
+
+[enrollment]
+# Endpoint and domain advertised to new Agents in installation packages.
+# When omitted, these fall back to RUSTCTRL_SERVER_ENDPOINT / RUSTCTRL_SERVER_NAME
+# or the deployment settings recorded in /tls/enrollment.toml during pki-init.
+# server_endpoint = "https://rustctrl.office.internal:9876"
+# domain_name = "rustctrl.office.internal"
+agent_issuer_certificate = "../.local/pki/server/agent-ca/cert.pem"
+agent_issuer_private_key = "../.local/pki/server/agent-ca/key.pem"
+enrollment_certificate = "../.local/pki/server/enrollment/cert.pem"
+enrollment_private_key = "../.local/pki/server/enrollment/key.pem"

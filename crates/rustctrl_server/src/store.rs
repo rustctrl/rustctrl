@@ -151,6 +151,7 @@ pub struct DeviceEnrollmentRecord {
     pub device_id: String,
     pub authorization_id: String,
     pub enrolled_at_unix_ms: i64,
+    pub resumption_secret_hash: Option<String>,
 }
 
 #[derive(Clone)]
@@ -239,6 +240,7 @@ impl DeviceStore {
                 device_id TEXT PRIMARY KEY,
                 authorization_id TEXT NOT NULL,
                 enrolled_at_unix_ms INTEGER NOT NULL,
+                resumption_secret_hash TEXT,
                 FOREIGN KEY(authorization_id) REFERENCES installation_authorizations(authorization_id)
             );
             CREATE TABLE IF NOT EXISTS known_device_identities (
@@ -276,6 +278,18 @@ impl DeviceStore {
         {
             connection.execute_batch(
                 "ALTER TABLE staff_sessions ADD COLUMN expires_at_unix_ms INTEGER;",
+            )?;
+        }
+        let enrollment_columns: Vec<String> = connection
+            .prepare("SELECT name FROM pragma_table_info('device_enrollments')")?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        if !enrollment_columns
+            .iter()
+            .any(|name| name == "resumption_secret_hash")
+        {
+            connection.execute_batch(
+                "ALTER TABLE device_enrollments ADD COLUMN resumption_secret_hash TEXT;",
             )?;
         }
         Ok(Self(Arc::new(Mutex::new(connection))))
@@ -1888,6 +1902,7 @@ impl DeviceStore {
         name: String,
         agent_version: String,
         remote_address: Option<String>,
+        resumption_secret_hash: String,
     ) -> Result<i64> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -1916,20 +1931,29 @@ impl DeviceStore {
                 anyhow::bail!("device '{}' is blocked", device_id);
             }
 
-            let existing_auth: Option<String> = tx
+            let existing: Option<(String, Option<String>)> = tx
                 .query_row(
-                    "SELECT authorization_id FROM device_enrollments WHERE device_id = ?1",
+                    "SELECT authorization_id, resumption_secret_hash FROM device_enrollments WHERE device_id = ?1",
                     params![device_id.to_string()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
 
-            if let Some(enrolled_auth) = &existing_auth {
+            if let Some((enrolled_auth, stored_resumption_hash)) = &existing {
                 if enrolled_auth != &authorization_id {
                     anyhow::bail!(
                         "device '{}' is already enrolled under a different authorization",
                         device_id
                     );
+                }
+                match stored_resumption_hash {
+                    Some(expected) if expected == &resumption_secret_hash => {}
+                    _ => {
+                        anyhow::bail!(
+                            "resumption secret does not match enrolled device '{}'",
+                            device_id
+                        );
+                    }
                 }
             } else {
                 let is_bootstrap: i64 = tx.query_row(
@@ -1967,8 +1991,8 @@ impl DeviceStore {
                 }
 
                 tx.execute(
-                    "INSERT INTO device_enrollments (device_id, authorization_id, enrolled_at_unix_ms) VALUES (?1, ?2, ?3)",
-                    params![device_id.to_string(), authorization_id, now],
+                    "INSERT INTO device_enrollments (device_id, authorization_id, enrolled_at_unix_ms, resumption_secret_hash) VALUES (?1, ?2, ?3, ?4)",
+                    params![device_id.to_string(), authorization_id, now, resumption_secret_hash],
                 )?;
 
                 tx.execute(
@@ -2001,7 +2025,7 @@ impl DeviceStore {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let mut stmt = connection.prepare(
-                "SELECT device_id, authorization_id, enrolled_at_unix_ms FROM device_enrollments WHERE device_id = ?1",
+                "SELECT device_id, authorization_id, enrolled_at_unix_ms, resumption_secret_hash FROM device_enrollments WHERE device_id = ?1",
             )?;
             let mut rows = stmt.query(params![device_id])?;
             if let Some(row) = rows.next()? {
@@ -2009,6 +2033,7 @@ impl DeviceStore {
                     device_id: row.get(0)?,
                     authorization_id: row.get(1)?,
                     enrolled_at_unix_ms: row.get(2)?,
+                    resumption_secret_hash: row.get(3)?,
                 }))
             } else {
                 Ok(None)
@@ -2745,6 +2770,7 @@ mod tests {
 
         // 3. Enroll device 1
         let dev1_id = DeviceId::new();
+        let dev1_resumption_hash = "dev1_secret_hash".to_string();
         store
             .record_device_enrollment(
                 dev1_id,
@@ -2752,6 +2778,7 @@ mod tests {
                 "Dev 1".into(),
                 "0.1.0".into(),
                 Some("10.0.0.1".into()),
+                dev1_resumption_hash.clone(),
             )
             .await?;
 
@@ -2768,9 +2795,14 @@ mod tests {
             .expect("dev1 enrollment must exist");
         assert_eq!(dev1_enroll.device_id, dev1_id.to_string());
         assert_eq!(dev1_enroll.authorization_id, auth_id);
+        assert_eq!(
+            dev1_enroll.resumption_secret_hash.as_deref(),
+            Some("dev1_secret_hash")
+        );
 
         // 4. Enroll device 2 under same authorization
         let dev2_id = DeviceId::new();
+        let dev2_resumption_hash = "dev2_secret_hash".to_string();
         store
             .record_device_enrollment(
                 dev2_id,
@@ -2778,6 +2810,7 @@ mod tests {
                 "Dev 2".into(),
                 "0.1.0".into(),
                 Some("10.0.0.2".into()),
+                dev2_resumption_hash,
             )
             .await?;
         let dev2_rec = store
@@ -2786,7 +2819,7 @@ mod tests {
             .expect("dev2 must exist");
         assert_eq!(dev2_rec.name, "Dev 2");
 
-        // 5. Resuming enrollment for dev1 under the same authorization succeeds (idempotent resumption)
+        // 5. Resuming enrollment for dev1 with matching resumption secret succeeds
         store
             .record_device_enrollment(
                 dev1_id,
@@ -2794,6 +2827,7 @@ mod tests {
                 "Dev 1 Renamed".into(),
                 "0.1.1".into(),
                 Some("10.0.0.1".into()),
+                dev1_resumption_hash.clone(),
             )
             .await?;
         let dev1_resumed = store
@@ -2802,7 +2836,25 @@ mod tests {
             .expect("dev1 must exist");
         assert_eq!(dev1_resumed.name, "Dev 1 Renamed");
 
-        // 5b. Enrolling dev1 under a different authorization fails
+        // 5b. Resuming dev1 with wrong resumption secret fails (imposter cannot hijack)
+        let imposter_err = store
+            .record_device_enrollment(
+                dev1_id,
+                auth_id.into(),
+                "Dev 1 Imposter".into(),
+                "0.1.1".into(),
+                None,
+                "wrong_secret_hash".into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            imposter_err
+                .to_string()
+                .contains("resumption secret does not match")
+        );
+
+        // 5c. Enrolling dev1 under a different authorization fails
         let diff_auth_id = "diff-auth-uuid";
         store
             .create_installation_authorization(
@@ -2818,6 +2870,7 @@ mod tests {
                 "Dev 1 Hijack".into(),
                 "0.1.1".into(),
                 None,
+                "any_secret_hash".into(),
             )
             .await
             .unwrap_err();
@@ -2827,7 +2880,7 @@ mod tests {
                 .contains("already enrolled under a different authorization")
         );
 
-        // 5c. Enrolling a bootstrap device identity fails
+        // 5d. Enrolling a bootstrap device identity fails
         let boot_id = DeviceId::new();
         store
             .heartbeat(boot_id, "Boot PC".into(), "1.0.0".into(), None)
@@ -2839,6 +2892,7 @@ mod tests {
                 "Boot Clone".into(),
                 "1.0.0".into(),
                 None,
+                "any_secret_hash".into(),
             )
             .await
             .unwrap_err();
@@ -2884,12 +2938,13 @@ mod tests {
                 "Dev 3".into(),
                 "0.1.0".into(),
                 None,
+                "dev3_secret_hash".into(),
             )
             .await
             .unwrap_err();
         assert!(enroll_err.to_string().contains("revoked"));
 
-        // 8b. Resuming previously enrolled dev1 even under revoked authorization succeeds
+        // 8b. Resuming previously enrolled dev1 with matching resumption secret under revoked authorization succeeds
         store2
             .record_device_enrollment(
                 dev1_id,
@@ -2897,8 +2952,27 @@ mod tests {
                 "Dev 1 After Revoke".into(),
                 "0.1.2".into(),
                 Some("10.0.0.1".into()),
+                dev1_resumption_hash.clone(),
             )
             .await?;
+
+        // 8c. Resuming previously enrolled dev1 with wrong secret fails even under revoked authorization
+        let revoke_imposter_err = store2
+            .record_device_enrollment(
+                dev1_id,
+                auth_id.into(),
+                "Dev 1 After Revoke Imposter".into(),
+                "0.1.2".into(),
+                Some("10.0.0.1".into()),
+                "wrong_secret_hash".into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            revoke_imposter_err
+                .to_string()
+                .contains("resumption secret does not match")
+        );
 
         Ok(())
     }

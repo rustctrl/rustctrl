@@ -128,6 +128,7 @@ async fn login(
     Ok(reply.session_token)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enroll_agent(
     endpoint: &str,
     ca_pem: &str,
@@ -136,6 +137,7 @@ async fn enroll_agent(
     device_id: DeviceId,
     name: &str,
     secret: &str,
+    resumption_secret: &str,
 ) -> Result<EnrollAgentReply> {
     let mut client = rustctrl_network::connect_from_pem(
         endpoint,
@@ -151,6 +153,7 @@ async fn enroll_agent(
             name: name.into(),
             agent_version: "0.1.0".into(),
             installation_secret: secret.into(),
+            resumption_secret: resumption_secret.into(),
         })
         .await?
         .into_inner();
@@ -278,6 +281,7 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
             name: "Imposter-PC".into(),
             agent_version: "0.1.0".into(),
             installation_secret: artifact.installation_secret.clone(),
+            resumption_secret: "imposter-secret".into(),
         })
         .await
         .unwrap_err();
@@ -285,6 +289,7 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
 
     // 3. Enroll Agent 1 with valid enrollment credentials
     let dev1_id = DeviceId::new();
+    let dev1_resumption_secret = "alice-secret-token-123";
     let enroll1 = enroll_agent(
         &server.endpoint,
         &artifact.ca_certificate,
@@ -293,6 +298,7 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
         dev1_id,
         "DESKTOP-ALICE-1",
         &artifact.installation_secret,
+        dev1_resumption_secret,
     )
     .await?;
 
@@ -332,7 +338,7 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
         .into_inner();
     assert!(hb1.received_at_unix_ms > 0);
 
-    // 5. Resuming enrollment for Agent 1 under the same authorization succeeds (idempotent resumption)
+    // 5. Resuming enrollment for Agent 1 with matching resumption secret succeeds (idempotent resumption)
     let mut enrollment_client = rustctrl_network::connect_from_pem(
         &server.endpoint,
         "localhost",
@@ -347,10 +353,24 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
             name: "DESKTOP-ALICE-1".into(),
             agent_version: "0.1.0".into(),
             installation_secret: artifact.installation_secret.clone(),
+            resumption_secret: dev1_resumption_secret.into(),
         })
         .await?
         .into_inner();
     assert_eq!(resume1.device_id, dev1_id.to_string());
+
+    // 5a. Attempting to re-enroll Agent 1 with wrong resumption secret fails (imposter cannot hijack)
+    let hijack_err = enrollment_client
+        .enroll_agent(EnrollAgentRequest {
+            device_id: dev1_id.to_string(),
+            name: "DESKTOP-ALICE-HIJACK".into(),
+            agent_version: "0.1.0".into(),
+            installation_secret: artifact.installation_secret.clone(),
+            resumption_secret: "hacker-guessed-wrong-secret".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(hijack_err.code(), tonic::Code::PermissionDenied);
 
     // 5b. Attempting to enroll an existing bootstrap device's ID fails
     let bootstrap_cfg = client_config(&pki_dir, &server.endpoint, "agent");
@@ -369,6 +389,7 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
             name: "BOOTSTRAP-STEAL".into(),
             agent_version: "0.1.0".into(),
             installation_secret: artifact.installation_secret.clone(),
+            resumption_secret: "random-secret".into(),
         })
         .await
         .unwrap_err();
@@ -390,6 +411,7 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
             name: "DESKTOP-ALICE-HIJACK".into(),
             agent_version: "0.1.0".into(),
             installation_secret: reply2.installation_secret,
+            resumption_secret: dev1_resumption_secret.into(),
         })
         .await
         .unwrap_err();
@@ -397,6 +419,7 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
 
     // 6. Enroll Agent 2 from same artifact -> receives distinct DeviceId
     let dev2_id = DeviceId::new();
+    let dev2_resumption_secret = "bob-secret-token-456";
     let enroll2 = enroll_agent(
         &server.endpoint,
         &artifact.ca_certificate,
@@ -405,6 +428,7 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
         dev2_id,
         "DESKTOP-BOB-2",
         &artifact.installation_secret,
+        dev2_resumption_secret,
     )
     .await?;
 
@@ -442,12 +466,13 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
             name: "Hacker-PC".into(),
             agent_version: "0.1.0".into(),
             installation_secret: "completely-wrong-secret".into(),
+            resumption_secret: "random-secret".into(),
         })
         .await
         .unwrap_err();
     assert_eq!(invalid_secret_err.code(), tonic::Code::Unauthenticated);
 
-    // 9. Revoking authorization rejects subsequent enrollment attempts
+    // 9. Revoking authorization rejects subsequent enrollment attempts for new devices
     let revoked = store
         .revoke_installation_authorization(&reply.authorization_id)
         .await?;
@@ -459,10 +484,40 @@ async fn agent_enrollment_lifecycle_multiple_devices_and_idempotency() -> Result
             name: "Late-PC".into(),
             agent_version: "0.1.0".into(),
             installation_secret: artifact.installation_secret.clone(),
+            resumption_secret: "late-pc-secret".into(),
         })
         .await
         .unwrap_err();
     assert_eq!(revoked_err.code(), tonic::Code::PermissionDenied);
+
+    // 9b. Legitimate Agent 1 with matching resumption secret can still resume after revocation
+    let resume_after_revoke = enrollment_client
+        .enroll_agent(EnrollAgentRequest {
+            device_id: dev1_id.to_string(),
+            name: "DESKTOP-ALICE-1".into(),
+            agent_version: "0.1.0".into(),
+            installation_secret: artifact.installation_secret.clone(),
+            resumption_secret: dev1_resumption_secret.into(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(resume_after_revoke.device_id, dev1_id.to_string());
+
+    // 9c. Imposter with wrong resumption secret fails after revocation
+    let imposter_after_revoke_err = enrollment_client
+        .enroll_agent(EnrollAgentRequest {
+            device_id: dev1_id.to_string(),
+            name: "DESKTOP-ALICE-1".into(),
+            agent_version: "0.1.0".into(),
+            installation_secret: artifact.installation_secret.clone(),
+            resumption_secret: "wrong-secret".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        imposter_after_revoke_err.code(),
+        tonic::Code::PermissionDenied
+    );
 
     // 10. Existing enrolled agents continue to operate normally even if auth is revoked
     agent1_client

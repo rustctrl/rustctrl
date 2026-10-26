@@ -20,21 +20,36 @@ pub async fn enroll_or_load(
     }
 
     let artifact = AgentInstallationArtifact::load_from_file(artifact_path)?;
-    let pending_id_path = target_dir.join(".pending_device_id");
-    let device_id = if pending_id_path.exists() {
-        let content = std::fs::read_to_string(&pending_id_path)?;
-        content.trim().parse::<DeviceId>()?
+    let pending_file = target_dir.join(".pending_enrollment");
+    let legacy_pending_id_path = target_dir.join(".pending_device_id");
+    let (device_id, resumption_secret) = if pending_file.exists() {
+        let content = std::fs::read_to_string(&pending_file)?;
+        let mut lines = content.lines();
+        let id_str = lines.next().unwrap_or("").trim();
+        let id = id_str.parse::<DeviceId>()?;
+        let secret = lines
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        (id, secret)
+    } else if legacy_pending_id_path.exists() {
+        let content = std::fs::read_to_string(&legacy_pending_id_path)?;
+        let id = content.trim().parse::<DeviceId>()?;
+        let secret = uuid::Uuid::new_v4().to_string();
+        (id, secret)
     } else {
         std::fs::create_dir_all(target_dir)?;
         let id = DeviceId::new();
-        std::fs::write(&pending_id_path, id.to_string().as_bytes())?;
+        let secret = uuid::Uuid::new_v4().to_string();
+        let body = format!("{id}\n{secret}\n");
+        std::fs::write(&pending_file, body.as_bytes())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&pending_id_path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&pending_file, std::fs::Permissions::from_mode(0o600));
         }
-        id
+        (id, secret)
     };
 
     let computer_name = name
@@ -64,6 +79,7 @@ pub async fn enroll_or_load(
         name: computer_name.clone(),
         agent_version: env!("CARGO_PKG_VERSION").into(),
         installation_secret: artifact.installation_secret,
+        resumption_secret,
     };
 
     let reply = client.enroll_agent(req).await?.into_inner();
@@ -103,7 +119,8 @@ pub async fn enroll_or_load(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
     }
-    let _ = std::fs::remove_file(&pending_id_path);
+    let _ = std::fs::remove_file(&pending_file);
+    let _ = std::fs::remove_file(&legacy_pending_id_path);
 
     tracing::info!(
         device_id = %device_id,
@@ -204,10 +221,14 @@ mod tests {
     async fn enroll_or_load_pending_device_id_persists_before_rpc() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let target_dir = dir.path();
-        let pending_id_path = target_dir.join(".pending_device_id");
+        let pending_file = target_dir.join(".pending_enrollment");
 
         let device_id = DeviceId::new();
-        std::fs::write(&pending_id_path, device_id.to_string().as_bytes())?;
+        let resumption_secret = "test-resumption-secret-token";
+        std::fs::write(
+            &pending_file,
+            format!("{device_id}\n{resumption_secret}\n").as_bytes(),
+        )?;
 
         let artifact = AgentInstallationArtifact {
             server_endpoint: "https://127.0.0.1:9".into(),
@@ -222,12 +243,14 @@ mod tests {
         let artifact_path = target_dir.join("artifact.toml");
         artifact.save_to_file(&artifact_path)?;
 
-        // Connection will fail since endpoint is unreachable, but pending_id_path should be preserved with the same device_id
+        // Connection will fail since endpoint is unreachable, but pending_file should be preserved with the same credentials
         let _ = enroll_or_load(&artifact_path, target_dir, Some("Test PC".into()), 10).await;
 
-        assert!(pending_id_path.exists());
-        let content = std::fs::read_to_string(&pending_id_path)?;
-        assert_eq!(content.trim().parse::<DeviceId>()?, device_id);
+        assert!(pending_file.exists());
+        let content = std::fs::read_to_string(&pending_file)?;
+        let mut lines = content.lines();
+        assert_eq!(lines.next().unwrap().trim().parse::<DeviceId>()?, device_id);
+        assert_eq!(lines.next().unwrap().trim(), resumption_secret);
         Ok(())
     }
 }
