@@ -120,23 +120,21 @@ pub fn install_service(
         service_name,
         windows_service::service::ServiceAccess::STOP
             | windows_service::service::ServiceAccess::QUERY_STATUS,
-    ) {
-        if let Ok(svc_status) = existing.query_status()
-            && svc_status.current_state != ServiceState::Stopped
-        {
-            was_running = true;
-            tracing::info!(
-                service_name,
-                "stopping existing service before binary update"
-            );
-            let _ = existing.stop();
-            for _ in 0..40 {
-                std::thread::sleep(Duration::from_millis(500));
-                if let Ok(st) = existing.query_status()
-                    && st.current_state == ServiceState::Stopped
-                {
-                    break;
-                }
+    ) && let Ok(svc_status) = existing.query_status()
+        && svc_status.current_state != ServiceState::Stopped
+    {
+        was_running = true;
+        tracing::info!(
+            service_name,
+            "stopping existing service before binary update"
+        );
+        let _ = existing.stop();
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(500));
+            if let Ok(st) = existing.query_status()
+                && st.current_state == ServiceState::Stopped
+            {
+                break;
             }
         }
     }
