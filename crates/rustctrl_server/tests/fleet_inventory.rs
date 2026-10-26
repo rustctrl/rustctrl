@@ -2139,6 +2139,7 @@ async fn admin_cleans_offline_device_and_restores_on_agent_reconnect_and_survive
     let bob_session = login(&mut operator_client, "bob", "BobPermanent123!").await?;
 
     // 1. Establish an agent TLS channel and run real Agent heartbeat loop.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let agent_stop = CancellationToken::new();
     let agent_task = {
         let stop = agent_stop.clone();
@@ -2147,7 +2148,22 @@ async fn admin_cleans_offline_device_and_restores_on_agent_reconnect_and_survive
         tokio::spawn(async move {
             let mut agent =
                 rustctrl_network::connect(&client_config(&pki_dir, &endpoint, "agent")).await?;
+            agent
+                .send_heartbeat(HeartbeatRequest {
+                    device_id: device_id.to_string(),
+                    name: "Workstation Offline Test".into(),
+                    agent_version: "0.1.0".into(),
+                })
+                .await?;
+            let _ = ready_tx.send(());
             while !stop.is_cancelled() {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+                }
+                if stop.is_cancelled() {
+                    break;
+                }
                 agent
                     .send_heartbeat(HeartbeatRequest {
                         device_id: device_id.to_string(),
@@ -2155,16 +2171,12 @@ async fn admin_cleans_offline_device_and_restores_on_agent_reconnect_and_survive
                         agent_version: "0.1.0".into(),
                     })
                     .await?;
-                tokio::select! {
-                    _ = stop.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(150)) => {}
-                }
             }
             Ok::<_, anyhow::Error>(())
         })
     };
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    ready_rx.await.expect("agent loop sent initial heartbeat");
 
     // Alice curates device metadata.
     admin
@@ -2196,7 +2208,7 @@ async fn admin_cleans_offline_device_and_restores_on_agent_reconnect_and_survive
     agent_task.await??;
 
     // Wait for offline threshold (server offline_after_secs is 1 second).
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
 
     // Verify device is now offline in inventory.
     let list_offline = admin
@@ -2464,7 +2476,7 @@ async fn admin_manages_device_cleanup_via_controller_cli() -> Result<()> {
     agent_heartbeat(&pki_dir, &server.endpoint, device_id).await?;
 
     // Wait until device goes offline (offline_after_secs is 1 second).
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
 
     // Operator Bob cannot clean offline device.
     let op_clean = run_controller(&[
