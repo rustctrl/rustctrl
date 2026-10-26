@@ -233,7 +233,7 @@ async fn controller_package_export_to_agent_service_lifecycle_restart_and_update
     };
 
     // 2. Controller assembles ready-to-install package with pinned binary
-    let mock_agent_binary = b"MOCK_AGENT_EXECUTABLE_WINDOWS_PE_V1".to_vec();
+    let mock_agent_binary = rustctrl_core::mock_windows_pe_binary();
     let package =
         rustctrl_core::AgentInstallationPackage::new(artifact.clone(), mock_agent_binary.clone())?;
 
@@ -297,7 +297,8 @@ async fn controller_package_export_to_agent_service_lifecycle_restart_and_update
     assert_eq!(pc1_restarted.name, "FINANCE-DESKTOP-01");
 
     // 6. Identity-preserving update: binary updated, local config preserved
-    let updated_mock_binary = b"MOCK_AGENT_EXECUTABLE_WINDOWS_PE_V2".to_vec();
+    let mut updated_mock_binary = rustctrl_core::mock_windows_pe_binary();
+    updated_mock_binary.extend_from_slice(b"UPDATED_SECTION");
     std::fs::write(
         pc1_service_dir.join("rustctrl-agent.exe"),
         &updated_mock_binary,

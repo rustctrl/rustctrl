@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::{ffi::OsString, path::Path, sync::OnceLock, time::Duration};
+use std::{ffi::OsString, sync::OnceLock, time::Duration};
 use tokio_util::sync::CancellationToken;
 use windows_service::{
     define_windows_service,
@@ -109,6 +109,38 @@ pub fn install_service(
             .output();
     }
 
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )?;
+
+    let mut was_running = false;
+    // Stop existing service if running before overwriting its binary
+    if let Ok(existing) = manager.open_service(
+        service_name,
+        windows_service::service::ServiceAccess::STOP
+            | windows_service::service::ServiceAccess::QUERY_STATUS,
+    ) {
+        if let Ok(svc_status) = existing.query_status()
+            && svc_status.current_state != ServiceState::Stopped
+        {
+            was_running = true;
+            tracing::info!(
+                service_name,
+                "stopping existing service before binary update"
+            );
+            let _ = existing.stop();
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(500));
+                if let Ok(st) = existing.query_status()
+                    && st.current_state == ServiceState::Stopped
+                {
+                    break;
+                }
+            }
+        }
+    }
+
     let current_exe = std::env::current_exe()?;
     let target_exe = options.target_dir.join("rustctrl-agent.exe");
     if current_exe != target_exe {
@@ -117,18 +149,44 @@ pub fn install_service(
 
     let target_config = options.target_dir.join("config.toml");
     let target_artifact = options.target_dir.join("artifact.toml");
-    if !target_config.exists() {
-        if let Some(art) = &options.artifact {
-            if art != &target_artifact && art.exists() {
-                std::fs::copy(art, &target_artifact)?;
+
+    // Copy explicit config and referenced certificates if provided
+    if let Some(cfg) = &options.config
+        && cfg.exists()
+        && cfg != &target_config
+    {
+        std::fs::copy(cfg, &target_config)?;
+        if let Some(parent) = cfg.parent() {
+            for cert_name in ["ca.pem", "cert.pem", "key.pem"] {
+                let src_cert = parent.join(cert_name);
+                let dst_cert = options.target_dir.join(cert_name);
+                if src_cert.exists() && src_cert != dst_cert {
+                    let _ = std::fs::copy(src_cert, dst_cert);
+                }
             }
         }
     }
 
-    let manager = ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
-    )?;
+    if !target_config.exists()
+        && let Some(art) = &options.artifact
+        && art != &target_artifact
+        && art.exists()
+    {
+        std::fs::copy(art, &target_artifact)?;
+    }
+
+    let mut launch_arguments: Vec<OsString> = vec![
+        "service".into(),
+        "--target-dir".into(),
+        options.target_dir.clone().into(),
+    ];
+    if target_config.exists() {
+        launch_arguments.push("--config".into());
+        launch_arguments.push(target_config.into());
+    } else {
+        launch_arguments.push("--artifact".into());
+        launch_arguments.push(target_artifact.into());
+    }
 
     let info = ServiceInfo {
         name: service_name.into(),
@@ -137,13 +195,7 @@ pub fn install_service(
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: target_exe,
-        launch_arguments: vec![
-            "service".into(),
-            "--target-dir".into(),
-            options.target_dir.into(),
-            "--artifact".into(),
-            target_artifact.into(),
-        ],
+        launch_arguments,
         dependencies: vec![],
         account_name: None,
         account_password: None,
@@ -176,7 +228,7 @@ pub fn install_service(
     let _ = service
         .set_description("RustCtrl Windows Agent service for fleet management and monitoring");
 
-    if start {
+    if start || was_running {
         tracing::info!(service_name, "starting Windows service");
         let _ = service.start(&[] as &[&str]);
     }

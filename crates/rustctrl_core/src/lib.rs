@@ -211,6 +211,34 @@ impl AgentInstallationArtifact {
     }
 }
 
+/// Returns true if the provided slice contains a valid Windows PE header (MZ at offset 0, valid PE signature at e_lfanew).
+pub fn is_windows_pe_executable(data: &[u8]) -> bool {
+    if data.len() < 64 {
+        return false;
+    }
+    if data[0..2] != [0x4d, 0x5a] {
+        return false;
+    }
+    let pe_offset = u32::from_le_bytes(data[0x3c..0x40].try_into().unwrap_or([0; 4])) as usize;
+    if pe_offset.checked_add(4).is_none() || pe_offset + 4 > data.len() {
+        return false;
+    }
+    data[pe_offset..pe_offset + 4] == [0x50, 0x45, 0x00, 0x00]
+}
+
+/// Generates a minimal valid mock Windows PE executable header for testing.
+pub fn mock_windows_pe_binary() -> Vec<u8> {
+    let mut bin = vec![0u8; 256];
+    bin[0] = b'M';
+    bin[1] = b'Z';
+    bin[0x3c] = 0x80;
+    bin[0x80] = b'P';
+    bin[0x81] = b'E';
+    bin[0x82] = 0;
+    bin[0x83] = 0;
+    bin
+}
+
 /// A ready-to-install Windows Agent package prepared by the Controller.
 ///
 /// Contains the pinned Agent executable, the deployment's installation authorization artifact,
@@ -224,6 +252,10 @@ pub struct AgentInstallationPackage {
 impl AgentInstallationPackage {
     pub fn new(artifact: AgentInstallationArtifact, agent_binary: Vec<u8>) -> Result<Self> {
         ensure!(!agent_binary.is_empty(), "agent binary must not be empty");
+        ensure!(
+            is_windows_pe_executable(&agent_binary),
+            "agent binary must be a Windows PE executable (starting with MZ/PE header); Linux diagnostic binaries are not supported for Windows packages"
+        );
         Ok(Self {
             artifact,
             agent_binary,
@@ -249,10 +281,37 @@ impl AgentInstallationPackage {
     pub fn assemble_to_dir(&self, target_dir: &Path) -> Result<()> {
         fs::create_dir_all(target_dir)
             .with_context(|| format!("create package directory {}", target_dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(target_dir, fs::Permissions::from_mode(0o700));
+        }
         for (name, content) in self.files()? {
-            let file_path = target_dir.join(name);
-            fs::write(&file_path, content)
-                .with_context(|| format!("write package file {}", file_path.display()))?;
+            let file_path = target_dir.join(&name);
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mode = if name == "rustctrl-agent.exe" || name.ends_with(".ps1") {
+                    0o700
+                } else {
+                    0o600
+                };
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(mode)
+                    .open(&file_path)
+                    .with_context(|| format!("create package file {}", file_path.display()))?;
+                file.write_all(&content)
+                    .with_context(|| format!("write package file {}", file_path.display()))?;
+            }
+            #[cfg(not(unix))]
+            {
+                fs::write(&file_path, &content)
+                    .with_context(|| format!("write package file {}", file_path.display()))?;
+            }
         }
         Ok(())
     }
@@ -295,12 +354,22 @@ pub fn resolve_agent_binary(explicit: Option<&Path>) -> Result<PathBuf> {
             "pinned agent executable not found at '{}'",
             path.display()
         );
+        let data = fs::read(path)
+            .with_context(|| format!("read candidate binary from '{}'", path.display()))?;
+        ensure!(
+            is_windows_pe_executable(&data),
+            "specified binary '{}' is not a Windows PE executable",
+            path.display()
+        );
         return Ok(path.to_path_buf());
     }
 
     if let Some(val) = std::env::var_os("RUSTCTRL_AGENT_BINARY") {
         let path = PathBuf::from(val);
-        if path.exists() {
+        if path.exists()
+            && let Ok(data) = fs::read(&path)
+            && is_windows_pe_executable(&data)
+        {
             return Ok(path);
         }
     }
@@ -309,36 +378,37 @@ pub fn resolve_agent_binary(explicit: Option<&Path>) -> Result<PathBuf> {
         && let Some(parent) = current_exe.parent()
     {
         let candidate_exe = parent.join("rustctrl-agent.exe");
-        if candidate_exe.exists() {
+        if candidate_exe.exists()
+            && let Ok(data) = fs::read(&candidate_exe)
+            && is_windows_pe_executable(&data)
+        {
             return Ok(candidate_exe);
-        }
-        let candidate_bin = parent.join("rustctrl-agent");
-        if candidate_bin.exists() {
-            return Ok(candidate_bin);
         }
     }
 
     let search_paths = [
         "rustctrl-agent.exe",
-        "rustctrl-agent",
         "target/x86_64-pc-windows-msvc/debug/rustctrl-agent.exe",
         "target/x86_64-pc-windows-msvc/release/rustctrl-agent.exe",
+        "target/x86_64-pc-windows-gnu/debug/rustctrl-agent.exe",
+        "target/x86_64-pc-windows-gnu/release/rustctrl-agent.exe",
         "target/debug/rustctrl-agent.exe",
         "target/release/rustctrl-agent.exe",
-        "target/debug/rustctrl-agent",
-        "target/release/rustctrl-agent",
         ".local/bin/rustctrl-agent.exe",
     ];
 
     for rel in search_paths {
         let candidate = PathBuf::from(rel);
-        if candidate.exists() {
+        if candidate.exists()
+            && let Ok(data) = fs::read(&candidate)
+            && is_windows_pe_executable(&data)
+        {
             return Ok(candidate);
         }
     }
 
     anyhow::bail!(
-        "pinned agent executable not found; specify path via --agent-binary or RUSTCTRL_AGENT_BINARY"
+        "pinned Windows agent executable not found; specify path via --agent-binary or RUSTCTRL_AGENT_BINARY"
     )
 }
 
@@ -629,7 +699,24 @@ pub fn write_zip_archive(path: &Path, files: &[(&str, &[u8])]) -> Result<()> {
     out.extend_from_slice(&cd_offset.to_le_bytes()); // offset of start of central directory
     out.extend_from_slice(&0_u16.to_le_bytes()); // comment length
 
-    fs::write(path, out).with_context(|| format!("write zip archive to {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("create zip file {}", path.display()))?;
+        file.write_all(&out)
+            .with_context(|| format!("write zip archive to {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, out).with_context(|| format!("write zip archive to {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -849,7 +936,7 @@ mod tests {
             installation_secret: "secret-token-xyz".into(),
             created_at_unix_ms: 1700000000000,
         };
-        let agent_binary = b"MZ_MOCK_WINDOWS_PE_EXECUTABLE_BINARY_DATA".to_vec();
+        let agent_binary = mock_windows_pe_binary();
         let package = AgentInstallationPackage::new(artifact.clone(), agent_binary.clone())?;
 
         // 1. Export to directory
