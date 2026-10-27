@@ -1,304 +1,64 @@
-use anyhow::{Context, Result};
+//! Server persistence facade and store coordinator.
+//!
+//! # Domain Scope
+//! This module provides the unified [`DeviceStore`] facade coordinator for all persistence
+//! operations in the RustCtrl Server, including fleet inventory, staff accounts, staff sessions,
+//! installation authorizations, device enrollments, and audit logging.
+//!
+//! # Canonical Terms (from [CONTEXT.md](../../../../CONTEXT.md))
+//! - **Server**: The shared authority for staff accounts, inventory, Remote Sessions, Management Tasks, and activity history.
+//! - **Device**: A Windows computer or Android TV recorded in the fleet inventory.
+//! - **Fleet Inventory**: Operational list of Devices and information needed to identify and access them.
+//! - **Staff Account**: Individual IT staff member identity with Admin or Operator role.
+//! - **Staff Session**: Revocable period of access to RustCtrl under a Staff Account.
+//! - **Installation Authorization**: Admin-granted permission for new Agents to join.
+//! - **Inventory Cleanup**: Removal of an offline Device entry without revoking Agent access.
+//! - **Device Block**: Denying operational Agent access while keeping Device visible in inventory.
+//!
+//! # Invariants and Architectural Guarantees
+//! - The [`DeviceStore`] facade coordinates all persistence operations with thread-safe access.
+//! - Atomic transactions guarantee consistent updates across related entities (e.g. metadata transfers, replacements).
+//! - All domain types are re-exported directly from the store module root to preserve caller compatibility.
+//!
+//! # Forbidden Anti-Patterns
+//! - Never use IP address as device identity (Devices are identified by permanent `DeviceId`).
+//! - Never treat Inventory Cleanup as Device Block (Cleanup allows re-registration; Block denies access).
+//! - Never conflate Staff Session with Remote Session (Staff Session is Controller access; Remote Session is screen control).
+//! - Never allow shared staff accounts or Controller certificates as staff identity.
+//!
+//! # Applicable Architecture Decision Records (ADRs)
+//! - [ADR 0001: Centralize Fleet Coordination](../../../../docs/adr/0001-centralize-fleet-coordination.md)
+//! - [ADR 0003: Bootstrap Staff Administration Locally](../../../../docs/adr/0003-bootstrap-staff-administration-locally.md)
+//! - [ADR 0004: Enroll Agents Through Trusted Installation](../../../../docs/adr/0004-enroll-agents-through-trusted-installation.md)
+//! - [ADR 0005: Keep Remembered Staff Access Revocable](../../../../docs/adr/0005-keep-remembered-staff-access-revocable.md)
+//! - [ADR 0006: Separate Inventory Cleanup from Device Blocking](../../../../docs/adr/0006-separate-inventory-cleanup-from-device-blocking.md)
+//! - [ADR 0007: Provision Agent Credentials via Scoped Issuing Authority](../../../../docs/adr/0007-provision-agent-credentials-via-scoped-issuing-authority.md)
+
+pub(crate) mod helpers;
+pub(crate) mod schema;
+pub mod types;
+
+pub use types::{
+    ActivityRecord, DeviceEnrollmentRecord, DeviceRecord, DeviceReplacementRecord,
+    InstallationAuthorizationRecord, RevokeAuthorizationOutcome, StaffAccount, StaffRole,
+    StaffSession, TargetRecord,
+};
+
+use anyhow::Result;
+use helpers::{current_time_ms, reset_account_password_to_temporary, validate_username};
 use rusqlite::{Connection, OptionalExtension, params};
 use rustctrl_core::DeviceId;
 use std::{
     path::Path,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
-
-fn current_time_ms() -> Result<i64> {
-    Ok(i64::try_from(
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
-    )?)
-}
-
-fn validate_username(username: &str) -> Result<String> {
-    let username = username.trim().to_string();
-    anyhow::ensure!(
-        !username.is_empty() && username.len() <= 64,
-        "username must contain 1 to 64 characters"
-    );
-    anyhow::ensure!(
-        username
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'),
-        "username may only contain alphanumeric characters, '.', '_', or '-'"
-    );
-    Ok(username)
-}
-
-// Caller keeps the transaction open so reset and its activity record commit together.
-fn reset_account_password_to_temporary(
-    tx: &rusqlite::Transaction<'_>,
-    username: &str,
-    password_hash: &str,
-    now: i64,
-) -> Result<()> {
-    let changed = tx.execute(
-        "UPDATE staff_accounts SET password_hash = ?1, must_change_password = 1, updated_at_unix_ms = ?2 WHERE username = ?3",
-        params![password_hash, now, username],
-    )?;
-    anyhow::ensure!(changed == 1, "account '{username}' not found");
-    tx.execute(
-        "UPDATE staff_sessions SET revoked = 1 WHERE username = ?1 AND revoked = 0",
-        params![username],
-    )?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StaffRole {
-    Admin,
-    Operator,
-}
-
-impl StaffRole {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            StaffRole::Admin => "admin",
-            StaffRole::Operator => "operator",
-        }
-    }
-}
-
-impl std::str::FromStr for StaffRole {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "admin" => Ok(StaffRole::Admin),
-            "operator" => Ok(StaffRole::Operator),
-            _ => anyhow::bail!("unknown role: {s}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct StaffAccount {
-    pub username: String,
-    pub role: StaffRole,
-    pub password_hash: String,
-    pub must_change_password: bool,
-    pub active: bool,
-    pub created_at_unix_ms: i64,
-    pub updated_at_unix_ms: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct StaffSession {
-    pub session_id: String,
-    pub username: String,
-    pub role: StaffRole,
-    pub must_change_password: bool,
-    pub created_at_unix_ms: i64,
-    pub last_seen_unix_ms: i64,
-    pub revoked: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct ActivityRecord {
-    pub id: i64,
-    pub server_time_unix_ms: i64,
-    pub actor: String,
-    pub action: String,
-    pub result: String,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct DeviceRecord {
-    pub device_id: String,
-    pub name: String,
-    pub agent_version: String,
-    pub last_address: Option<String>,
-    pub last_seen_unix_ms: i64,
-    pub location: Option<String>,
-    pub device_type: String,
-    pub configured_address: Option<String>,
-    pub blocked: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct TargetRecord {
-    pub target_id: String,
-    pub display_name: String,
-    pub target_type: String,
-    pub configured_address: String,
-    pub location: Option<String>,
-    pub created_at_unix_ms: i64,
-    pub updated_at_unix_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceReplacementRecord {
-    pub prior_device_id: String,
-    pub replacement_device_id: String,
-    pub replaced_at_unix_ms: i64,
-    pub replaced_by: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallationAuthorizationRecord {
-    pub authorization_id: String,
-    pub secret_hash: String,
-    pub created_at_unix_ms: i64,
-    pub created_by: String,
-    pub revoked_at_unix_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RevokeAuthorizationOutcome {
-    NotFound,
-    AlreadyRevoked,
-    Revoked(InstallationAuthorizationRecord),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceEnrollmentRecord {
-    pub device_id: String,
-    pub authorization_id: String,
-    pub enrolled_at_unix_ms: i64,
-    pub resumption_secret_hash: Option<String>,
-}
 
 #[derive(Clone)]
 pub struct DeviceStore(Arc<Mutex<Connection>>);
 
 impl DeviceStore {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        let connection = Connection::open(path).context("open inventory database")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS bootstrap_devices (
-                device_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                agent_version TEXT NOT NULL,
-                last_address TEXT,
-                last_seen_unix_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS staff_accounts (
-                username TEXT PRIMARY KEY,
-                role TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                must_change_password INTEGER NOT NULL DEFAULT 0,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at_unix_ms INTEGER NOT NULL,
-                updated_at_unix_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS staff_sessions (
-                session_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                role TEXT NOT NULL,
-                must_change_password INTEGER NOT NULL,
-                created_at_unix_ms INTEGER NOT NULL,
-                last_seen_unix_ms INTEGER NOT NULL,
-                revoked INTEGER NOT NULL DEFAULT 0,
-                expires_at_unix_ms INTEGER,
-                FOREIGN KEY(username) REFERENCES staff_accounts(username)
-            );
-            CREATE TABLE IF NOT EXISTS activity_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                server_time_unix_ms INTEGER NOT NULL,
-                actor TEXT NOT NULL,
-                action TEXT NOT NULL,
-                result TEXT NOT NULL,
-                detail TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS device_metadata (
-                device_id TEXT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                location TEXT,
-                updated_at_unix_ms INTEGER NOT NULL,
-                FOREIGN KEY(device_id) REFERENCES bootstrap_devices(device_id)
-            );
-            CREATE TABLE IF NOT EXISTS connection_targets (
-                target_id TEXT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                target_type TEXT NOT NULL,
-                configured_address TEXT NOT NULL,
-                location TEXT,
-                created_at_unix_ms INTEGER NOT NULL,
-                updated_at_unix_ms INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS blocked_devices (
-                device_id TEXT PRIMARY KEY,
-                blocked_at_unix_ms INTEGER NOT NULL,
-                blocked_by TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS device_replacements (
-                prior_device_id TEXT PRIMARY KEY,
-                replacement_device_id TEXT NOT NULL,
-                replaced_at_unix_ms INTEGER NOT NULL,
-                replaced_by TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS installation_authorizations (
-                authorization_id TEXT PRIMARY KEY,
-                secret_hash TEXT NOT NULL,
-                created_at_unix_ms INTEGER NOT NULL,
-                created_by TEXT NOT NULL,
-                revoked_at_unix_ms INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_installation_authorizations_secret_hash ON installation_authorizations(secret_hash);
-            CREATE TABLE IF NOT EXISTS device_enrollments (
-                device_id TEXT PRIMARY KEY,
-                authorization_id TEXT NOT NULL,
-                enrolled_at_unix_ms INTEGER NOT NULL,
-                resumption_secret_hash TEXT,
-                FOREIGN KEY(authorization_id) REFERENCES installation_authorizations(authorization_id)
-            );
-            CREATE TABLE IF NOT EXISTS known_device_identities (
-                device_id TEXT PRIMARY KEY
-            );
-            INSERT OR IGNORE INTO known_device_identities (device_id) SELECT device_id FROM bootstrap_devices;
-            INSERT OR IGNORE INTO known_device_identities (device_id) SELECT device_id FROM device_enrollments;",
-        )?;
-        // Existing databases predate account deactivation, remembered-session
-        // expiry, and observed device addresses; add missing columns in place.
-        let device_columns: Vec<String> = connection
-            .prepare("SELECT name FROM pragma_table_info('bootstrap_devices')")?
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        if !device_columns.iter().any(|name| name == "last_address") {
-            connection
-                .execute_batch("ALTER TABLE bootstrap_devices ADD COLUMN last_address TEXT;")?;
-        }
-        let staff_columns: Vec<String> = connection
-            .prepare("SELECT name FROM pragma_table_info('staff_accounts')")?
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        if !staff_columns.iter().any(|name| name == "active") {
-            connection.execute_batch(
-                "ALTER TABLE staff_accounts ADD COLUMN active INTEGER NOT NULL DEFAULT 1;",
-            )?;
-        }
-        let session_columns: Vec<String> = connection
-            .prepare("SELECT name FROM pragma_table_info('staff_sessions')")?
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        if !session_columns
-            .iter()
-            .any(|name| name == "expires_at_unix_ms")
-        {
-            connection.execute_batch(
-                "ALTER TABLE staff_sessions ADD COLUMN expires_at_unix_ms INTEGER;",
-            )?;
-        }
-        let enrollment_columns: Vec<String> = connection
-            .prepare("SELECT name FROM pragma_table_info('device_enrollments')")?
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        if !enrollment_columns
-            .iter()
-            .any(|name| name == "resumption_secret_hash")
-        {
-            connection.execute_batch(
-                "ALTER TABLE device_enrollments ADD COLUMN resumption_secret_hash TEXT;",
-            )?;
-        }
+        let connection = schema::open_connection(path)?;
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
 
