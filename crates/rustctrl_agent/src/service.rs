@@ -65,7 +65,21 @@ fn service_main(_arguments: Vec<OsString>) {
 
     let result: Result<()> = (|| {
         let opts = OPTIONS.get().context("missing service options")?.clone();
-        let log_file = opts.target_dir.join("agent.log");
+        let existing_cfg_path = opts
+            .config
+            .as_ref()
+            .filter(|p| p.exists())
+            .cloned()
+            .or_else(|| {
+                let p = opts.target_dir.join("config.toml");
+                if p.exists() { Some(p) } else { None }
+            });
+
+        let log_file =
+            match existing_cfg_path.and_then(|p| rustctrl_core::AgentConfig::load(&p).ok()) {
+                Some(cfg) => cfg.log_file,
+                None => opts.target_dir.join("agent.log"),
+            };
         let _ = rustctrl_core::init_file_logging(&log_file);
 
         let runtime = tokio::runtime::Runtime::new()?;

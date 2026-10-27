@@ -1248,7 +1248,7 @@ impl ControllerApp {
             self.overlay = Overlay::PrepareInstallationArtifact {
                 request_id,
                 output_path: "rustctrl-agent-windows.zip".to_string(),
-                agent_binary_path: "rustctrl-agent.exe".to_string(),
+                agent_binary_path: String::new(),
                 error: None,
                 in_flight: false,
                 success: None,
@@ -5404,7 +5404,7 @@ mod tests {
         let overlay = Overlay::PrepareInstallationArtifact {
             request_id: 15,
             output_path: "agent-artifact.toml".into(),
-            agent_binary_path: "rustctrl-agent.exe".into(),
+            agent_binary_path: String::new(),
             error: None,
             in_flight: true,
             success: None,
