@@ -725,40 +725,41 @@ impl ControllerApp {
                         .await?
                         .into_inner()
                         .devices;
-                    let accounts = if is_admin || reply.role == "admin" {
+                    let accounts_res = if is_admin || reply.role == "admin" {
                         let mut list_req = tonic::Request::new(ListStaffAccountsRequest {});
                         list_req
                             .metadata_mut()
                             .insert("authorization", format!("Bearer {tok_for_req}").parse()?);
-                        client
-                            .list_staff_accounts(list_req)
-                            .await
-                            .map(|r| r.into_inner().accounts)
-                            .unwrap_or_default()
+                        match client.list_staff_accounts(list_req).await {
+                            Ok(r) => Ok(r.into_inner().accounts),
+                            Err(e) => Err(e.to_string()),
+                        }
                     } else {
-                        Vec::new()
+                        Ok(Vec::new())
                     };
-                    let authorizations = if is_admin || reply.role == "admin" {
+                    let authorizations_res = if is_admin || reply.role == "admin" {
                         let mut list_auth_req =
                             tonic::Request::new(ListInstallationAuthorizationsRequest {});
                         list_auth_req
                             .metadata_mut()
                             .insert("authorization", format!("Bearer {tok_for_req}").parse()?);
-                        client
-                            .list_installation_authorizations(list_auth_req)
-                            .await
-                            .map(|r| r.into_inner().authorizations)
-                            .unwrap_or_default()
+                        match client.list_installation_authorizations(list_auth_req).await {
+                            Ok(r) => Ok(r.into_inner().authorizations),
+                            Err(e) => Err(e.to_string()),
+                        }
                     } else {
-                        Vec::new()
+                        Ok(Vec::new())
                     };
-                    Ok::<_, anyhow::Error>((reply, devices, accounts, authorizations))
+                    Ok::<_, anyhow::Error>((reply, devices, accounts_res, authorizations_res))
                 })
                 .await;
 
             let _ = this.update(cx, |view, cx| {
                 if let ScreenState::Connected {
                     session_token: tok,
+                    username,
+                    role,
+                    registered_devices,
                     devices,
                     accounts,
                     authorizations,
@@ -773,14 +774,38 @@ impl ControllerApp {
                     && *tok == tok_for_update
                 {
                     match res {
-                        Ok(Ok((reply, devices_reply, accs, auths))) => {
-                            let (updated_accounts, updated_authorizations) =
-                                if reply.role == "admin" {
-                                    (accs, auths)
-                                } else {
-                                    (Vec::new(), Vec::new())
-                                };
-                            let keep_error = error.clone();
+                        Ok(Ok((reply, devices_reply, accs_res, auths_res))) => {
+                            let mut err_msg = None;
+                            let updated_accounts = if reply.role == "admin" {
+                                match accs_res {
+                                    Ok(accs) => accs,
+                                    Err(e) => {
+                                        err_msg =
+                                            Some(format!("Failed to list staff accounts: {e}"));
+                                        accounts.clone()
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            let updated_authorizations = if reply.role == "admin" {
+                                match auths_res {
+                                    Ok(auths) => auths,
+                                    Err(e) => {
+                                        let msg = format!(
+                                            "Failed to list installation authorizations: {e}"
+                                        );
+                                        err_msg = Some(match err_msg {
+                                            Some(prev) => format!("{prev}; {msg}"),
+                                            None => msg,
+                                        });
+                                        authorizations.clone()
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            let keep_error = err_msg.or_else(|| error.clone());
                             let keep_notice = notice.clone();
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
@@ -802,10 +827,10 @@ impl ControllerApp {
                         Ok(Err(err)) => {
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
-                                username: String::new(),
-                                role: String::new(),
+                                username: username.clone(),
+                                role: role.clone(),
                                 server_version: "Unavailable".into(),
-                                registered_devices: 0,
+                                registered_devices: *registered_devices,
                                 devices: devices.clone(),
                                 accounts: accounts.clone(),
                                 authorizations: authorizations.clone(),
@@ -820,10 +845,10 @@ impl ControllerApp {
                         Err(e) => {
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
-                                username: String::new(),
-                                role: String::new(),
+                                username: username.clone(),
+                                role: role.clone(),
                                 server_version: "Unavailable".into(),
-                                registered_devices: 0,
+                                registered_devices: *registered_devices,
                                 devices: devices.clone(),
                                 accounts: accounts.clone(),
                                 authorizations: authorizations.clone(),
@@ -5044,12 +5069,13 @@ impl Render for ControllerApp {
                         .child(div().text_xl().child("Installation Authorizations"));
 
                     if authorizations.is_empty() {
-                        auth_list = auth_list.child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0x8899aa))
-                                .child("No installation authorizations issued yet."),
-                        );
+                        let empty_text = if error.is_some() {
+                            "Unable to load installation authorizations."
+                        } else {
+                            "No installation authorizations issued yet."
+                        };
+                        auth_list = auth_list
+                            .child(div().text_sm().text_color(rgb(0x8899aa)).child(empty_text));
                     } else {
                         let header_row = div()
                             .flex()
@@ -5713,6 +5739,63 @@ mod tests {
             assert_eq!(authorizations.len(), 2);
             assert!(authorizations[0].revoked_at_unix_ms.is_none());
             assert_eq!(authorizations[1].revoked_at_unix_ms, Some(3000));
+        } else {
+            panic!("expected Connected state");
+        }
+    }
+
+    #[test]
+    fn connected_state_preserves_authorizations_when_refresh_fails() {
+        let auth_active = InstallationAuthorizationEntry {
+            authorization_id: "auth-preserved".into(),
+            created_at_unix_ms: 1000,
+            created_by: "admin".into(),
+            revoked_at_unix_ms: None,
+        };
+        let mut state = ScreenState::Connected {
+            session_token: "token-1".into(),
+            username: "admin".into(),
+            role: "admin".into(),
+            server_version: "1.0.0".into(),
+            registered_devices: 1,
+            devices: Vec::new(),
+            accounts: Vec::new(),
+            authorizations: vec![auth_active.clone()],
+            new_account_username: String::new(),
+            new_account_role: "operator".into(),
+            new_account_password: String::new(),
+            error: None,
+            notice: None,
+            in_flight: false,
+        };
+
+        let auths_res: Result<Vec<InstallationAuthorizationEntry>, String> =
+            Err("connection timeout".into());
+        if let ScreenState::Connected {
+            authorizations,
+            error,
+            ..
+        } = &mut state
+        {
+            let updated_authorizations = match auths_res {
+                Ok(fresh) => fresh,
+                Err(err) => {
+                    *error = Some(format!("Failed to list installation authorizations: {err}"));
+                    authorizations.clone()
+                }
+            };
+            *authorizations = updated_authorizations;
+        }
+
+        if let ScreenState::Connected {
+            authorizations,
+            error,
+            ..
+        } = state
+        {
+            assert_eq!(authorizations.len(), 1);
+            assert_eq!(authorizations[0].authorization_id, "auth-preserved");
+            assert!(error.as_ref().unwrap().contains("connection timeout"));
         } else {
             panic!("expected Connected state");
         }
