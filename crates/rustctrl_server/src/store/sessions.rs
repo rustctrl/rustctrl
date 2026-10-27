@@ -376,4 +376,76 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn login_session_rejects_credentials_superseded_by_a_password_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = DeviceStore::open(&temp.path().join("store.db"))?;
+        store
+            .bootstrap_admin("alice".into(), "TempPass1234!".into())
+            .await?;
+
+        let account = store
+            .get_staff_account("alice")
+            .await?
+            .expect("bootstrapped account");
+        let session = store
+            .create_login_session(
+                "s1".into(),
+                "alice".into(),
+                account.password_hash.clone(),
+                None,
+            )
+            .await?;
+        let session = session.expect("current hash yields a session");
+        assert!(session.must_change_password);
+        assert_eq!(session.role, StaffRole::Admin);
+
+        // A password change supersedes the verified hash; a login that verified
+        // the old hash must not produce a session.
+        let new_hash = crate::password::hash_password("NewPermanent123!")?;
+        store
+            .update_password("alice", new_hash.clone(), false)
+            .await?;
+        let stale = store
+            .create_login_session("s2".into(), "alice".into(), account.password_hash, None)
+            .await?;
+        assert!(stale.is_none(), "stale hash must not create a session");
+
+        // The new hash still yields one, reflecting the fresh account state.
+        let fresh = store
+            .create_login_session("s3".into(), "alice".into(), new_hash, None)
+            .await?
+            .expect("current hash yields a session");
+        assert!(!fresh.must_change_password);
+
+        // Unknown accounts never yield a session.
+        let unknown = store
+            .create_login_session("s4".into(), "ghost".into(), "irrelevant".into(), None)
+            .await?;
+        assert!(unknown.is_none());
+
+        // A remembered session with a past deadline is treated as revoked.
+        let past = store
+            .create_login_session(
+                "s5".into(),
+                "alice".into(),
+                store
+                    .get_staff_account("alice")
+                    .await?
+                    .expect("account")
+                    .password_hash,
+                Some(1),
+            )
+            .await?
+            .expect("session created");
+        assert!(past.created_at_unix_ms > 1);
+        let expired = store.get_session("s5").await?.expect("row exists");
+        assert!(
+            expired.revoked,
+            "expired remembered session must be invalid"
+        );
+
+        Ok(())
+    }
 }
