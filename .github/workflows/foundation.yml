@@ -26,7 +26,7 @@ jobs:
       windows: ${{ steps.filter.outputs.windows }}
       compose: ${{ steps.filter.outputs.compose }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
         with:
           fetch-depth: 0
       - id: filter
@@ -72,6 +72,7 @@ jobs:
               fi
 
               if [[ "$path" == Cargo.toml || "$path" == Cargo.lock || "$path" == rust-toolchain.toml || "$path" == .github/* ]]; then
+                rust=true
                 headless=true
                 controller=true
                 windows=true
@@ -109,7 +110,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
       - run: cargo fmt --all --check
 
   headless:
@@ -117,7 +118,7 @@ jobs:
     if: needs.changes.outputs.headless == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: rustup show
       - run: cargo clippy --locked --workspace --exclude rustctrl_controller --all-targets -- -D warnings
@@ -131,14 +132,19 @@ jobs:
     container: almalinux:10
     steps:
       - run: >-
-          dnf install -y git curl-minimal gcc gcc-c++ pkgconf-pkg-config fontconfig-devel
+          dnf install -y git curl-minimal tar gcc gcc-c++ pkgconf-pkg-config fontconfig-devel
           freetype-devel libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
       - name: Install rustup
-        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Cache Cargo and target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: "almalinux-controller"
       - name: Build and lint GPUI Controller
         run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
           cargo clippy --locked -p rustctrl_controller --all-targets -- -D warnings
           cargo build --locked -p rustctrl_controller
 
@@ -147,7 +153,7 @@ jobs:
     if: needs.changes.outputs.windows == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: rustup show
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -189,7 +195,7 @@ jobs:
     if: needs.changes.outputs.compose == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
       - run: rustup show
       - run: scripts/smoke-compose.sh
 
