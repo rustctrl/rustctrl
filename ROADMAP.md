@@ -2,30 +2,43 @@
 
 RustCtrl is intended to be a self-hosted product, with the Server operated by its deployer. This follows the existing internal-Server architecture and offline operation decisions.
 
-## Next milestone: staff access and fleet inventory
+## Upcoming milestones
 
-Status: design and ticket breakdown approved. Feature spec [#1](https://github.com/rustctrl/rustctrl/issues/1) and 14 implementation tickets are published; implementation has not started.
+### Next milestone: Remote Sessions and Android TV connectivity
 
-Deliver staff access and the minimum Fleet Inventory through the desktop Controller and shared Server, including central activity recording. Remote Sessions, Android TV connectivity integration, and advanced audit search/filter views follow this milestone. RustCtrl operates independently of the office's separate asset inventory application. Windows Devices join automatically through trusted Agent installation; Android TVs are added manually as unverified connection targets.
+Status: pending specification and ticket breakdown. Follows the completed staff access and Fleet Inventory milestone.
 
-Feature requirements and acceptance criteria live in [Spec: self-hosted staff access and minimal Fleet Inventory](https://github.com/rustctrl/rustctrl/issues/1) and its implementation tickets below. Blocking relationships are recorded natively in GitHub and in each ticket body. Start with [#2](https://github.com/rustctrl/rustctrl/issues/2), then select an open, unassigned ticket whose blockers are all closed.
+Planned capabilities:
+- Unattended Remote Sessions for Windows endpoints (WebRTC media plane, screen capture, input control, single operator lock per device).
+- Android TV connectivity integration (ADB and scrcpy bridge via the central Server).
+- Advanced audit search and filtering.
 
-## Implementation tickets
+Requirements will be synthesized into feature specifications and implementation tickets as the milestone is planned.
 
-1. [#2: Bootstrap the first Admin and sign in through the Controller](https://github.com/rustctrl/rustctrl/issues/2).
-2. [#3: Create Staff Accounts and change roles through the Controller](https://github.com/rustctrl/rustctrl/issues/3).
-3. [#4: Change passwords, reset staff access, and recover an existing Admin](https://github.com/rustctrl/rustctrl/issues/4).
-4. [#5: Deactivate Staff Accounts without losing the last active Admin](https://github.com/rustctrl/rustctrl/issues/5).
-5. [#6: Remember staff login across Controller restarts with independent sessions](https://github.com/rustctrl/rustctrl/issues/6).
-6. [#7: Show the shared Windows Fleet Inventory with real heartbeat status](https://github.com/rustctrl/rustctrl/issues/7).
-7. [#8: Edit Device display names and optional locations through the Controller](https://github.com/rustctrl/rustctrl/issues/8).
-8. [#9: Manage Android TV connection targets as unverified inventory entries](https://github.com/rustctrl/rustctrl/issues/9).
-9. [#10: Block and unblock Device identities while retaining visible inventory records](https://github.com/rustctrl/rustctrl/issues/10).
-10. [#11: Clean offline inventory entries without revoking authorized Agent access](https://github.com/rustctrl/rustctrl/issues/11).
-11. [#12: Replace an inventory entry explicitly after Device identity loss](https://github.com/rustctrl/rustctrl/issues/12).
-12. [#13: Prepare Installation Authorization in the Controller and enroll distinct Agents automatically](https://github.com/rustctrl/rustctrl/issues/13).
-13. [#14: Install and update Controller-generated Windows Agent packages as a service](https://github.com/rustctrl/rustctrl/issues/14).
-14. [#15: Revoke and replace Installation Authorizations without interrupting enrolled Devices](https://github.com/rustctrl/rustctrl/issues/15).
+## Completed milestones
+
+### Staff access and minimal Fleet Inventory
+
+Status: completed. Feature spec [#1](https://github.com/rustctrl/rustctrl/issues/1) and all 14 implementation tickets ([#2](https://github.com/rustctrl/rustctrl/issues/2) through [#15](https://github.com/rustctrl/rustctrl/issues/15)) delivered and verified.
+
+Delivered staff access and the minimum Fleet Inventory through the desktop Controller and shared Server, including central activity recording, trusted Windows Agent service enrollment and lifecycle management, unverified Android TV targets, and durable access controls.
+
+#### Implementation tickets
+
+1. [#2: Bootstrap the first Admin and sign in through the Controller](https://github.com/rustctrl/rustctrl/issues/2) (completed).
+2. [#3: Create Staff Accounts and change roles through the Controller](https://github.com/rustctrl/rustctrl/issues/3) (completed).
+3. [#4: Change passwords, reset staff access, and recover an existing Admin](https://github.com/rustctrl/rustctrl/issues/4) (completed).
+4. [#5: Deactivate Staff Accounts without losing the last active Admin](https://github.com/rustctrl/rustctrl/issues/5) (completed).
+5. [#6: Remember staff login across Controller restarts with independent sessions](https://github.com/rustctrl/rustctrl/issues/6) (completed).
+6. [#7: Show the shared Windows Fleet Inventory with real heartbeat status](https://github.com/rustctrl/rustctrl/issues/7) (completed).
+7. [#8: Edit Device display names and optional locations through the Controller](https://github.com/rustctrl/rustctrl/issues/8) (completed).
+8. [#9: Manage Android TV connection targets as unverified inventory entries](https://github.com/rustctrl/rustctrl/issues/9) (completed).
+9. [#10: Block and unblock Device identities while retaining visible inventory records](https://github.com/rustctrl/rustctrl/issues/10) (completed).
+10. [#11: Clean offline inventory entries without revoking authorized Agent access](https://github.com/rustctrl/rustctrl/issues/11) (completed).
+11. [#12: Replace an inventory entry explicitly after Device identity loss](https://github.com/rustctrl/rustctrl/issues/12) (completed).
+12. [#13: Prepare Installation Authorization in the Controller and enroll distinct Agents automatically](https://github.com/rustctrl/rustctrl/issues/13) (completed).
+13. [#14: Install and update Controller-generated Windows Agent packages as a service](https://github.com/rustctrl/rustctrl/issues/14) (completed).
+14. [#15: Revoke and replace Installation Authorizations without interrupting enrolled Devices](https://github.com/rustctrl/rustctrl/issues/15) (completed).
 
 ## Architecture decisions
 
