@@ -1,3 +1,34 @@
+//! gRPC transport services and entrypoints for the RustCtrl Server.
+//!
+//! # Domain Scope
+//! This module provides the gRPC transport layer coordinating Agent communication, staff
+//! administration, and transport security. It houses submodules for mutual TLS certificate
+//! inspection (`tls`) and staff authorization middleware (`middleware`), along with the public
+//! server startup entrypoints (`serve` and `serve_on`).
+//!
+//! # Canonical Terms (from [CONTEXT.md](../../../../CONTEXT.md))
+//! - **Server**: The shared authority for staff accounts, inventory, Remote Sessions,
+//!   Management Tasks, and activity history. Avoid: Controller.
+//! - **Device**: A Windows computer or Android TV recorded in the fleet inventory. Its identity
+//!   remains the same when its network address changes. Avoid: IP address as device identity.
+//! - **Fleet**: All Devices managed by the IT team through RustCtrl. Avoid: IP list.
+//! - **Controller**: The staff application for accessing the Fleet. Avoid: Server, Agent.
+//! - **Agent**: The RustCtrl component representing a Windows Device in the Fleet. Avoid: Controller.
+//! - **Staff Account**: An individual IT staff member's identity in RustCtrl. Avoid: shared account.
+//! - **Staff Session**: A revocable period of access to RustCtrl through the Controller under a
+//!   Staff Account. Avoid: Remote Session, Agent connection.
+//!
+//! # Invariants and Architectural Guarantees
+//! - **Mutual TLS (ADR 0002)**: All connections require mutual TLS verification distinguishing
+//!   enrolled Agents, enrollment bootstrap clients, and Controllers.
+//! - **Role-Based Authorization (ADR 0003, ADR 0005)**: Staff operations strictly enforce
+//!   role permissions and revocable session validity.
+//! - **Subordinate Agent CA (ADR 0007)**: Leaf agent credentials are provisioned through a scoped
+//!   issuing authority without exposing the root CA private key.
+
+pub mod middleware;
+pub mod tls;
+
 use crate::{
     config::ServerConfig,
     issuer::AgentIssuer,
@@ -34,7 +65,6 @@ use tonic::{
     Request, Response, Status,
     transport::{Certificate, Identity, Server, ServerTlsConfig},
 };
-use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 fn hash_secret(secret: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, secret.as_bytes());
@@ -97,30 +127,7 @@ impl Bootstrap for BootstrapService {
         {
             return Err(Status::invalid_argument("invalid name or agent_version"));
         }
-        let certs = request
-            .peer_certs()
-            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
-        let leaf = certs
-            .first()
-            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
-        let (_, cert) = parse_x509_certificate(leaf.as_ref())
-            .map_err(|_| Status::unauthenticated("invalid client certificate"))?;
-        let expected = id.certificate_name();
-        let san = cert
-            .subject_alternative_name()
-            .map_err(|_| Status::unauthenticated("invalid certificate SAN"))?;
-        let matches = san.is_some_and(|extension| {
-            extension
-                .value
-                .general_names
-                .iter()
-                .any(|name| matches!(name, GeneralName::DNSName(value) if *value == expected))
-        });
-        if !matches {
-            return Err(Status::permission_denied(
-                "certificate does not identify this device",
-            ));
-        }
+        tls::verify_agent_certificate(&request, &id)?;
 
         if self
             .store
@@ -175,31 +182,7 @@ impl Bootstrap for BootstrapService {
         if body.installation_secret.trim().is_empty() {
             return Err(Status::unauthenticated("installation secret is required"));
         }
-
-        let certs = request
-            .peer_certs()
-            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
-        let leaf = certs
-            .first()
-            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
-        let (_, cert) = parse_x509_certificate(leaf.as_ref())
-            .map_err(|_| Status::unauthenticated("invalid client certificate"))?;
-        let san = cert
-            .subject_alternative_name()
-            .map_err(|_| Status::unauthenticated("invalid certificate SAN"))?;
-        let matches = san.is_some_and(|extension| {
-            extension.value.general_names.iter().any(|name| {
-                matches!(
-                    name,
-                    GeneralName::DNSName(value) if *value == "enrollment.rustctrl.internal"
-                )
-            })
-        });
-        if !matches {
-            return Err(Status::permission_denied(
-                "certificate does not authorize agent enrollment",
-            ));
-        }
+        tls::verify_enrollment_certificate(&request)?;
 
         let secret_hash = hash_secret(body.installation_secret.trim());
         let auth = match self
@@ -389,41 +372,14 @@ impl StaffAuthService {
         &self,
         request: &Request<T>,
     ) -> Result<crate::store::StaffSession, Status> {
-        let token = request
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.strip_prefix("Bearer ").unwrap_or(s).trim())
-            .or_else(|| {
-                request
-                    .metadata()
-                    .get("session-token")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.trim())
-            });
-
-        let token = match token {
-            Some(t) if !t.is_empty() => t,
-            _ => return Err(Status::unauthenticated("staff session required")),
-        };
-
-        match self.store.get_session(token).await {
-            Ok(Some(session)) if !session.revoked => Ok(session),
-            _ => Err(Status::unauthenticated("invalid or revoked staff session")),
-        }
+        middleware::authenticate_request(&self.store, request).await
     }
 
     async fn authenticate_staff<T>(
         &self,
         request: &Request<T>,
     ) -> Result<crate::store::StaffSession, Status> {
-        let session = self.authenticate_request(request).await?;
-        if session.must_change_password {
-            return Err(Status::permission_denied(
-                "password change required before accessing protected operations",
-            ));
-        }
-        Ok(session)
+        middleware::authenticate_staff(&self.store, request).await
     }
 
     async fn authenticate_admin<T>(
@@ -432,30 +388,7 @@ impl StaffAuthService {
         action: &str,
         target: Option<&str>,
     ) -> Result<crate::store::StaffSession, Status> {
-        let session = self.authenticate_request(request).await?;
-        if session.must_change_password {
-            return Err(Status::permission_denied(
-                "password change required before accessing protected operations",
-            ));
-        }
-        if session.role != crate::store::StaffRole::Admin {
-            let detail = if let Some(tgt) = target {
-                format!("operator cannot perform '{action}' on target '{tgt}'")
-            } else {
-                format!("operator cannot perform '{action}'")
-            };
-            let _ = self
-                .store
-                .record_activity(
-                    session.username.clone(),
-                    action.into(),
-                    "rejected".into(),
-                    detail,
-                )
-                .await;
-            return Err(Status::permission_denied("admin role required"));
-        }
-        Ok(session)
+        middleware::authenticate_admin(&self.store, request, action, target).await
     }
 }
 
