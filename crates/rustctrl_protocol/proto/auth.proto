@@ -22,6 +22,8 @@ service StaffAuth {
   rpc CreateStaffAccount(CreateStaffAccountRequest) returns (CreateStaffAccountReply);
   rpc ChangeStaffRole(ChangeStaffRoleRequest) returns (ChangeStaffRoleReply);
   rpc PrepareInstallationArtifact(PrepareInstallationArtifactRequest) returns (PrepareInstallationArtifactReply);
+  rpc ListInstallationAuthorizations(ListInstallationAuthorizationsRequest) returns (ListInstallationAuthorizationsReply);
+  rpc RevokeInstallationAuthorization(RevokeInstallationAuthorizationRequest) returns (RevokeInstallationAuthorizationReply);
 }
 
 message LoginRequest {
@@ -232,4 +234,28 @@ message PrepareInstallationArtifactReply {
   string installation_secret = 7;
   int64 created_at_unix_ms = 8;
 }
+
+message InstallationAuthorizationEntry {
+  string authorization_id = 1;
+  int64 created_at_unix_ms = 2;
+  string created_by = 3;
+  optional int64 revoked_at_unix_ms = 4;
+}
+
+message ListInstallationAuthorizationsRequest {}
+
+message ListInstallationAuthorizationsReply {
+  repeated InstallationAuthorizationEntry authorizations = 1;
+}
+
+message RevokeInstallationAuthorizationRequest {
+  string authorization_id = 1;
+}
+
+message RevokeInstallationAuthorizationReply {
+  bool success = 1;
+  string authorization_id = 2;
+  int64 revoked_at_unix_ms = 3;
+}
+
 
