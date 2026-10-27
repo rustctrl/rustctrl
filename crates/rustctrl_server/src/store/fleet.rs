@@ -1231,91 +1231,149 @@ mod tests {
     async fn clean_offline_device_removes_entry_without_revoking_access_and_preserves_attribution()
     -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let store = DeviceStore::open(&temp.path().join("store.db"))?;
+        let db_path = temp.path().join("store.db");
+        let store = DeviceStore::open(&db_path)?;
         let dev_id = DeviceId::new();
 
-        // 1. Device registers via heartbeat with curated metadata
+        // 1. Invalid device ID fails.
+        let invalid_err = store
+            .clean_offline_device("not-a-uuid", 60)
+            .await
+            .unwrap_err();
+        assert!(invalid_err.to_string().contains("invalid device_id"));
+
+        // 2. Non-existent device fails.
+        let not_found_err = store
+            .clean_offline_device(&dev_id.to_string(), 60)
+            .await
+            .unwrap_err();
+        assert!(not_found_err.to_string().contains("not found"));
+
+        // 3. Connection target cannot be cleaned via clean_offline_device.
+        let target = store
+            .create_target(
+                "Boardroom TV",
+                "192.168.1.50:5555",
+                Some("android_tv"),
+                None,
+            )
+            .await?;
+        let target_clean_err = store
+            .clean_offline_device(&target.target_id, 60)
+            .await
+            .unwrap_err();
+        assert!(
+            target_clean_err.to_string().contains("connection target"),
+            "cleaning a connection target must fail: {target_clean_err}"
+        );
+
+        // 4. Register a Windows device and update metadata.
         store
             .heartbeat(
                 dev_id,
-                "WIN-CLEANUP-TEST".into(),
+                "WORKSTATION-01".into(),
                 "1.0.0".into(),
                 Some("192.168.1.100:5000".into()),
             )
             .await?;
         store
-            .update_device_metadata(&dev_id.to_string(), "Conference Room PC", Some("Floor 2"))
+            .update_device_metadata(&dev_id.to_string(), "Finance PC", Some("Floor 2"))
+            .await?;
+        store
+            .record_activity(
+                "alice".into(),
+                "test_action".into(),
+                "success".into(),
+                format!("attributed to device '{dev_id}'"),
+            )
             .await?;
 
-        // 2. Attempting to clean up an online device (heartbeat within window) fails
-        let err = store
-            .clean_offline_device(&dev_id.to_string(), 3600)
+        // 5. Attempting to clean online device fails.
+        let online_clean_err = store
+            .clean_offline_device(&dev_id.to_string(), 60)
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("cannot clean up online device"),
-            "online device cleanup must be rejected: {err}"
+            online_clean_err.to_string().contains("online"),
+            "online device must not be cleaned: {online_clean_err}"
         );
 
-        // 3. Attempting to clean up an unknown device fails
-        let ghost = DeviceId::new();
-        assert!(
-            store
-                .clean_offline_device(&ghost.to_string(), 0)
-                .await
-                .is_err()
-        );
-
-        // 4. Attempting to clean up a blocked device fails
-        store
-            .block_device(&dev_id.to_string(), "admin_alice")
-            .await?;
-        let block_err = store
+        // 6. Block device: even if offline window is 0, cleaning a blocked device must fail.
+        store.block_device(&dev_id.to_string(), "alice").await?;
+        // Explicitly set the heartbeat timestamp into the past so offline threshold is satisfied
+        store.0.lock().unwrap().execute(
+            "UPDATE bootstrap_devices SET last_seen_unix_ms = ?1 WHERE device_id = ?2",
+            params![1000, dev_id.to_string()],
+        )?;
+        let blocked_clean_err = store
             .clean_offline_device(&dev_id.to_string(), 0)
             .await
             .unwrap_err();
         assert!(
-            block_err
-                .to_string()
-                .contains("cannot clean up blocked device"),
-            "blocked device cleanup must be rejected: {block_err}"
+            blocked_clean_err.to_string().contains("blocked"),
+            "blocked device cannot be cleaned up: {blocked_clean_err}"
         );
+
+        // 7. Unblock device.
         store.unblock_device(&dev_id.to_string()).await?;
 
-        // 5. Clean up the offline device with offline_after_secs = 0 (instant timeout)
-        let cleaned = store.clean_offline_device(&dev_id.to_string(), 0).await?;
-        assert_eq!(cleaned, dev_id.to_string());
+        // 8. Offline cleanup succeeds with window = 0 because heartbeat is in the past.
+        let cleaned_id = store.clean_offline_device(&dev_id.to_string(), 0).await?;
+        assert_eq!(cleaned_id, dev_id.to_string());
 
-        // Device is no longer in inventory
-        assert!(store.get_device(&dev_id.to_string()).await?.is_none());
-        assert!(store.list_devices().await?.is_empty());
+        // 9. Entry is removed from inventory and metadata.
+        assert!(
+            store.get_device(&dev_id.to_string()).await?.is_none(),
+            "cleaned device must not be returned by get_device"
+        );
+        let list_after_clean = store.list_devices().await?;
+        assert!(
+            !list_after_clean
+                .iter()
+                .any(|d| d.device_id == dev_id.to_string()),
+            "cleaned device must not be in list_devices"
+        );
 
-        // 6. When the still-authorized Agent reconnects, it automatically reappears
-        store
+        // 10. Removal persists across store reopen.
+        drop(store);
+        let store2 = DeviceStore::open(&db_path)?;
+        assert!(
+            store2.get_device(&dev_id.to_string()).await?.is_none(),
+            "cleaned device must remain removed across restart"
+        );
+
+        // 11. Still-authorized agent reconnects and restores entry under SAME identity without duplicate.
+        store2
             .heartbeat(
                 dev_id,
-                "WIN-CLEANUP-TEST".into(),
+                "WORKSTATION-01".into(),
                 "1.0.0".into(),
-                Some("192.168.1.101:5000".into()),
+                Some("192.168.1.105:5000".into()),
             )
             .await?;
-
-        let restored = store
+        let restored_dev = store2
             .get_device(&dev_id.to_string())
             .await?
-            .expect("device restored on reconnect");
-        assert_eq!(restored.device_id, dev_id.to_string());
-        // Curated metadata was removed on cleanup, so it resets to reported name
-        assert_eq!(restored.name, "WIN-CLEANUP-TEST");
-        assert_eq!(restored.location, None);
-        assert!(!restored.blocked);
+            .expect("restored device must exist");
+        assert_eq!(restored_dev.device_id, dev_id.to_string());
+        assert_eq!(restored_dev.name, "WORKSTATION-01");
+        assert!(!restored_dev.blocked);
 
-        // 7. Cleanup survives store restart
-        store.clean_offline_device(&dev_id.to_string(), 0).await?;
-        drop(store);
+        let list_restored = store2.list_devices().await?;
+        let matching: Vec<_> = list_restored
+            .iter()
+            .filter(|d| d.device_id == dev_id.to_string())
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one device record must exist");
 
-        let store2 = DeviceStore::open(&temp.path().join("store.db"))?;
-        assert!(store2.get_device(&dev_id.to_string()).await?.is_none());
+        // 12. Historical activity attribution remains intact.
+        let activities = store2.list_activity().await?;
+        assert!(
+            activities
+                .iter()
+                .any(|a| a.detail.contains(&dev_id.to_string()) && a.action == "test_action"),
+            "historical activity attribution must be preserved after cleanup and restoration"
+        );
 
         Ok(())
     }
@@ -1376,6 +1434,14 @@ mod tests {
             .update_device_metadata(&prior_id.to_string(), "Executive Laptop", Some("Room 401"))
             .await?;
         store.block_device(&prior_id.to_string(), "alice").await?;
+        store
+            .record_activity(
+                "alice".into(),
+                "update_fleet_device".into(),
+                "success".into(),
+                format!("updated device '{prior_id}' display name"),
+            )
+            .await?;
 
         // Replacement device still does not exist
         assert!(
@@ -1474,6 +1540,23 @@ mod tests {
                 .replace_device(&prior_id.to_string(), &replacement_id.to_string(), "alice")
                 .await
                 .is_err()
+        );
+
+        // Historical activity attribution is not rewritten.
+        let activities = store.list_activity().await?;
+        assert!(
+            activities
+                .iter()
+                .any(|a| a.detail.contains(&prior_id.to_string())
+                    && a.action == "update_fleet_device"),
+            "past activity must retain prior_device_id attribution"
+        );
+        assert!(
+            !activities
+                .iter()
+                .any(|a| a.detail.contains(&replacement_id.to_string())
+                    && a.action == "update_fleet_device"),
+            "past activity must not be rewritten to replacement_device_id"
         );
 
         // 8. Reconnecting heartbeat from prior device is rejected
