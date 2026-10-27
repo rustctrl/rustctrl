@@ -94,14 +94,15 @@ fn resolve_target_dir(
     config: Option<&PathBuf>,
     artifact: Option<&PathBuf>,
 ) -> PathBuf {
-    target_dir
+    let raw = target_dir
         .or_else(|| config.and_then(|p| p.parent().map(PathBuf::from)))
         .or_else(|| artifact.and_then(|p| p.parent().map(PathBuf::from)))
         .unwrap_or_else(|| {
             std::env::var_os("ProgramData")
                 .map(|p| PathBuf::from(p).join("RustCtrl"))
                 .unwrap_or_else(|| PathBuf::from("."))
-        })
+        });
+    std::path::absolute(&raw).unwrap_or(raw)
 }
 
 fn main() -> Result<()> {

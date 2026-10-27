@@ -429,12 +429,18 @@ pub fn powershell_install_script() -> String {
     The name of the Windows service. Defaults to "RustCtrlAgent".
 .PARAMETER DisplayName
     The display name of the Windows service. Defaults to "RustCtrl Agent Service".
+.PARAMETER Name
+    Optional custom endpoint name override for enrollment.
+.PARAMETER HeartbeatSeconds
+    Interval in seconds between heartbeats. Defaults to 10.
 #>
 [CmdletBinding()]
 param(
     [string]$TargetDir = "$env:ProgramData\RustCtrl",
     [string]$ServiceName = "RustCtrlAgent",
-    [string]$DisplayName = "RustCtrl Agent Service"
+    [string]$DisplayName = "RustCtrl Agent Service",
+    [string]$Name,
+    [int]$HeartbeatSeconds = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -446,6 +452,7 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     exit 1
 }
 
+$TargetDir = [System.IO.Path]::GetFullPath($TargetDir)
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SourceExe = Join-Path $ScriptDir "rustctrl-agent.exe"
 $SourceArtifact = Join-Path $ScriptDir "artifact.toml"
@@ -514,6 +521,12 @@ if (Test-Path $ConfigPath) {
 
 # Register or update Windows Service
 $binaryCommandLine = "`"$DestExe`" service --target-dir `"$TargetDir`" --artifact `"$ArtifactPath`""
+if ($Name) {
+    $binaryCommandLine += " --name `"$Name`""
+}
+if ($HeartbeatSeconds -gt 0) {
+    $binaryCommandLine += " --heartbeat-seconds $HeartbeatSeconds"
+}
 
 if (-not $existingService) {
     Write-Host "Registering new Windows service '$ServiceName'..."

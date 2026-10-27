@@ -87,11 +87,17 @@ fn service_main(_arguments: Vec<OsString>) {
 }
 
 pub fn install_service(
-    options: crate::ServiceOptions,
+    mut options: crate::ServiceOptions,
     service_name: &str,
     display_name: &str,
     start: bool,
 ) -> Result<()> {
+    // Resolve target_dir to an absolute path so the Windows service (running under a different working dir)
+    // always locates its files accurately.
+    let abs_target_dir =
+        std::path::absolute(&options.target_dir).unwrap_or_else(|_| options.target_dir.clone());
+    options.target_dir = abs_target_dir;
+
     std::fs::create_dir_all(&options.target_dir)?;
 
     // Restrict access on Windows: SYSTEM (*S-1-5-18) and BUILTIN\Administrators (*S-1-5-32-544)
@@ -142,24 +148,34 @@ pub fn install_service(
     let current_exe = std::env::current_exe()?;
     let target_exe = options.target_dir.join("rustctrl-agent.exe");
     if current_exe != target_exe {
-        std::fs::copy(&current_exe, &target_exe)?;
+        let mut copied = false;
+        for _ in 0..25 {
+            if std::fs::copy(&current_exe, &target_exe).is_ok() {
+                copied = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if !copied {
+            std::fs::copy(&current_exe, &target_exe)?;
+        }
     }
 
     let target_config = options.target_dir.join("config.toml");
     let target_artifact = options.target_dir.join("artifact.toml");
 
     // Copy explicit config and referenced certificates if provided
-    if let Some(cfg) = &options.config
-        && cfg.exists()
-        && cfg != &target_config
-    {
-        std::fs::copy(cfg, &target_config)?;
-        if let Some(parent) = cfg.parent() {
-            for cert_name in ["ca.pem", "cert.pem", "key.pem"] {
-                let src_cert = parent.join(cert_name);
-                let dst_cert = options.target_dir.join(cert_name);
-                if src_cert.exists() && src_cert != dst_cert {
-                    let _ = std::fs::copy(src_cert, dst_cert);
+    if let Some(cfg) = &options.config {
+        let abs_cfg = std::path::absolute(cfg).unwrap_or_else(|_| cfg.clone());
+        if abs_cfg.exists() && abs_cfg != target_config {
+            std::fs::copy(&abs_cfg, &target_config)?;
+            if let Some(parent) = abs_cfg.parent() {
+                for cert_name in ["ca.pem", "cert.pem", "key.pem"] {
+                    let src_cert = parent.join(cert_name);
+                    let dst_cert = options.target_dir.join(cert_name);
+                    if src_cert.exists() && src_cert != dst_cert {
+                        let _ = std::fs::copy(src_cert, dst_cert);
+                    }
                 }
             }
         }
@@ -167,10 +183,11 @@ pub fn install_service(
 
     if !target_config.exists()
         && let Some(art) = &options.artifact
-        && art != &target_artifact
-        && art.exists()
     {
-        std::fs::copy(art, &target_artifact)?;
+        let abs_art = std::path::absolute(art).unwrap_or_else(|_| art.clone());
+        if abs_art.exists() && abs_art != target_artifact {
+            std::fs::copy(&abs_art, &target_artifact)?;
+        }
     }
 
     let mut launch_arguments: Vec<OsString> = vec![
@@ -184,6 +201,14 @@ pub fn install_service(
     } else {
         launch_arguments.push("--artifact".into());
         launch_arguments.push(target_artifact.into());
+    }
+    if let Some(name) = &options.name {
+        launch_arguments.push("--name".into());
+        launch_arguments.push(name.clone().into());
+    }
+    if options.heartbeat_seconds > 0 {
+        launch_arguments.push("--heartbeat-seconds".into());
+        launch_arguments.push(options.heartbeat_seconds.to_string().into());
     }
 
     let info = ServiceInfo {
