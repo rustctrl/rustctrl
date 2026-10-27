@@ -171,6 +171,18 @@ jobs:
             Stop-Service RustCtrlAgent -ErrorAction SilentlyContinue
             sc.exe delete RustCtrlAgent
           }
+          # Check rustctrl-agent service subcommands
+          ./target/debug/rustctrl-agent.exe install --config $config
+          try {
+            ./target/debug/rustctrl-agent.exe status
+            ./target/debug/rustctrl-agent.exe start
+            (Get-Service RustCtrlAgent).WaitForStatus('Running', [TimeSpan]::FromSeconds(20))
+            ./target/debug/rustctrl-agent.exe status
+            ./target/debug/rustctrl-agent.exe stop
+            (Get-Service RustCtrlAgent).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(20))
+          } finally {
+            ./target/debug/rustctrl-agent.exe uninstall
+          }
 
   compose:
     needs: changes

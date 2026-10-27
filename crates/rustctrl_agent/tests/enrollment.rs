@@ -187,3 +187,167 @@ async fn agent_enrolls_from_artifact_and_restarts_cleanly() -> Result<()> {
     server.stop().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn controller_package_export_to_agent_service_lifecycle_restart_and_update() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pki_dir = dir.path().join("pki");
+    pki::initialize(&pki_options(&pki_dir))?;
+
+    let db_path = dir.path().join("rustctrl.db");
+    seed_admin(&db_path).await?;
+
+    let server = RunningServer::start(&pki_dir, db_path.clone()).await?;
+    let controller_cfg = client_config(&pki_dir, &server.endpoint, "controller");
+    let mut staff_client = rustctrl_network::connect_staff_auth(&controller_cfg).await?;
+
+    // 1. Admin prepares installation artifact via StaffAuth RPC
+    let admin_login = staff_client
+        .login(LoginRequest {
+            username: "admin_alice".into(),
+            password: "AdminPass123!@#".into(),
+            remember: false,
+        })
+        .await?
+        .into_inner();
+
+    let mut admin_req = tonic::Request::new(PrepareInstallationArtifactRequest {});
+    admin_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", admin_login.session_token).parse()?,
+    );
+    let reply = staff_client
+        .prepare_installation_artifact(admin_req)
+        .await?
+        .into_inner();
+
+    let artifact = AgentInstallationArtifact {
+        server_endpoint: server.endpoint.clone(),
+        domain_name: "localhost".into(),
+        ca_certificate: reply.ca_certificate,
+        enrollment_certificate: reply.enrollment_certificate,
+        enrollment_private_key: reply.enrollment_private_key,
+        authorization_id: reply.authorization_id.clone(),
+        installation_secret: reply.installation_secret.clone(),
+        created_at_unix_ms: reply.created_at_unix_ms,
+    };
+
+    // 2. Controller assembles ready-to-install package with pinned binary
+    let mock_agent_binary = rustctrl_core::mock_windows_pe_binary();
+    let package =
+        rustctrl_core::AgentInstallationPackage::new(artifact.clone(), mock_agent_binary.clone())?;
+
+    let zip_package_path = dir.path().join("rustctrl-agent-windows.zip");
+    package.export(&zip_package_path)?;
+    assert!(zip_package_path.exists());
+
+    // 3. Technician extracts package
+    let entries = rustctrl_core::read_zip_entries(&zip_package_path)?;
+    assert!(entries.contains_key("rustctrl-agent.exe"));
+    assert!(entries.contains_key("artifact.toml"));
+    assert!(entries.contains_key("install.ps1"));
+    assert!(entries.contains_key("uninstall.ps1"));
+    assert!(entries.contains_key("README.txt"));
+
+    let extracted_dir = dir.path().join("extracted_pkg");
+    std::fs::create_dir_all(&extracted_dir)?;
+    for (name, content) in entries {
+        std::fs::write(extracted_dir.join(name), content)?;
+    }
+
+    // 4. First PC service installation and automatic startup
+    let pc1_service_dir = dir.path().join("pc1_target");
+    std::fs::create_dir_all(&pc1_service_dir)?;
+    // Simulate install.ps1 copying binary and artifact to TargetDir
+    std::fs::copy(
+        extracted_dir.join("rustctrl-agent.exe"),
+        pc1_service_dir.join("rustctrl-agent.exe"),
+    )?;
+    std::fs::copy(
+        extracted_dir.join("artifact.toml"),
+        pc1_service_dir.join("artifact.toml"),
+    )?;
+
+    // Service starts with ServiceOptions (pointing to target_dir)
+    let pc1_opts = rustctrl_agent::ServiceOptions {
+        config: None,
+        artifact: None,
+        target_dir: pc1_service_dir.clone(),
+        name: Some("FINANCE-DESKTOP-01".into()),
+        heartbeat_seconds: 5,
+    };
+
+    let stop_service = CancellationToken::new();
+    let pc1_cfg = pc1_opts.load_or_enroll(stop_service.clone()).await?;
+    assert_eq!(pc1_cfg.name, "FINANCE-DESKTOP-01");
+    let pc1_id = pc1_cfg.device_id;
+
+    // Run heartbeat once to establish inventory appearance
+    run_agent(pc1_cfg.clone(), stop_service.clone(), true).await?;
+
+    // Verify PC1 in server inventory
+    let store = DeviceStore::open(&db_path)?;
+    let dev1 = store.get_device(&pc1_id.to_string()).await?.unwrap();
+    assert_eq!(dev1.name, "FINANCE-DESKTOP-01");
+    assert_eq!(dev1.device_id, pc1_id.to_string());
+
+    // 5. Service restart / reboot: uses existing config, retains same identity
+    let pc1_restarted = pc1_opts.load_or_enroll(stop_service.clone()).await?;
+    assert_eq!(pc1_restarted.device_id, pc1_id);
+    assert_eq!(pc1_restarted.name, "FINANCE-DESKTOP-01");
+
+    // 6. Identity-preserving update: binary updated, local config preserved
+    let mut updated_mock_binary = rustctrl_core::mock_windows_pe_binary();
+    updated_mock_binary.extend_from_slice(b"UPDATED_SECTION");
+    std::fs::write(
+        pc1_service_dir.join("rustctrl-agent.exe"),
+        &updated_mock_binary,
+    )?;
+
+    // Updated service starts: preserves existing Device ID and config
+    let pc1_updated = pc1_opts.load_or_enroll(stop_service.clone()).await?;
+    assert_eq!(pc1_updated.device_id, pc1_id);
+    assert_eq!(pc1_updated.name, "FINANCE-DESKTOP-01");
+
+    // 7. Distinct identity for PC 2 from the same package
+    let pc2_service_dir = dir.path().join("pc2_target");
+    std::fs::create_dir_all(&pc2_service_dir)?;
+    std::fs::copy(
+        extracted_dir.join("rustctrl-agent.exe"),
+        pc2_service_dir.join("rustctrl-agent.exe"),
+    )?;
+    std::fs::copy(
+        extracted_dir.join("artifact.toml"),
+        pc2_service_dir.join("artifact.toml"),
+    )?;
+
+    let pc2_opts = rustctrl_agent::ServiceOptions {
+        config: None,
+        artifact: None,
+        target_dir: pc2_service_dir.clone(),
+        name: Some("SALES-LAPTOP-02".into()),
+        heartbeat_seconds: 5,
+    };
+
+    let pc2_cfg = pc2_opts.load_or_enroll(stop_service.clone()).await?;
+    let pc2_id = pc2_cfg.device_id;
+    assert_ne!(pc1_id, pc2_id);
+
+    run_agent(pc2_cfg, stop_service.clone(), true).await?;
+
+    // Both distinct devices present in Server inventory
+    let all_devices = store.list_devices().await?;
+    assert!(
+        all_devices
+            .iter()
+            .any(|d| d.device_id == pc1_id.to_string())
+    );
+    assert!(
+        all_devices
+            .iter()
+            .any(|d| d.device_id == pc2_id.to_string())
+    );
+
+    server.stop().await?;
+    Ok(())
+}
