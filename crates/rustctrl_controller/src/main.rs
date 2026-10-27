@@ -4,10 +4,11 @@ use rustctrl_core::{ControllerConfig, init_logging};
 use rustctrl_protocol::auth::{
     BlockDeviceRequest, ChangeOwnPasswordRequest, ChangeStaffRoleRequest,
     CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
-    DeactivateStaffAccountRequest, ListFleetDevicesRequest, ListStaffAccountsRequest, LoginRequest,
-    LogoutRequest, PrepareInstallationArtifactRequest, RemoveTargetRequest,
-    ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest,
-    StaffStatusRequest, UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
+    DeactivateStaffAccountRequest, ListFleetDevicesRequest, ListInstallationAuthorizationsRequest,
+    ListStaffAccountsRequest, LoginRequest, LogoutRequest, PrepareInstallationArtifactRequest,
+    RemoveTargetRequest, ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest,
+    ResetStaffPasswordRequest, RevokeInstallationAuthorizationRequest, StaffStatusRequest,
+    UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
 };
 use rustctrl_protocol::bootstrap::HealthRequest;
 use std::path::PathBuf;
@@ -206,6 +207,24 @@ enum Command {
         password: String,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        agent_binary: Option<PathBuf>,
+    },
+    ListInstallationAuthorizations {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+    },
+    RevokeInstallationAuthorization {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long)]
+        authorization_id: String,
+        #[arg(long)]
+        replace_output: Option<PathBuf>,
         #[arg(long)]
         agent_binary: Option<PathBuf>,
     },
@@ -1052,6 +1071,101 @@ fn main() -> Result<()> {
             )
             .await
         }),
+        Command::ListInstallationAuthorizations { username, password } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+                let login_reply = client
+                    .login(LoginRequest {
+                        username,
+                        password,
+                        remember: false,
+                    })
+                    .await?
+                    .into_inner();
+                if login_reply.must_change_password {
+                    anyhow::bail!("temporary password must be replaced before listing installation authorizations");
+                }
+                let mut req = tonic::Request::new(ListInstallationAuthorizationsRequest {});
+                req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let reply = client
+                    .list_installation_authorizations(req)
+                    .await?
+                    .into_inner();
+                for auth in reply.authorizations {
+                    let status = if let Some(revoked_at) = auth.revoked_at_unix_ms {
+                        format!("revoked ({revoked_at})")
+                    } else {
+                        "active".to_string()
+                    };
+                    println!(
+                        "authorization_id={} created_by={} created_at={} status={}",
+                        auth.authorization_id, auth.created_by, auth.created_at_unix_ms, status
+                    );
+                }
+                let mut logout_req = tonic::Request::new(LogoutRequest {});
+                logout_req.metadata_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", login_reply.session_token).parse()?,
+                );
+                let _ = client.logout(logout_req).await;
+                Ok(())
+            })
+        }
+        Command::RevokeInstallationAuthorization {
+            username,
+            password,
+            authorization_id,
+            replace_output,
+            agent_binary,
+        } => tokio::runtime::Runtime::new()?.block_on(async {
+            let mut client = rustctrl_network::connect_staff_auth(&config.server).await?;
+            let login_reply = client
+                .login(LoginRequest {
+                    username,
+                    password,
+                    remember: false,
+                })
+                .await?
+                .into_inner();
+            if login_reply.must_change_password {
+                anyhow::bail!("temporary password must be replaced before revoking installation authorization");
+            }
+            let mut req = tonic::Request::new(RevokeInstallationAuthorizationRequest {
+                authorization_id: authorization_id.clone(),
+            });
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let reply = client
+                .revoke_installation_authorization(req)
+                .await?
+                .into_inner();
+            println!(
+                "revoked authorization_id={} revoked_at={}",
+                reply.authorization_id, reply.revoked_at_unix_ms
+            );
+            if let Some(out_path) = replace_output {
+                execute_prepare_package_or_artifact(
+                    &mut client,
+                    &login_reply.session_token,
+                    out_path,
+                    agent_binary,
+                    false,
+                )
+                .await?;
+            }
+            let mut logout_req = tonic::Request::new(LogoutRequest {});
+            logout_req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {}", login_reply.session_token).parse()?,
+            );
+            let _ = client.logout(logout_req).await;
+            Ok(())
+        }),
         Command::Gui => {
             #[cfg(feature = "gui")]
             {
@@ -1068,31 +1182,18 @@ fn main() -> Result<()> {
     }
 }
 
-async fn handle_prepare_package_or_artifact(
-    server_config: &rustctrl_core::ClientConfig,
-    username: String,
-    password: String,
+async fn execute_prepare_package_or_artifact(
+    client: &mut rustctrl_protocol::auth::staff_auth_client::StaffAuthClient<
+        tonic::transport::Channel,
+    >,
+    session_token: &str,
     output: PathBuf,
     agent_binary: Option<PathBuf>,
     is_package_command: bool,
 ) -> Result<()> {
-    let mut client = rustctrl_network::connect_staff_auth(server_config).await?;
-    let login_reply = client
-        .login(LoginRequest {
-            username,
-            password,
-            remember: false,
-        })
-        .await?
-        .into_inner();
-    if login_reply.must_change_password {
-        anyhow::bail!("temporary password must be replaced before preparing installation artifact");
-    }
     let mut req = tonic::Request::new(PrepareInstallationArtifactRequest {});
-    req.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {}", login_reply.session_token).parse()?,
-    );
+    req.metadata_mut()
+        .insert("authorization", format!("Bearer {session_token}").parse()?);
     let reply = client
         .prepare_installation_artifact(req)
         .await?
@@ -1141,6 +1242,38 @@ async fn handle_prepare_package_or_artifact(
             output.display()
         );
     }
+    Ok(())
+}
+
+async fn handle_prepare_package_or_artifact(
+    server_config: &rustctrl_core::ClientConfig,
+    username: String,
+    password: String,
+    output: PathBuf,
+    agent_binary: Option<PathBuf>,
+    is_package_command: bool,
+) -> Result<()> {
+    let mut client = rustctrl_network::connect_staff_auth(server_config).await?;
+    let login_reply = client
+        .login(LoginRequest {
+            username,
+            password,
+            remember: false,
+        })
+        .await?
+        .into_inner();
+    if login_reply.must_change_password {
+        anyhow::bail!("temporary password must be replaced before preparing installation artifact");
+    }
+
+    let res = execute_prepare_package_or_artifact(
+        &mut client,
+        &login_reply.session_token,
+        output,
+        agent_binary,
+        is_package_command,
+    )
+    .await;
 
     let mut logout_req = tonic::Request::new(LogoutRequest {});
     logout_req.metadata_mut().insert(
@@ -1148,5 +1281,5 @@ async fn handle_prepare_package_or_artifact(
         format!("Bearer {}", login_reply.session_token).parse()?,
     );
     let _ = client.logout(logout_req).await;
-    Ok(())
+    res
 }

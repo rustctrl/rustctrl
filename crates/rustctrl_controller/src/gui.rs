@@ -7,11 +7,12 @@ use rustctrl_core::{ControllerConfig, DeviceId};
 use rustctrl_protocol::auth::{
     BlockDeviceRequest, ChangeOwnPasswordRequest, ChangeStaffRoleRequest,
     CleanOfflineDeviceRequest, CreateStaffAccountRequest, CreateTargetRequest,
-    DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesRequest,
-    ListStaffAccountsRequest, LoginRequest, LogoutRequest, PrepareInstallationArtifactRequest,
-    RemoveTargetRequest, ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest,
-    ResetStaffPasswordRequest, StaffAccountEntry, StaffStatusRequest, UnblockDeviceRequest,
-    UpdateFleetDeviceRequest, UpdateTargetRequest,
+    DeactivateStaffAccountRequest, FleetDeviceEntry, InstallationAuthorizationEntry,
+    ListFleetDevicesRequest, ListInstallationAuthorizationsRequest, ListStaffAccountsRequest,
+    LoginRequest, LogoutRequest, PrepareInstallationArtifactRequest, RemoveTargetRequest,
+    ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordRequest, ResetStaffPasswordRequest,
+    RevokeInstallationAuthorizationRequest, StaffAccountEntry, StaffStatusRequest,
+    UnblockDeviceRequest, UpdateFleetDeviceRequest, UpdateTargetRequest,
 };
 use std::time::Duration;
 
@@ -125,6 +126,7 @@ enum ScreenState {
         registered_devices: u64,
         devices: Vec<FleetDeviceEntry>,
         accounts: Vec<StaffAccountEntry>,
+        authorizations: Vec<InstallationAuthorizationEntry>,
         new_account_username: String,
         new_account_role: String,
         new_account_password: String,
@@ -280,6 +282,7 @@ impl ControllerApp {
                                 registered_devices: reply.registered_devices,
                                 devices: Vec::new(),
                                 accounts: Vec::new(),
+                                authorizations: Vec::new(),
                                 new_account_username: String::new(),
                                 new_account_role: "operator".into(),
                                 new_account_password: String::new(),
@@ -446,6 +449,7 @@ impl ControllerApp {
                                 registered_devices: 0,
                                 devices: Vec::new(),
                                 accounts: Vec::new(),
+                                authorizations: Vec::new(),
                                 new_account_username: String::new(),
                                 new_account_role: "operator".into(),
                                 new_account_password: String::new(),
@@ -584,6 +588,7 @@ impl ControllerApp {
                             registered_devices: 0,
                             devices: Vec::new(),
                             accounts: Vec::new(),
+                            authorizations: Vec::new(),
                             new_account_username: String::new(),
                             new_account_role: "operator".into(),
                             new_account_password: String::new(),
@@ -720,28 +725,44 @@ impl ControllerApp {
                         .await?
                         .into_inner()
                         .devices;
-                    let accounts = if is_admin || reply.role == "admin" {
+                    let accounts_res = if is_admin || reply.role == "admin" {
                         let mut list_req = tonic::Request::new(ListStaffAccountsRequest {});
                         list_req
                             .metadata_mut()
                             .insert("authorization", format!("Bearer {tok_for_req}").parse()?);
-                        client
-                            .list_staff_accounts(list_req)
-                            .await
-                            .map(|r| r.into_inner().accounts)
-                            .unwrap_or_default()
+                        match client.list_staff_accounts(list_req).await {
+                            Ok(r) => Ok(r.into_inner().accounts),
+                            Err(e) => Err(e.to_string()),
+                        }
                     } else {
-                        Vec::new()
+                        Ok(Vec::new())
                     };
-                    Ok::<_, anyhow::Error>((reply, devices, accounts))
+                    let authorizations_res = if is_admin || reply.role == "admin" {
+                        let mut list_auth_req =
+                            tonic::Request::new(ListInstallationAuthorizationsRequest {});
+                        list_auth_req
+                            .metadata_mut()
+                            .insert("authorization", format!("Bearer {tok_for_req}").parse()?);
+                        match client.list_installation_authorizations(list_auth_req).await {
+                            Ok(r) => Ok(r.into_inner().authorizations),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        Ok(Vec::new())
+                    };
+                    Ok::<_, anyhow::Error>((reply, devices, accounts_res, authorizations_res))
                 })
                 .await;
 
             let _ = this.update(cx, |view, cx| {
                 if let ScreenState::Connected {
                     session_token: tok,
+                    username,
+                    role,
+                    registered_devices,
                     devices,
                     accounts,
+                    authorizations,
                     new_account_username,
                     new_account_role,
                     new_account_password,
@@ -753,13 +774,38 @@ impl ControllerApp {
                     && *tok == tok_for_update
                 {
                     match res {
-                        Ok(Ok((reply, devices_reply, accs))) => {
+                        Ok(Ok((reply, devices_reply, accs_res, auths_res))) => {
+                            let mut err_msg = None;
                             let updated_accounts = if reply.role == "admin" {
-                                accs
+                                match accs_res {
+                                    Ok(accs) => accs,
+                                    Err(e) => {
+                                        err_msg =
+                                            Some(format!("Failed to list staff accounts: {e}"));
+                                        accounts.clone()
+                                    }
+                                }
                             } else {
                                 Vec::new()
                             };
-                            let keep_error = error.clone();
+                            let updated_authorizations = if reply.role == "admin" {
+                                match auths_res {
+                                    Ok(auths) => auths,
+                                    Err(e) => {
+                                        let msg = format!(
+                                            "Failed to list installation authorizations: {e}"
+                                        );
+                                        err_msg = Some(match err_msg {
+                                            Some(prev) => format!("{prev}; {msg}"),
+                                            None => msg,
+                                        });
+                                        authorizations.clone()
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            let keep_error = err_msg.or_else(|| error.clone());
                             let keep_notice = notice.clone();
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
@@ -769,6 +815,7 @@ impl ControllerApp {
                                 registered_devices: reply.registered_devices,
                                 devices: devices_reply,
                                 accounts: updated_accounts,
+                                authorizations: updated_authorizations,
                                 new_account_username: new_account_username.clone(),
                                 new_account_role: new_account_role.clone(),
                                 new_account_password: new_account_password.clone(),
@@ -780,12 +827,13 @@ impl ControllerApp {
                         Ok(Err(err)) => {
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
-                                username: String::new(),
-                                role: String::new(),
+                                username: username.clone(),
+                                role: role.clone(),
                                 server_version: "Unavailable".into(),
-                                registered_devices: 0,
+                                registered_devices: *registered_devices,
                                 devices: devices.clone(),
                                 accounts: accounts.clone(),
+                                authorizations: authorizations.clone(),
                                 new_account_username: new_account_username.clone(),
                                 new_account_role: new_account_role.clone(),
                                 new_account_password: new_account_password.clone(),
@@ -797,12 +845,13 @@ impl ControllerApp {
                         Err(e) => {
                             view.state = ScreenState::Connected {
                                 session_token: tok_for_update,
-                                username: String::new(),
-                                role: String::new(),
+                                username: username.clone(),
+                                role: role.clone(),
                                 server_version: "Unavailable".into(),
-                                registered_devices: 0,
+                                registered_devices: *registered_devices,
                                 devices: devices.clone(),
                                 accounts: accounts.clone(),
+                                authorizations: authorizations.clone(),
                                 new_account_username: new_account_username.clone(),
                                 new_account_role: new_account_role.clone(),
                                 new_account_password: new_account_password.clone(),
@@ -2254,6 +2303,103 @@ impl ControllerApp {
         .detach();
     }
 
+    fn submit_revoke_authorization(
+        &mut self,
+        authorization_id: String,
+        and_replace: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let session_token = match &mut self.state {
+            ScreenState::Connected {
+                session_token,
+                role,
+                in_flight,
+                error,
+                ..
+            } if role == "admin" => {
+                if *in_flight {
+                    return;
+                }
+                *in_flight = true;
+                *error = None;
+                session_token.clone()
+            }
+            _ => return,
+        };
+        cx.notify();
+
+        let client_cfg = self.config.server.clone();
+        let handle = self.tokio_handle.clone();
+        let tok = session_token.clone();
+        let tok_check = session_token;
+        let auth_label = authorization_id.clone();
+
+        cx.spawn(async move |this, cx| {
+            let res = handle
+                .spawn(async move {
+                    let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
+                    let mut req = tonic::Request::new(RevokeInstallationAuthorizationRequest {
+                        authorization_id,
+                    });
+                    req.metadata_mut()
+                        .insert("authorization", format!("Bearer {tok}").parse()?);
+                    client
+                        .revoke_installation_authorization(req)
+                        .await?
+                        .into_inner();
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                let is_same_session = match &view.state {
+                    ScreenState::Connected { session_token, .. } => session_token == &tok_check,
+                    _ => false,
+                };
+                if !is_same_session {
+                    return;
+                }
+
+                if let ScreenState::Connected { in_flight, .. } = &mut view.state {
+                    *in_flight = false;
+                }
+
+                match res {
+                    Ok(Ok(())) => {
+                        if let ScreenState::Connected { notice, .. } = &mut view.state {
+                            if and_replace {
+                                *notice = Some(format!(
+                                    "Revoked installation authorization '{auth_label}'. Prepare replacement package below."
+                                ));
+                            } else {
+                                *notice = Some(format!(
+                                    "Revoked installation authorization '{auth_label}'."
+                                ));
+                            }
+                            let token = tok_check.clone();
+                            view.fetch_status(token, cx);
+                        }
+                        if and_replace {
+                            view.open_prepare_installation_artifact(cx);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if let ScreenState::Connected { error, .. } = &mut view.state {
+                            *error = Some(err.to_string());
+                        }
+                    }
+                    Err(join_err) => {
+                        if let ScreenState::Connected { error, .. } = &mut view.state {
+                            *error = Some(format!("Join error: {join_err}"));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn submit_prepare_installation_artifact(&mut self, cx: &mut Context<Self>) {
         let (request_id, session_token, out_path, agent_bin_path) = match &mut self.overlay {
             Overlay::PrepareInstallationArtifact {
@@ -2383,6 +2529,7 @@ impl ControllerApp {
                             };
                             *success = Some(format!("{action} ({auth_id}) to {out_path}"));
                             *error = None;
+                            view.fetch_status(tok_check.clone(), cx);
                         }
                     }
                     Ok(Err(err)) => {
@@ -4186,6 +4333,7 @@ impl Render for ControllerApp {
                 registered_devices,
                 devices,
                 accounts,
+                authorizations,
                 new_account_username,
                 new_account_role,
                 new_account_password,
@@ -4913,7 +5061,134 @@ impl Render for ControllerApp {
                                 }),
                         );
 
-                    content = content.child(accounts_list).child(create_form);
+                    let mut auth_list = div()
+                        .mt_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().text_xl().child("Installation Authorizations"));
+
+                    if authorizations.is_empty() {
+                        let empty_text = if error.is_some() {
+                            "Unable to load installation authorizations."
+                        } else {
+                            "No installation authorizations issued yet."
+                        };
+                        auth_list = auth_list
+                            .child(div().text_sm().text_color(rgb(0x8899aa)).child(empty_text));
+                    } else {
+                        let header_row = div()
+                            .flex()
+                            .gap_4()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(rgb(0x334455))
+                            .text_sm()
+                            .text_color(rgb(0x8899aa))
+                            .child(div().w(gpui::px(260.0)).child("Authorization ID"))
+                            .child(div().w(gpui::px(120.0)).child("Created By"))
+                            .child(div().w(gpui::px(140.0)).child("Status"))
+                            .child(div().w(gpui::px(260.0)).child("Actions"));
+                        auth_list = auth_list.child(header_row);
+
+                        for auth in authorizations {
+                            let auth_id = auth.authorization_id.clone();
+                            let is_revoked = auth.revoked_at_unix_ms.is_some();
+                            let status_cell = if let Some(revoked_at) = auth.revoked_at_unix_ms {
+                                div()
+                                    .w(gpui::px(140.0))
+                                    .text_color(rgb(0x8899aa))
+                                    .child(format!("Revoked ({revoked_at})"))
+                            } else {
+                                div()
+                                    .w(gpui::px(140.0))
+                                    .text_color(rgb(0x44cc44))
+                                    .child("Active")
+                            };
+
+                            let actions_cell = if !is_revoked {
+                                let auth_id_revoke = auth_id.clone();
+                                let auth_id_replace = auth_id.clone();
+                                div()
+                                    .w(gpui::px(260.0))
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(0xaa3333))
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .id(format!("revoke-auth-{}", auth_id))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.submit_revoke_authorization(
+                                                    auth_id_revoke.clone(),
+                                                    false,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("Revoke"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(0xaa7733))
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .id(format!("revoke-replace-auth-{}", auth_id))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.submit_revoke_authorization(
+                                                    auth_id_replace.clone(),
+                                                    true,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("Revoke & Replace"),
+                                    )
+                            } else {
+                                div()
+                                    .w(gpui::px(260.0))
+                                    .text_color(rgb(0x667788))
+                                    .child("None")
+                            };
+
+                            let row = div()
+                                .flex()
+                                .gap_4()
+                                .items_center()
+                                .py_1()
+                                .border_b_1()
+                                .border_color(rgb(0x223344))
+                                .text_sm()
+                                .child(
+                                    div()
+                                        .w(gpui::px(260.0))
+                                        .text_color(rgb(0xccddee))
+                                        .child(auth.authorization_id.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .w(gpui::px(120.0))
+                                        .text_color(rgb(0x8899aa))
+                                        .child(auth.created_by.clone()),
+                                )
+                                .child(status_cell)
+                                .child(actions_cell);
+
+                            auth_list = auth_list.child(row);
+                        }
+                    }
+
+                    content = content
+                        .child(accounts_list)
+                        .child(create_form)
+                        .child(auth_list);
                 } else {
                     content = content.child(
                         div()
@@ -5421,5 +5696,108 @@ mod tests {
             _ => false,
         };
         assert!(!is_stale);
+    }
+
+    #[test]
+    fn connected_state_installation_authorizations_display_and_filtering() {
+        let auth_active = InstallationAuthorizationEntry {
+            authorization_id: "auth-1".into(),
+            created_at_unix_ms: 1000,
+            created_by: "admin".into(),
+            revoked_at_unix_ms: None,
+        };
+        let auth_revoked = InstallationAuthorizationEntry {
+            authorization_id: "auth-2".into(),
+            created_at_unix_ms: 2000,
+            created_by: "admin".into(),
+            revoked_at_unix_ms: Some(3000),
+        };
+        let state = ScreenState::Connected {
+            session_token: "token".into(),
+            username: "admin".into(),
+            role: "admin".into(),
+            server_version: "1.0.0".into(),
+            registered_devices: 0,
+            devices: Vec::new(),
+            accounts: Vec::new(),
+            authorizations: vec![auth_active.clone(), auth_revoked.clone()],
+            new_account_username: String::new(),
+            new_account_role: "operator".into(),
+            new_account_password: String::new(),
+            error: None,
+            notice: None,
+            in_flight: false,
+        };
+
+        if let ScreenState::Connected {
+            authorizations,
+            role,
+            ..
+        } = state
+        {
+            assert_eq!(role, "admin");
+            assert_eq!(authorizations.len(), 2);
+            assert!(authorizations[0].revoked_at_unix_ms.is_none());
+            assert_eq!(authorizations[1].revoked_at_unix_ms, Some(3000));
+        } else {
+            panic!("expected Connected state");
+        }
+    }
+
+    #[test]
+    fn connected_state_preserves_authorizations_when_refresh_fails() {
+        let auth_active = InstallationAuthorizationEntry {
+            authorization_id: "auth-preserved".into(),
+            created_at_unix_ms: 1000,
+            created_by: "admin".into(),
+            revoked_at_unix_ms: None,
+        };
+        let mut state = ScreenState::Connected {
+            session_token: "token-1".into(),
+            username: "admin".into(),
+            role: "admin".into(),
+            server_version: "1.0.0".into(),
+            registered_devices: 1,
+            devices: Vec::new(),
+            accounts: Vec::new(),
+            authorizations: vec![auth_active.clone()],
+            new_account_username: String::new(),
+            new_account_role: "operator".into(),
+            new_account_password: String::new(),
+            error: None,
+            notice: None,
+            in_flight: false,
+        };
+
+        let auths_res: Result<Vec<InstallationAuthorizationEntry>, String> =
+            Err("connection timeout".into());
+        if let ScreenState::Connected {
+            authorizations,
+            error,
+            ..
+        } = &mut state
+        {
+            let updated_authorizations = match auths_res {
+                Ok(fresh) => fresh,
+                Err(err) => {
+                    *error = Some(format!("Failed to list installation authorizations: {err}"));
+                    authorizations.clone()
+                }
+            };
+            *authorizations = updated_authorizations;
+        }
+
+        if let ScreenState::Connected {
+            authorizations,
+            error,
+            ..
+        } = state
+        {
+            assert_eq!(authorizations.len(), 1);
+            assert_eq!(authorizations[0].authorization_id, "auth-preserved");
+            assert!(error.as_ref().unwrap().contains("connection timeout"));
+        } else {
+            panic!("expected Connected state");
+        }
     }
 }

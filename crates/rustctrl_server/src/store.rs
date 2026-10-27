@@ -147,6 +147,13 @@ pub struct InstallationAuthorizationRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeAuthorizationOutcome {
+    NotFound,
+    AlreadyRevoked,
+    Revoked(InstallationAuthorizationRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceEnrollmentRecord {
     pub device_id: String,
     pub authorization_id: String,
@@ -1877,20 +1884,79 @@ impl DeviceStore {
         .await?
     }
 
-    pub async fn revoke_installation_authorization(&self, authorization_id: &str) -> Result<bool> {
+    pub async fn revoke_installation_authorization(
+        &self,
+        authorization_id: &str,
+    ) -> Result<RevokeAuthorizationOutcome> {
         let store = self.clone();
         let authorization_id = authorization_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let now = current_time_ms()?;
             let connection = store
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-            let changed = connection.execute(
+
+            let mut stmt = connection.prepare(
+                "SELECT authorization_id, secret_hash, created_at_unix_ms, created_by, revoked_at_unix_ms FROM installation_authorizations WHERE authorization_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![authorization_id])?;
+            let record = match rows.next()? {
+                Some(row) => InstallationAuthorizationRecord {
+                    authorization_id: row.get(0)?,
+                    secret_hash: row.get(1)?,
+                    created_at_unix_ms: row.get(2)?,
+                    created_by: row.get(3)?,
+                    revoked_at_unix_ms: row.get(4)?,
+                },
+                None => return Ok(RevokeAuthorizationOutcome::NotFound),
+            };
+
+            if record.revoked_at_unix_ms.is_some() {
+                return Ok(RevokeAuthorizationOutcome::AlreadyRevoked);
+            }
+
+            let now = current_time_ms()?;
+            connection.execute(
                 "UPDATE installation_authorizations SET revoked_at_unix_ms = ?1 WHERE authorization_id = ?2 AND revoked_at_unix_ms IS NULL",
                 params![now, authorization_id],
             )?;
-            Ok(changed > 0)
+
+            Ok(RevokeAuthorizationOutcome::Revoked(
+                InstallationAuthorizationRecord {
+                    revoked_at_unix_ms: Some(now),
+                    ..record
+                },
+            ))
+        })
+        .await?
+    }
+
+    pub async fn list_installation_authorizations(
+        &self,
+    ) -> Result<Vec<InstallationAuthorizationRecord>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            let mut stmt = connection.prepare(
+                "SELECT authorization_id, secret_hash, created_at_unix_ms, created_by, revoked_at_unix_ms FROM installation_authorizations ORDER BY created_at_unix_ms DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(InstallationAuthorizationRecord {
+                    authorization_id: row.get(0)?,
+                    secret_hash: row.get(1)?,
+                    created_at_unix_ms: row.get(2)?,
+                    created_by: row.get(3)?,
+                    revoked_at_unix_ms: row.get(4)?,
+                })
+            })?;
+            let mut auths = Vec::new();
+            for r in rows {
+                auths.push(r?);
+            }
+            Ok(auths)
         })
         .await?
     }
@@ -2920,8 +2986,10 @@ mod tests {
         assert_eq!(dev1_persisted.name, "Dev 1 Renamed");
 
         // 7. Revoke authorization
-        let revoked = store2.revoke_installation_authorization(auth_id).await?;
-        assert!(revoked);
+        let outcome = store2.revoke_installation_authorization(auth_id).await?;
+        assert!(matches!(outcome, RevokeAuthorizationOutcome::Revoked(_)));
+        let outcome_repeat = store2.revoke_installation_authorization(auth_id).await?;
+        assert_eq!(outcome_repeat, RevokeAuthorizationOutcome::AlreadyRevoked);
 
         let auth_revoked = store2
             .get_installation_authorization(auth_id)
@@ -2973,6 +3041,22 @@ mod tests {
                 .to_string()
                 .contains("resumption secret does not match")
         );
+
+        // 9. List installation authorizations returns all created authorizations
+        let all_auths = store2.list_installation_authorizations().await?;
+        assert_eq!(all_auths.len(), 2);
+        let listed_auth1 = all_auths
+            .iter()
+            .find(|a| a.authorization_id == auth_id)
+            .unwrap();
+        assert!(listed_auth1.revoked_at_unix_ms.is_some());
+        assert_eq!(listed_auth1.created_by, "admin_user");
+        let listed_auth2 = all_auths
+            .iter()
+            .find(|a| a.authorization_id == diff_auth_id)
+            .unwrap();
+        assert!(listed_auth2.revoked_at_unix_ms.is_none());
+        assert_eq!(listed_auth2.created_by, "admin_user");
 
         Ok(())
     }

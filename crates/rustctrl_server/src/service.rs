@@ -1,7 +1,7 @@
 use crate::{
     config::ServerConfig,
     issuer::AgentIssuer,
-    store::{DeviceRecord, DeviceStore, TargetRecord},
+    store::{DeviceRecord, DeviceStore, RevokeAuthorizationOutcome, TargetRecord},
 };
 use anyhow::{Context, Result};
 use ring::rand::SecureRandom;
@@ -11,12 +11,14 @@ use rustctrl_protocol::auth::{
     ChangeStaffRoleReply, ChangeStaffRoleRequest, CleanOfflineDeviceReply,
     CleanOfflineDeviceRequest, CreateStaffAccountReply, CreateStaffAccountRequest,
     CreateTargetReply, CreateTargetRequest, DeactivateStaffAccountReply,
-    DeactivateStaffAccountRequest, FleetDeviceEntry, ListFleetDevicesReply,
-    ListFleetDevicesRequest, ListStaffAccountsReply, ListStaffAccountsRequest, LoginReply,
-    LoginRequest, LogoutReply, LogoutRequest, PrepareInstallationArtifactReply,
+    DeactivateStaffAccountRequest, FleetDeviceEntry, InstallationAuthorizationEntry,
+    ListFleetDevicesReply, ListFleetDevicesRequest, ListInstallationAuthorizationsReply,
+    ListInstallationAuthorizationsRequest, ListStaffAccountsReply, ListStaffAccountsRequest,
+    LoginReply, LoginRequest, LogoutReply, LogoutRequest, PrepareInstallationArtifactReply,
     PrepareInstallationArtifactRequest, RemoveTargetReply, RemoveTargetRequest,
     ReplaceFleetDeviceReply, ReplaceFleetDeviceRequest, ReplaceTemporaryPasswordReply,
     ReplaceTemporaryPasswordRequest, ResetStaffPasswordReply, ResetStaffPasswordRequest,
+    RevokeInstallationAuthorizationReply, RevokeInstallationAuthorizationRequest,
     StaffAccountEntry, StaffStatusReply, StaffStatusRequest, UnblockDeviceReply,
     UnblockDeviceRequest, UpdateFleetDeviceReply, UpdateFleetDeviceRequest, UpdateTargetReply,
     UpdateTargetRequest,
@@ -1523,6 +1525,112 @@ impl StaffAuth for StaffAuthService {
             installation_secret,
             created_at_unix_ms: auth.created_at_unix_ms,
         }))
+    }
+
+    async fn list_installation_authorizations(
+        &self,
+        request: Request<ListInstallationAuthorizationsRequest>,
+    ) -> Result<Response<ListInstallationAuthorizationsReply>, Status> {
+        let _session = self
+            .authenticate_admin(&request, "list_installation_authorizations", None)
+            .await?;
+
+        let auths = self
+            .store
+            .list_installation_authorizations()
+            .await
+            .map_err(database_error)?;
+
+        let entries = auths
+            .into_iter()
+            .map(|a| InstallationAuthorizationEntry {
+                authorization_id: a.authorization_id,
+                created_at_unix_ms: a.created_at_unix_ms,
+                created_by: a.created_by,
+                revoked_at_unix_ms: a.revoked_at_unix_ms,
+            })
+            .collect();
+
+        Ok(Response::new(ListInstallationAuthorizationsReply {
+            authorizations: entries,
+        }))
+    }
+
+    async fn revoke_installation_authorization(
+        &self,
+        request: Request<RevokeInstallationAuthorizationRequest>,
+    ) -> Result<Response<RevokeInstallationAuthorizationReply>, Status> {
+        let body = request.get_ref();
+        let authorization_id = body.authorization_id.trim().to_string();
+        if authorization_id.is_empty() {
+            return Err(Status::invalid_argument("authorization_id is required"));
+        }
+
+        let session = self
+            .authenticate_admin(
+                &request,
+                "revoke_installation_authorization",
+                Some(&authorization_id),
+            )
+            .await?;
+
+        let outcome = self
+            .store
+            .revoke_installation_authorization(&authorization_id)
+            .await
+            .map_err(database_error)?;
+
+        match outcome {
+            RevokeAuthorizationOutcome::NotFound => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "revoke_installation_authorization".into(),
+                        "rejected".into(),
+                        format!(
+                            "failed to revoke installation authorization '{authorization_id}': not found"
+                        ),
+                    )
+                    .await;
+                Err(Status::not_found(format!(
+                    "installation authorization '{authorization_id}' not found"
+                )))
+            }
+            RevokeAuthorizationOutcome::AlreadyRevoked => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "revoke_installation_authorization".into(),
+                        "rejected".into(),
+                        format!(
+                            "failed to revoke installation authorization '{authorization_id}': already revoked"
+                        ),
+                    )
+                    .await;
+                Err(Status::failed_precondition(format!(
+                    "installation authorization '{authorization_id}' is already revoked"
+                )))
+            }
+            RevokeAuthorizationOutcome::Revoked(record) => {
+                let _ = self
+                    .store
+                    .record_activity(
+                        session.username.clone(),
+                        "revoke_installation_authorization".into(),
+                        "success".into(),
+                        format!("revoked installation authorization '{authorization_id}'"),
+                    )
+                    .await;
+
+                Ok(Response::new(RevokeInstallationAuthorizationReply {
+                    success: true,
+                    authorization_id: record.authorization_id,
+                    revoked_at_unix_ms: record.revoked_at_unix_ms.unwrap_or(0),
+                }))
+            }
+        }
     }
 }
 
