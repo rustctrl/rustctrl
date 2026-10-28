@@ -51,5 +51,6 @@ Design decisions:
 - [Revocable remembered staff access](docs/adr/0005-keep-remembered-staff-access-revocable.md).
 - [Separate inventory cleanup and Device blocking](docs/adr/0006-separate-inventory-cleanup-from-device-blocking.md).
 - [Provision Agent credentials through a scoped issuing authority](docs/adr/0007-provision-agent-credentials-via-scoped-issuing-authority.md).
+- [Adopt GPUI Kit design system and Tokyo Night theme](docs/adr/0008-adopt-gpui-kit-design-system-and-tokyo-night-theme.md).
 
 Domain terms are defined in [CONTEXT.md](CONTEXT.md). The [initial brief](SPEC.md) supplies background, not an implementation ticket for the entire project.
