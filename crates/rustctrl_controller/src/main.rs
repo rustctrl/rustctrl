@@ -17,6 +17,8 @@ use std::path::PathBuf;
 
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(any(feature = "gui", test))]
+mod navigation;
 mod session;
 #[cfg(feature = "gui")]
 mod theme;
