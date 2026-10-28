@@ -33,6 +33,8 @@ cargo run --locked -p rustctrl_controller -- --config .local/pki/clients/control
 cargo run --locked -p rustctrl_controller -- --config .local/pki/clients/controller/config.toml gui
 ```
 
+The GUI stores local visual preferences in `preferences.toml` in the user configuration directory (`$XDG_CONFIG_HOME/rustctrl` or `~/.config/rustctrl` on Linux, `%APPDATA%/rustctrl` on Windows). An unknown theme name falls back to Tokyo Night.
+
 The GUI polls actual Server health. With the Server stopped, it reports an unavailable connection instead of displaying sample inventory. To run only the connection diagnostic on a headless machine:
 
 ```sh

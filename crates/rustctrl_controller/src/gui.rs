@@ -142,6 +142,7 @@ enum RestoreFailure {
 }
 
 struct ControllerApp {
+    theme: crate::theme::Theme,
     config: ControllerConfig,
     config_path: std::path::PathBuf,
     state: ScreenState,
@@ -181,6 +182,7 @@ fn resolve_typed_text(keystroke: &gpui::Keystroke) -> Option<&str> {
 
 impl ControllerApp {
     fn new(
+        theme: crate::theme::Theme,
         config: ControllerConfig,
         config_path: std::path::PathBuf,
         tokio_handle: tokio::runtime::Handle,
@@ -321,6 +323,7 @@ impl ControllerApp {
         });
 
         Self {
+            theme,
             config,
             config_path,
             state: ScreenState::Login {
@@ -4064,8 +4067,8 @@ impl Render for ControllerApp {
                 this.handle_key_down(event, cx);
             }))
             .size_full()
-            .bg(rgb(0x101820))
-            .text_color(rgb(0xe8eef2))
+            .bg(rgb(self.theme.bg_app))
+            .text_color(rgb(self.theme.text_primary))
             .p_8()
             .flex()
             .flex_col()
@@ -5282,12 +5285,22 @@ pub fn open(config: ControllerConfig, config_path: std::path::PathBuf) -> Result
             .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty())),
         "A graphical session is required. Run the Controller on an X11 or Wayland desktop; use the check command for headless diagnostics."
     );
+    let preferences_path = crate::theme::preferences_path()?;
+    let preferences = crate::theme::Preferences::load(&preferences_path)?;
+    if !preferences_path.exists() {
+        if let Some(parent) = preferences_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        preferences.save(&preferences_path)?;
+    }
+    let theme = preferences.theme();
     let runtime = tokio::runtime::Runtime::new()?;
     let handle = runtime.handle().clone();
 
-    gpui_platform::application().run(move |cx: &mut App| {
+    gpui::application().run(move |cx: &mut App| {
+        gpui::init(cx);
         cx.open_window(WindowOptions::default(), |_, cx| {
-            cx.new(|cx| ControllerApp::new(config, config_path, handle, cx))
+            cx.new(|cx| ControllerApp::new(theme, config, config_path, handle, cx))
         })
         .expect("open RustCtrl window");
         cx.activate(true);
