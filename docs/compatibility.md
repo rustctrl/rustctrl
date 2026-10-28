@@ -41,6 +41,14 @@ Environment: AlmaLinux 10.2 x86_64, Rust 1.98.1, Podman 5.8.2, and podman-compos
 - Stable graphical startup remains pending on a real desktop. An isolated Weston/Xwayland test reached Vulkan initialization, but the virtual compositor failed before a stable frame could be inspected. This is not a visual acceptance pass.
 - Native Windows builds and Service Control Manager start/stop checks remain pending on a Windows runner. The CI workflow is configured, but was not triggered during this local setup.
 
+## Foundation CI cache verification on 2026-10-28
+
+Environment: AlmaLinux 10.2 x86_64, Rust 1.98.1, Podman 5.8.2, and podman-compose 1.5.0.
+
+- `actionlint` passed for the Foundation workflow. An isolated check of its path-filter script passed 33 push, pull request, manual-dispatch, and missing-base scenarios.
+- `scripts/smoke-compose.sh` built the Server image and passed TLS health, Agent heartbeat, and persistence after restart checks. A second run with `RUSTCTRL_SKIP_IMAGE_BUILD=1` passed using the prebuilt image. Both runs used temporary Compose projects and removed their volumes.
+- These are Podman Compose results, not Docker Engine or Buildx cache validation. GitHub Actions cache restore/upload and the resulting execution-time savings remain unverified until the updated workflow runs on GitHub.
+
 ## Issue #14 Verification on 2026-10-26 (Windows Agent Package & Service Lifecycle)
 
 Environment: Linux x86_64, Rust 1.98.1 pinned toolchain.

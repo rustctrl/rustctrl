@@ -113,3 +113,7 @@ cargo build --locked -p rustctrl_controller
 The integration tests use real local TLS connections. They cover Agent identity binding, rejection of unauthenticated/untrusted clients, hostname verification, key overwrite protection, and persistence across a Server restart. Tests bind ephemeral loopback ports.
 
 The GitHub Actions workflow separately checks Linux headless components, the AlmaLinux Controller build, Windows builds/service lifecycle, and Docker Compose startup. A configured workflow is not evidence of a completed run.
+
+The Compose job caches host Agent dependencies separately from the Server's Docker build. Buildx loads the Server image into the local Docker image store, then the smoke test uses `RUSTCTRL_SKIP_IMAGE_BUILD=1` to test that image without rebuilding it. Both Docker layers and Cargo cache mounts persist between runs; the mount cache is keyed by the lockfile, toolchain, Dockerfile, and commit, with fallback to earlier commits using the same build inputs. Cache extraction runs before cache upload during job cleanup.
+
+Changes to the Foundation workflow or local actions under `.github/actions/` run all Foundation checks. Other `.github/` metadata, such as the pull request template, does not trigger platform builds.
