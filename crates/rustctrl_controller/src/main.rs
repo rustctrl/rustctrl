@@ -16,6 +16,8 @@ use std::path::PathBuf;
 #[cfg(feature = "gui")]
 mod gui;
 mod session;
+#[cfg(feature = "gui")]
+mod theme;
 
 #[derive(Parser)]
 #[command(

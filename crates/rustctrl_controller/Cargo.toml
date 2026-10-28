@@ -9,7 +9,7 @@ name = "rustctrl-controller"
 path = "src/main.rs"
 [features]
 default = ["gui"]
-gui = ["dep:gpui", "dep:gpui_platform"]
+gui = ["dep:gpui"]
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -21,11 +21,6 @@ tokio.workspace = true
 toml.workspace = true
 tonic.workspace = true
 tracing.workspace = true
-gpui = { workspace = true, optional = true }
-[target.'cfg(target_os = "linux")'.dependencies]
-gpui = { workspace = true, optional = true, features = ["x11", "wayland"] }
-gpui_platform = { workspace = true, optional = true, features = ["x11", "wayland"] }
-[target.'cfg(target_os = "windows")'.dependencies]
-gpui_platform = { workspace = true, optional = true }
+gpui = { package = "gpui-kit", version = "=0.8.1", optional = true }
 [lints]
 workspace = true

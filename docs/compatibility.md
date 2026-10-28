@@ -14,15 +14,13 @@ The checked-in CI configuration is a recipe for verification, not a claim that G
 
 ## GPUI version and graphics
 
-`gpui` and `gpui_platform` use the same pinned Zed commit. Linux enables both X11 and Wayland; Windows uses its native platform backend. Avoid mixing a registry release of one package with a different Git revision of the other.
-
-The pinned Linux platform crate does not forward the X11 flag to GPUI's compositor detection, so the Controller enables the Linux backend features on both crates explicitly. The GUI command requires a graphical session; use `check` for headless connection diagnostics.
+The Controller uses `gpui-kit` 0.8.1, which supplies matching `gpui-pre` and `gpui-pre-platform` 0.3.10 dependencies. Its desktop platform enables X11 and Wayland on Linux and the native backend on Windows. The GUI command requires a graphical session; use `check` for headless connection diagnostics.
 
 Linux builds require native font and windowing libraries. Launching the Controller also requires a usable graphical session and graphics driver. A successful `cargo check` does not prove the binary links, and a successful build does not prove a window renders.
 
-Windows release builds of the pinned GPUI backend require `fxc.exe` from the Windows SDK. Install that SDK or configure `GPUI_FXC_PATH` if automatic discovery fails. A Rust Windows target installed on Linux does not provide the Windows linker, SDK, or a running Windows environment.
+Windows release builds of the GPUI backend require `fxc.exe` from the Windows SDK. Install that SDK or configure `GPUI_FXC_PATH` if automatic discovery fails. A Rust Windows target installed on Linux does not provide the Windows linker, SDK, or a running Windows environment.
 
-Sources: [pinned GPUI README](https://github.com/zed-industries/zed/blob/66ed3027b8ca7fed0feeee91d1ce6346ccd4ac39/crates/gpui/README.md), [pinned Windows build script](https://github.com/zed-industries/zed/blob/66ed3027b8ca7fed0feeee91d1ce6346ccd4ac39/crates/gpui_windows/build.rs).
+
 
 ## Feature validation remains separate
 
@@ -69,3 +67,7 @@ Environment: Linux x86_64, Rust 1.98.1 pinned toolchain.
 - **Platform Limitations & Evidence**:
   - Linux builds, tests, and headless controller diagnostics (`cargo test --locked --workspace --exclude rustctrl_controller`, `cargo test --locked -p rustctrl_controller`, `cargo clippy`, `cargo fmt`) passed locally.
   - Physical Windows PC execution with desktop GUI and interactive Windows Service Control Manager was unavailable in this Linux host and was not run locally; Windows SCM lifecycle is gated and validated via the `windows-latest` GitHub Actions workflow.
+
+## Issue #47 verification on 2026-10-28
+
+On Linux x86_64 with Rust 1.98.1, the Controller with GPUI Kit built and passed strict Clippy and the workspace test suite. These checks do not validate graphical rendering. Native Windows MSVC and interactive X11 and Wayland sessions were not available for this verification.
