@@ -1,4 +1,5 @@
 mod views {
+    pub(super) mod fleet;
     pub(super) mod login;
     pub(super) mod must_change_password;
 }
@@ -45,6 +46,7 @@ enum ActiveField {
     ReplaceDeviceReplacementId,
     PrepareArtifactOutputPath,
     PreparePackageAgentBinary,
+    FleetSearch,
 }
 
 #[derive(Clone)]
@@ -174,6 +176,14 @@ struct ControllerApp {
     server_status: crate::login_state::ServerStatus,
     show_password: bool,
     navigation: crate::navigation::Navigation,
+    fleet_model: crate::gui::views::fleet::FleetInventoryModel,
+    fleet_table: std::cell::RefCell<
+        Option<
+            gpui::Entity<
+                gpui::component::table::TableState<crate::gui::views::fleet::FleetTableDelegate>,
+            >,
+        >,
+    >,
     _health: Task<()>,
     _refresh: Task<()>,
     _restore: Option<Task<()>>,
@@ -400,6 +410,8 @@ impl ControllerApp {
             server_status: crate::login_state::ServerStatus::Connecting,
             show_password: false,
             navigation: crate::navigation::Navigation::default(),
+            fleet_model: crate::gui::views::fleet::FleetInventoryModel::default(),
+            fleet_table: std::cell::RefCell::new(None),
             _health: health,
             _refresh: refresh,
             _restore: Some(restore),
@@ -4104,6 +4116,29 @@ impl ControllerApp {
                 role,
                 ..
             } => {
+                if matches!(self.overlay, Overlay::None)
+                    && self.navigation.active(role) == crate::navigation::Route::Fleet
+                    && self.active_field == ActiveField::FleetSearch
+                {
+                    match key.as_str() {
+                        "escape" => {
+                            self.fleet_model.filter.search_query.clear();
+                            cx.notify();
+                        }
+                        "backspace" => {
+                            self.fleet_model.filter.search_query.pop();
+                            cx.notify();
+                        }
+                        _ => {
+                            if let Some(text) = resolve_typed_text(&event.keystroke) {
+                                self.fleet_model.filter.search_query.push_str(text);
+                                cx.notify();
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 if *in_flight
                     || role != "admin"
                     || self.navigation.active(role) != crate::navigation::Route::Accounts
@@ -4158,7 +4193,7 @@ impl ControllerApp {
 }
 
 impl Render for ControllerApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let container = div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
@@ -4300,8 +4335,10 @@ impl Render for ControllerApp {
                     .p_4()
                     .flex()
                     .flex_col()
-                    .gap_4()
-                    .overflow_y_scroll();
+                    .gap_4();
+                if active != Route::Fleet {
+                    content = content.overflow_y_scroll();
+                }
                 if let Some(err) = error {
                     content = content.child(
                         div()
@@ -4323,351 +4360,9 @@ impl Render for ControllerApp {
                 }
 
                 if active == Route::Fleet {
-                    // The Fleet Inventory is visible to both roles and derives
-                    // online status from heartbeat freshness on the Server.
-                    let mut fleet_list = div().mt_4().flex().flex_col().gap_2();
-
-                    let mut title_bar = div()
-                        .flex()
-                        .justify_between()
-                        .items_center()
-                        .child(div().text_xl().child("Fleet Inventory"));
-                    if is_admin {
-                        title_bar = title_bar.child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .bg(rgb(0x3a5a7a))
-                                        .text_color(rgb(0xffffff))
-                                        .rounded_md()
-                                        .text_sm()
-                                        .cursor_pointer()
-                                        .id("open-replace-device-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_replace_device(
-                                                String::new(),
-                                                String::new(),
-                                                cx,
-                                            );
-                                        }))
-                                        .child("Replace Device"),
-                                )
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .bg(rgb(0x2a7a5a))
-                                        .text_color(rgb(0xffffff))
-                                        .rounded_md()
-                                        .text_sm()
-                                        .cursor_pointer()
-                                        .id("open-prepare-artifact-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_prepare_installation_artifact(cx);
-                                        }))
-                                        .child("+ Installation Package"),
-                                )
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .bg(rgb(0x2d884d))
-                                        .text_color(rgb(0xffffff))
-                                        .rounded_md()
-                                        .text_sm()
-                                        .cursor_pointer()
-                                        .id("add-target-btn")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_add_target(cx);
-                                        }))
-                                        .child("+ Add Target"),
-                                ),
-                        );
-                    }
-                    fleet_list = fleet_list.child(title_bar);
-
-                    if devices.is_empty() {
-                        fleet_list =
-                            fleet_list.child(div().text_sm().text_color(rgb(0x8899aa)).child(
-                                if server_version == "Unavailable" {
-                                    "Server unavailable — the last known Fleet is shown below."
-                                } else {
-                                    "No Devices registered yet."
-                                },
-                            ));
-                    } else {
-                        let mut header_row = div()
-                            .flex()
-                            .gap_4()
-                            .py_1()
-                            .border_b_1()
-                            .border_color(rgb(0x334455))
-                            .text_sm()
-                            .text_color(rgb(0x8899aa))
-                            .child(div().w(gpui::px(180.0)).child("Device"))
-                            .child(div().w(gpui::px(80.0)).child("Type"))
-                            .child(div().w(gpui::px(120.0)).child("Location"))
-                            .child(div().w(gpui::px(140.0)).child("Last Address"))
-                            .child(div().w(gpui::px(140.0)).child("Config Address"))
-                            .child(div().w(gpui::px(90.0)).child("Status"))
-                            .child(div().w(gpui::px(100.0)).child("Last Seen"));
-                        if is_admin {
-                            header_row =
-                                header_row.child(div().w(gpui::px(340.0)).child("Actions"));
-                        }
-                        fleet_list = fleet_list.child(header_row);
-
-                        for device in devices {
-                            let vm = format_device_row(device);
-                            let dev_id = device.device_id.clone();
-                            let dev_name = device.display_name.clone();
-                            let dev_loc = device.location.clone();
-                            let is_tv_target = device.device_type == "android_tv";
-                            let configured_addr =
-                                device.configured_address.clone().unwrap_or_default();
-
-                            let status_color = if vm.status == "Blocked" {
-                                rgb(0xd9534f)
-                            } else if vm.status == "Unverified" {
-                                rgb(0xe0a838)
-                            } else if vm.status == "Online" {
-                                rgb(0x44cc44)
-                            } else {
-                                rgb(0xff6b6b)
-                            };
-
-                            let mut row = div()
-                                .flex()
-                                .gap_4()
-                                .items_center()
-                                .py_1()
-                                .child(
-                                    div()
-                                        .w(gpui::px(180.0))
-                                        .child(format!("{} ({})", vm.display_name, vm.device_id)),
-                                )
-                                .child(
-                                    div()
-                                        .w(gpui::px(80.0))
-                                        .text_color(rgb(0xaaaaaa))
-                                        .child(vm.device_type),
-                                )
-                                .child(
-                                    div()
-                                        .w(gpui::px(120.0))
-                                        .text_color(rgb(0xaaaaaa))
-                                        .child(vm.location),
-                                )
-                                .child(
-                                    div()
-                                        .w(gpui::px(140.0))
-                                        .text_color(rgb(0xaaaaaa))
-                                        .child(vm.last_address),
-                                )
-                                .child(
-                                    div()
-                                        .w(gpui::px(140.0))
-                                        .text_color(rgb(0xaaaaaa))
-                                        .child(vm.configured_address),
-                                )
-                                .child(
-                                    div()
-                                        .w(gpui::px(90.0))
-                                        .text_color(status_color)
-                                        .child(vm.status),
-                                )
-                                .child(
-                                    div()
-                                        .w(gpui::px(100.0))
-                                        .text_color(rgb(0x8899aa))
-                                        .text_sm()
-                                        .child(vm.last_seen),
-                                );
-                            if is_admin {
-                                if is_tv_target {
-                                    let dev_id_for_remove = dev_id.clone();
-                                    row = row.child(
-                                        div()
-                                            .w(gpui::px(340.0))
-                                            .flex()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py_1()
-                                                    .bg(rgb(0x3a5a7a))
-                                                    .text_color(rgb(0xffffff))
-                                                    .rounded_md()
-                                                    .text_xs()
-                                                    .cursor_pointer()
-                                                    .id(format!(
-                                                        "edit-target-btn-{}",
-                                                        device.device_id
-                                                    ))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.open_edit_target(
-                                                            dev_id.clone(),
-                                                            dev_name.clone(),
-                                                            configured_addr.clone(),
-                                                            dev_loc.clone(),
-                                                            cx,
-                                                        );
-                                                    }))
-                                                    .child("Edit"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py_1()
-                                                    .bg(rgb(0x883333))
-                                                    .text_color(rgb(0xffffff))
-                                                    .rounded_md()
-                                                    .text_xs()
-                                                    .cursor_pointer()
-                                                    .id(format!(
-                                                        "remove-target-btn-{}",
-                                                        device.device_id
-                                                    ))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.submit_remove_target(
-                                                            dev_id_for_remove.clone(),
-                                                            cx,
-                                                        );
-                                                    }))
-                                                    .child("Remove"),
-                                            ),
-                                    );
-                                } else {
-                                    let is_blocked = device.blocked || device.status == "blocked";
-                                    let dev_id_for_edit = dev_id.clone();
-                                    let dev_id_for_replace = dev_id.clone();
-                                    let mut actions_div =
-                                        div().w(gpui::px(340.0)).flex().gap_2().child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .bg(rgb(0x3a5a7a))
-                                                .text_color(rgb(0xffffff))
-                                                .rounded_md()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .id(format!("edit-device-btn-{}", device.device_id))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.open_edit_device(
-                                                        dev_id_for_edit.clone(),
-                                                        dev_name.clone(),
-                                                        dev_loc.clone(),
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child("Edit"),
-                                        );
-
-                                    if is_blocked {
-                                        let dev_id_for_unblock = dev_id.clone();
-                                        actions_div = actions_div.child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .bg(rgb(0x2d884d))
-                                                .text_color(rgb(0xffffff))
-                                                .rounded_md()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .id(format!(
-                                                    "unblock-device-btn-{}",
-                                                    device.device_id
-                                                ))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.submit_unblock_device(
-                                                        dev_id_for_unblock.clone(),
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child("Unblock"),
-                                        );
-                                    } else {
-                                        let dev_id_for_block = dev_id.clone();
-                                        actions_div = actions_div.child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .bg(rgb(0x883333))
-                                                .text_color(rgb(0xffffff))
-                                                .rounded_md()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .id(format!(
-                                                    "block-device-btn-{}",
-                                                    device.device_id
-                                                ))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.submit_block_device(
-                                                        dev_id_for_block.clone(),
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child("Block"),
-                                        );
-
-                                        if !device.online || device.status == "offline" {
-                                            let dev_id_for_clean = dev_id.clone();
-                                            actions_div = actions_div.child(
-                                                div()
-                                                    .px_2()
-                                                    .py_1()
-                                                    .bg(rgb(0x7a4a3a))
-                                                    .text_color(rgb(0xffffff))
-                                                    .rounded_md()
-                                                    .text_xs()
-                                                    .cursor_pointer()
-                                                    .id(format!(
-                                                        "clean-device-btn-{}",
-                                                        device.device_id
-                                                    ))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.submit_clean_offline_device(
-                                                            dev_id_for_clean.clone(),
-                                                            cx,
-                                                        );
-                                                    }))
-                                                    .child("Clean"),
-                                            );
-                                        }
-                                    }
-
-                                    actions_div = actions_div.child(
-                                        div()
-                                            .px_2()
-                                            .py_1()
-                                            .bg(rgb(0x4a6a8a))
-                                            .text_color(rgb(0xffffff))
-                                            .rounded_md()
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .id(format!("replace-device-btn-{}", device.device_id))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_replace_device(
-                                                    dev_id_for_replace.clone(),
-                                                    String::new(),
-                                                    cx,
-                                                );
-                                            }))
-                                            .child("Replace"),
-                                    );
-
-                                    row = row.child(actions_div);
-                                }
-                            }
-                            fleet_list = fleet_list.child(row);
-                        }
-                    }
-                    content = content.child(fleet_list);
+                    content = content.child(self.render_fleet(is_admin, devices, window, cx));
                 }
+
                 if matches!(active, Route::Remote | Route::Audit) {
                     content = content.child(div().text_xl().child(active.label())).child(
                         div()
@@ -5136,6 +4831,7 @@ impl Render for ControllerApp {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 struct DeviceRowViewModel {
     device_id: String,
@@ -5148,6 +4844,7 @@ struct DeviceRowViewModel {
     last_seen: String,
 }
 
+#[cfg(test)]
 fn format_device_row(device: &FleetDeviceEntry) -> DeviceRowViewModel {
     let is_tv_target = device.device_type == "android_tv";
     let location = match &device.location {
