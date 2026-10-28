@@ -1,3 +1,8 @@
+mod views {
+    pub(super) mod login;
+    pub(super) mod must_change_password;
+}
+
 use anyhow::Result;
 use gpui::{
     App, Context, FocusHandle, IntoElement, KeyDownEvent, Render, Task, Window, WindowOptions, div,
@@ -20,6 +25,8 @@ use std::time::Duration;
 enum ActiveField {
     Username,
     Password,
+    PasswordVisibility,
+    RememberLogin,
     NewPassword,
     ConfirmPassword,
     CurrentPassword,
@@ -141,6 +148,14 @@ enum RestoreFailure {
     ServerUnavailable(String),
 }
 
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct ControllerApp {
     theme: crate::theme::Theme,
     config: ControllerConfig,
@@ -149,11 +164,16 @@ struct ControllerApp {
     overlay: Overlay,
     active_field: ActiveField,
     focus_handle: FocusHandle,
+    visibility_focus: FocusHandle,
+    remember_focus: FocusHandle,
     tokio_handle: tokio::runtime::Handle,
     next_edit_device_request_id: u64,
     next_target_request_id: u64,
     next_replace_device_request_id: u64,
     next_prepare_artifact_request_id: u64,
+    server_status: crate::login_state::ServerStatus,
+    show_password: bool,
+    _health: Task<()>,
     _refresh: Task<()>,
     _restore: Option<Task<()>>,
 }
@@ -208,6 +228,38 @@ impl ControllerApp {
                         view.fetch_status(token, cx);
                     });
                 }
+            }
+        });
+
+        let health_config = config.server.clone();
+        let health_handle = tokio_handle.clone();
+        let health = cx.spawn(async move |this, cx| {
+            loop {
+                let config = health_config.clone();
+                let mut task = AbortOnDrop(health_handle.spawn(async move {
+                    let mut client = rustctrl_network::connect(&config).await?;
+                    let reply = client
+                        .get_health(rustctrl_protocol::bootstrap::HealthRequest {})
+                        .await?
+                        .into_inner();
+                    Ok::<_, anyhow::Error>(reply.staff_bootstrap_required)
+                }));
+                let result = (&mut task.0).await;
+                if this
+                    .update(cx, |view, cx| {
+                        view.server_status = match result {
+                            Ok(Ok(bootstrap_required)) => {
+                                crate::login_state::ServerStatus::Connected { bootstrap_required }
+                            }
+                            _ => crate::login_state::ServerStatus::Unreachable,
+                        };
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_secs(5)).await;
             }
         });
 
@@ -337,11 +389,16 @@ impl ControllerApp {
             overlay: Overlay::None,
             active_field: ActiveField::Username,
             focus_handle,
+            visibility_focus: cx.focus_handle(),
+            remember_focus: cx.focus_handle(),
             tokio_handle,
             next_edit_device_request_id: 0,
             next_target_request_id: 0,
             next_replace_device_request_id: 0,
             next_prepare_artifact_request_id: 0,
+            server_status: crate::login_state::ServerStatus::Connecting,
+            show_password: false,
+            _health: health,
             _refresh: refresh,
             _restore: Some(restore),
         }
@@ -353,14 +410,18 @@ impl ControllerApp {
                 username,
                 password,
                 remember,
-                in_flight: false,
+                in_flight,
                 ..
             } => {
-                if username.trim().is_empty() || password.is_empty() {
+                let decision = crate::login_state::submit_decision(username, password, *in_flight);
+                if decision == crate::login_state::SubmitDecision::AlreadySubmitting {
+                    return;
+                }
+                if let crate::login_state::SubmitDecision::Invalid(message) = decision {
                     self.state = ScreenState::Login {
                         username: username.clone(),
                         password: password.clone(),
-                        error: Some("Username and password are required.".into()),
+                        error: Some(message.into()),
                         notice: None,
                         remember: *remember,
                         in_flight: false,
@@ -665,6 +726,7 @@ impl ControllerApp {
             remember: false,
             in_flight: false,
         };
+        self.show_password = false;
         // Any open password form belongs to the session being left behind.
         self.overlay = Overlay::None;
         self.active_field = ActiveField::Username;
@@ -3903,7 +3965,12 @@ impl ControllerApp {
         }
     }
 
-    fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !matches!(self.overlay, Overlay::None) {
             self.handle_overlay_key_down(event, cx);
             return;
@@ -3920,14 +3987,35 @@ impl ControllerApp {
                     return;
                 }
                 match key.as_str() {
-                    "enter" => {
-                        self.submit_login(cx);
-                    }
+                    "enter"
+                        if matches!(
+                            self.active_field,
+                            ActiveField::PasswordVisibility | ActiveField::RememberLogin
+                        ) => {}
+                    "enter" => self.submit_login(cx),
                     "tab" => {
-                        self.active_field = match self.active_field {
-                            ActiveField::Username => ActiveField::Password,
-                            _ => ActiveField::Username,
+                        self.active_field =
+                            match (self.active_field, event.keystroke.modifiers.shift) {
+                                (ActiveField::Username, false) => ActiveField::Password,
+                                (ActiveField::Password, false) => ActiveField::PasswordVisibility,
+                                (ActiveField::PasswordVisibility, false) => {
+                                    ActiveField::RememberLogin
+                                }
+                                (ActiveField::RememberLogin, true) => {
+                                    ActiveField::PasswordVisibility
+                                }
+                                (ActiveField::PasswordVisibility, true) => ActiveField::Password,
+                                (ActiveField::Password, true) => ActiveField::Username,
+                                (_, true) => ActiveField::RememberLogin,
+                                _ => ActiveField::Username,
+                            };
+                        let handle = match self.active_field {
+                            ActiveField::PasswordVisibility => &self.visibility_focus,
+                            ActiveField::RememberLogin => &self.remember_focus,
+                            _ => &self.focus_handle,
                         };
+                        window.focus(handle, cx);
+                        cx.stop_propagation();
                         cx.notify();
                     }
                     "backspace" => {
@@ -4064,7 +4152,7 @@ impl Render for ControllerApp {
         let container = div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                this.handle_key_down(event, cx);
+                this.handle_key_down(event, _window, cx);
             }))
             .size_full()
             .bg(rgb(self.theme.bg_app))
@@ -4075,259 +4163,9 @@ impl Render for ControllerApp {
             .gap_4();
 
         match &self.state {
-            ScreenState::Login {
-                username,
-                password,
-                error,
-                notice,
-                remember,
-                in_flight,
-            } => {
-                let user_active = self.active_field == ActiveField::Username;
-                let pass_active = self.active_field == ActiveField::Password;
-                let masked_pass = "•".repeat(password.len());
-                let remember_label = if *remember {
-                    "✓ Remember on this computer"
-                } else {
-                    "Remember on this computer"
-                };
-
-                container
-                    .child(div().text_3xl().child("RustCtrl"))
-                    .child("Staff Access · Please Sign In")
-                    .child(format!("Server: {}", self.config.server.endpoint))
-                    .children(notice.as_ref().map(|note| {
-                        div()
-                            .id("login-notice")
-                            .text_color(rgb(0x44cc44))
-                            .text_sm()
-                            .max_w(gpui::px(400.0))
-                            .child(note.clone())
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .max_w(gpui::px(400.0))
-                            .child("Username:")
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .bg(rgb(0x1a2634))
-                                    .border_1()
-                                    .border_color(if user_active {
-                                        rgb(0x4a90e2)
-                                    } else {
-                                        rgb(0x334455)
-                                    })
-                                    .rounded_md()
-                                    .id("username-input")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.active_field = ActiveField::Username;
-                                        cx.notify();
-                                    }))
-                                    .child(if username.is_empty() {
-                                        "Click and type username...".to_string()
-                                    } else {
-                                        username.clone()
-                                    }),
-                            )
-                            .child("Password:")
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .bg(rgb(0x1a2634))
-                                    .border_1()
-                                    .border_color(if pass_active {
-                                        rgb(0x4a90e2)
-                                    } else {
-                                        rgb(0x334455)
-                                    })
-                                    .rounded_md()
-                                    .id("password-input")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.active_field = ActiveField::Password;
-                                        cx.notify();
-                                    }))
-                                    .child(if password.is_empty() {
-                                        "Click and type password...".to_string()
-                                    } else {
-                                        masked_pass
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .bg(if *remember {
-                                        rgb(0x2d5a88)
-                                    } else {
-                                        rgb(0x223344)
-                                    })
-                                    .text_color(rgb(0xe8eef2))
-                                    .text_sm()
-                                    .id("remember-toggle")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let ScreenState::Login { remember, .. } = &mut this.state
-                                        {
-                                            *remember = !*remember;
-                                            cx.notify();
-                                        }
-                                    }))
-                                    .child(remember_label),
-                            )
-                            .children(error.as_ref().map(|err| {
-                                div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
-                            }))
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(if *in_flight {
-                                        rgb(0x556677)
-                                    } else {
-                                        rgb(0x2d5a88)
-                                    })
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("signin-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_login(cx);
-                                    }))
-                                    .child(if *in_flight {
-                                        "Signing in..."
-                                    } else {
-                                        "Sign In"
-                                    }),
-                            ),
-                    )
-            }
-            ScreenState::MustChangePassword {
-                username,
-                new_password,
-                confirm_password,
-                error,
-                in_flight,
-                ..
-            } => {
-                let new_active = self.active_field == ActiveField::NewPassword;
-                let conf_active = self.active_field == ActiveField::ConfirmPassword;
-                let masked_new = "•".repeat(new_password.len());
-                let masked_conf = "•".repeat(confirm_password.len());
-
-                container
-                    .child(div().text_3xl().child("RustCtrl"))
-                    .child(format!("Welcome, {username}"))
-                    .child(
-                        div()
-                            .text_color(rgb(0xffcc00))
-                            .child("A temporary password was used. You must set a permanent password before accessing the system."),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .max_w(gpui::px(400.0))
-                            .child("New Permanent Password:")
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .bg(rgb(0x1a2634))
-                                    .border_1()
-                                    .border_color(if new_active {
-                                        rgb(0x4a90e2)
-                                    } else {
-                                        rgb(0x334455)
-                                    })
-                                    .rounded_md()
-                                    .id("new-password-input")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.active_field = ActiveField::NewPassword;
-                                        cx.notify();
-                                    }))
-                                    .child(if new_password.is_empty() {
-                                        "Minimum 8 characters...".to_string()
-                                    } else {
-                                        masked_new
-                                    }),
-                            )
-                            .child("Confirm Permanent Password:")
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .bg(rgb(0x1a2634))
-                                    .border_1()
-                                    .border_color(if conf_active {
-                                        rgb(0x4a90e2)
-                                    } else {
-                                        rgb(0x334455)
-                                    })
-                                    .rounded_md()
-                                    .id("confirm-password-input")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.active_field = ActiveField::ConfirmPassword;
-                                        cx.notify();
-                                    }))
-                                    .child(if confirm_password.is_empty() {
-                                        "Re-enter new password...".to_string()
-                                    } else {
-                                        masked_conf
-                                    }),
-                            )
-                            .children(error.as_ref().map(|err| {
-                                div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
-                            }))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .px_4()
-                                            .py_2()
-                                            .bg(if *in_flight {
-                                                rgb(0x556677)
-                                            } else {
-                                                rgb(0x2d884d)
-                                            })
-                                            .text_color(rgb(0xffffff))
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .id("save-password-btn")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.submit_replace_password(cx);
-                                            }))
-                                            .child(if *in_flight {
-                                                "Updating..."
-                                            } else {
-                                                "Save & Continue"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_4()
-                                            .py_2()
-                                            .bg(rgb(0x445566))
-                                            .text_color(rgb(0xffffff))
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .id("cancel-btn")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.submit_logout(cx);
-                                            }))
-                                            .child("Cancel / Logout"),
-                                    ),
-                            ),
-                    )
+            ScreenState::Login { .. } => self.render_login(container, cx),
+            ScreenState::MustChangePassword { .. } => {
+                self.render_must_change_password(container, cx)
             }
             ScreenState::Connected {
                 username,
@@ -5299,8 +5137,18 @@ pub fn open(config: ControllerConfig, config_path: std::path::PathBuf) -> Result
 
     gpui::application().run(move |cx: &mut App| {
         gpui::init(cx);
-        cx.open_window(WindowOptions::default(), |_, cx| {
-            cx.new(|cx| ControllerApp::new(theme, config, config_path, handle, cx))
+        gpui::component::theme::Theme::change(gpui::component::theme::ThemeMode::Dark, None, cx);
+        gpui::component::theme::Theme::update(cx, |kit| {
+            kit.colors.button = rgb(theme.bg_surface_hover).into();
+            kit.colors.button_hover = rgb(theme.border_subtle).into();
+            kit.colors.button_active = rgb(theme.border_focus).into();
+            kit.colors.button_foreground = rgb(theme.text_primary).into();
+        });
+        cx.open_window(WindowOptions::default(), |window, cx| {
+            let view = cx.new(|cx| ControllerApp::new(theme, config, config_path, handle, cx));
+            let focus = view.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+            view
         })
         .expect("open RustCtrl window");
         cx.activate(true);
