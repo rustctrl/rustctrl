@@ -71,3 +71,7 @@ Environment: Linux x86_64, Rust 1.98.1 pinned toolchain.
 ## Issue #47 verification on 2026-10-28
 
 On Linux x86_64 with Rust 1.98.1, the Controller with GPUI Kit built and passed strict Clippy and the workspace test suite. These checks do not validate graphical rendering. Native Windows MSVC and interactive X11 and Wayland sessions were not available for this verification.
+
+## Issue #48 verification on 2026-10-28
+
+On Linux x86_64, Controller and Server compilation includes the optional health response field for bootstrap guidance. An older Server omits this field, so the Controller leaves bootstrap status unknown. Interactive X11, Wayland, and Windows GUI validation require desktop sessions and were not available on this host.

@@ -10,6 +10,7 @@ message HealthRequest {}
 message HealthReply {
   string version = 1;
   uint64 registered_devices = 2;
+  optional bool staff_bootstrap_required = 3;
 }
 message HeartbeatRequest {
   string device_id = 1;

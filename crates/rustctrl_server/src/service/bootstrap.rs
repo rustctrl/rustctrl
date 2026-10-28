@@ -92,6 +92,13 @@ impl Bootstrap for BootstrapService {
         Ok(Response::new(HealthReply {
             version: env!("CARGO_PKG_VERSION").into(),
             registered_devices: count,
+            staff_bootstrap_required: Some(
+                !self
+                    .store
+                    .has_staff_accounts()
+                    .await
+                    .map_err(database_error)?,
+            ),
         }))
     }
 
@@ -344,6 +351,23 @@ mod tests {
 
         assert_eq!(response.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(response.registered_devices, 0);
+        assert_eq!(response.staff_bootstrap_required, Some(true));
+    }
+
+    #[tokio::test]
+    async fn health_reports_when_first_account_exists() {
+        let store = create_test_store().await;
+        store
+            .bootstrap_admin("admin".into(), "StrongPass123!".into())
+            .await
+            .unwrap();
+        let service = BootstrapService::new(store);
+        let reply = service
+            .get_health(Request::new(HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.staff_bootstrap_required, Some(false));
     }
 
     #[tokio::test]

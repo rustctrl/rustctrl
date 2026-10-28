@@ -1,3 +1,5 @@
+#[cfg(any(feature = "gui", test))]
+mod login_state;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rustctrl_core::{ControllerConfig, init_logging};

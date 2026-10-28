@@ -338,6 +338,23 @@ impl DeviceStore {
         .await?
     }
 
+    /// Returns whether any Staff Account has been created.
+    pub async fn has_staff_accounts(&self) -> Result<bool> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            Ok(
+                connection.query_row("SELECT EXISTS(SELECT 1 FROM staff_accounts)", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        })
+        .await?
+    }
+
     /// Lists all staff accounts ordered by username ascending.
     pub async fn list_staff_accounts(&self) -> Result<Vec<StaffAccount>> {
         let store = self.clone();
