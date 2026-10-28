@@ -173,6 +173,7 @@ struct ControllerApp {
     next_prepare_artifact_request_id: u64,
     server_status: crate::login_state::ServerStatus,
     show_password: bool,
+    navigation: crate::navigation::Navigation,
     _health: Task<()>,
     _refresh: Task<()>,
     _restore: Option<Task<()>>,
@@ -398,6 +399,7 @@ impl ControllerApp {
             next_prepare_artifact_request_id: 0,
             server_status: crate::login_state::ServerStatus::Connecting,
             show_password: false,
+            navigation: crate::navigation::Navigation::default(),
             _health: health,
             _refresh: refresh,
             _restore: Some(restore),
@@ -727,6 +729,7 @@ impl ControllerApp {
             in_flight: false,
         };
         self.show_password = false;
+        self.navigation.reset();
         // Any open password form belongs to the session being left behind.
         self.overlay = Overlay::None;
         self.active_field = ActiveField::Username;
@@ -4101,7 +4104,14 @@ impl ControllerApp {
                 role,
                 ..
             } => {
-                if *in_flight || role != "admin" {
+                if *in_flight
+                    || role != "admin"
+                    || self.navigation.active(role) != crate::navigation::Route::Accounts
+                    || !matches!(
+                        self.active_field,
+                        ActiveField::NewAccountUsername | ActiveField::NewAccountPassword
+                    )
+                {
                     return;
                 }
                 match key.as_str() {
@@ -4157,15 +4167,14 @@ impl Render for ControllerApp {
             .size_full()
             .bg(rgb(self.theme.bg_app))
             .text_color(rgb(self.theme.text_primary))
-            .p_8()
             .flex()
             .flex_col()
             .gap_4();
 
         match &self.state {
-            ScreenState::Login { .. } => self.render_login(container, cx),
+            ScreenState::Login { .. } => self.render_login(container.p_8(), cx),
             ScreenState::MustChangePassword { .. } => {
-                self.render_must_change_password(container, cx)
+                self.render_must_change_password(container.p_8(), cx)
             }
             ScreenState::Connected {
                 username,
@@ -4183,69 +4192,116 @@ impl Render for ControllerApp {
                 in_flight,
                 ..
             } => {
+                use crate::navigation::{Navigation, Route};
+                use gpui::assets::IconName;
+                use gpui::component::button::Button;
+                use gpui::component::sidebar::{
+                    Sidebar, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
+                };
+
                 let is_admin = role == "admin";
-                // Scrollable so a populated Fleet cannot push Devices and the
-                // account controls below the viewport.
-                let mut content = div()
-                    .id("connected-scroll")
-                    .size_full()
+                let active = self.navigation.active(role);
+                let collapsed = self.navigation.collapsed;
+                let mut menu = SidebarMenu::new();
+                for route in Navigation::routes(role) {
+                    let icon = match route {
+                        Route::Fleet => IconName::LayoutDashboard,
+                        Route::Remote => IconName::Monitor,
+                        Route::Accounts => IconName::Users,
+                        Route::Deployment => IconName::Package,
+                        Route::Audit => IconName::FileClock,
+                    };
+                    menu = menu.child(
+                        SidebarMenuItem::new(route.label())
+                            .icon(icon)
+                            .active(active == route)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let ScreenState::Connected { role, .. } = &this.state {
+                                    this.navigation.select(route, role);
+                                    if matches!(this.overlay, Overlay::None) {
+                                        this.active_field = ActiveField::Username;
+                                    }
+                                    cx.notify();
+                                }
+                            })),
+                    );
+                }
+                let sidebar =
+                    Sidebar::new("navigation")
+                        .w(gpui::px(220.))
+                        .collapsed(collapsed)
+                        .header(SidebarToggleButton::new().collapsed(collapsed).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.navigation.collapsed = !this.navigation.collapsed;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(menu);
+                let (status, status_color) = match self.server_status {
+                    crate::login_state::ServerStatus::Connecting => {
+                        ("Connecting", self.theme.status_reconnecting)
+                    }
+                    crate::login_state::ServerStatus::Connected { .. } => {
+                        ("Connected over mutual TLS", self.theme.status_online)
+                    }
+                    crate::login_state::ServerStatus::Unreachable => {
+                        ("Server unreachable", self.theme.status_blocked)
+                    }
+                };
+                let header = div()
+                    .w_full()
+                    .px_4()
+                    .py_3()
                     .flex()
-                    .flex_col()
-                    .gap_4()
-                    .overflow_y_scroll()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(self.theme.border_subtle))
+                    .bg(rgb(self.theme.bg_surface))
                     .child(
                         div()
                             .flex()
-                            .justify_between()
+                            .gap_3()
                             .items_center()
+                            .child(div().text_color(rgb(status_color)).child(status))
+                            .child(div().text_color(rgb(self.theme.text_muted)).child(format!(
+                                "Server {server_version} · {registered_devices} devices"
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .items_center()
+                            .child(username.clone())
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(div().text_3xl().child("RustCtrl"))
-                                    .child(format!(
-                                        "Connected over mutual TLS · Server {server_version}"
-                                    ))
-                                    .child(format!("Logged in as: {username} ({role})"))
-                                    .child(format!(
-                                        "Registered devices in fleet: {registered_devices}"
-                                    )),
+                                    .px_2()
+                                    .rounded_md()
+                                    .bg(rgb(self.theme.bg_surface_hover))
+                                    .child(if is_admin { "Admin" } else { "Operator" }),
                             )
                             .child(
-                                div()
-                                    .flex()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .px_4()
-                                            .py_2()
-                                            .bg(rgb(0x2d5a88))
-                                            .text_color(rgb(0xffffff))
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .id("change-password-btn")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.open_change_password(cx);
-                                            }))
-                                            .child("Change Password"),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_4()
-                                            .py_2()
-                                            .bg(rgb(0x883333))
-                                            .text_color(rgb(0xffffff))
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .id("signout-btn")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.submit_logout(cx);
-                                            }))
-                                            .child("Sign Out"),
+                                Button::new("change-password-btn")
+                                    .label("Change Password")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_change_password(cx)),
                                     ),
+                            )
+                            .child(
+                                Button::new("signout-btn")
+                                    .label("Sign Out")
+                                    .on_click(cx.listener(|this, _, _, cx| this.submit_logout(cx))),
                             ),
                     );
-
+                let mut content = div()
+                    .id("connected-scroll")
+                    .size_full()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .overflow_y_scroll();
                 if let Some(err) = error {
                     content = content.child(
                         div()
@@ -4266,172 +4322,231 @@ impl Render for ControllerApp {
                     );
                 }
 
-                // The Fleet Inventory is visible to both roles and derives
-                // online status from heartbeat freshness on the Server.
-                let mut fleet_list = div().mt_4().flex().flex_col().gap_2();
+                if active == Route::Fleet {
+                    // The Fleet Inventory is visible to both roles and derives
+                    // online status from heartbeat freshness on the Server.
+                    let mut fleet_list = div().mt_4().flex().flex_col().gap_2();
 
-                let mut title_bar = div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(div().text_xl().child("Fleet Inventory"));
-                if is_admin {
-                    title_bar = title_bar.child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(0x3a5a7a))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .id("open-replace-device-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_replace_device(String::new(), String::new(), cx);
-                                    }))
-                                    .child("Replace Device"),
-                            )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(0x2a7a5a))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .id("open-prepare-artifact-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_prepare_installation_artifact(cx);
-                                    }))
-                                    .child("+ Installation Package"),
-                            )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .bg(rgb(0x2d884d))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .id("add-target-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_add_target(cx);
-                                    }))
-                                    .child("+ Add Target"),
-                            ),
-                    );
-                }
-                fleet_list = fleet_list.child(title_bar);
-
-                if devices.is_empty() {
-                    fleet_list = fleet_list.child(div().text_sm().text_color(rgb(0x8899aa)).child(
-                        if server_version == "Unavailable" {
-                            "Server unavailable — the last known Fleet is shown below."
-                        } else {
-                            "No Devices registered yet."
-                        },
-                    ));
-                } else {
-                    let mut header_row = div()
+                    let mut title_bar = div()
                         .flex()
-                        .gap_4()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(rgb(0x334455))
-                        .text_sm()
-                        .text_color(rgb(0x8899aa))
-                        .child(div().w(gpui::px(180.0)).child("Device"))
-                        .child(div().w(gpui::px(80.0)).child("Type"))
-                        .child(div().w(gpui::px(120.0)).child("Location"))
-                        .child(div().w(gpui::px(140.0)).child("Last Address"))
-                        .child(div().w(gpui::px(140.0)).child("Config Address"))
-                        .child(div().w(gpui::px(90.0)).child("Status"))
-                        .child(div().w(gpui::px(100.0)).child("Last Seen"));
+                        .justify_between()
+                        .items_center()
+                        .child(div().text_xl().child("Fleet Inventory"));
                     if is_admin {
-                        header_row = header_row.child(div().w(gpui::px(340.0)).child("Actions"));
+                        title_bar = title_bar.child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .bg(rgb(0x3a5a7a))
+                                        .text_color(rgb(0xffffff))
+                                        .rounded_md()
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .id("open-replace-device-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_replace_device(
+                                                String::new(),
+                                                String::new(),
+                                                cx,
+                                            );
+                                        }))
+                                        .child("Replace Device"),
+                                )
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .bg(rgb(0x2a7a5a))
+                                        .text_color(rgb(0xffffff))
+                                        .rounded_md()
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .id("open-prepare-artifact-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_prepare_installation_artifact(cx);
+                                        }))
+                                        .child("+ Installation Package"),
+                                )
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .bg(rgb(0x2d884d))
+                                        .text_color(rgb(0xffffff))
+                                        .rounded_md()
+                                        .text_sm()
+                                        .cursor_pointer()
+                                        .id("add-target-btn")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_add_target(cx);
+                                        }))
+                                        .child("+ Add Target"),
+                                ),
+                        );
                     }
-                    fleet_list = fleet_list.child(header_row);
+                    fleet_list = fleet_list.child(title_bar);
 
-                    for device in devices {
-                        let vm = format_device_row(device);
-                        let dev_id = device.device_id.clone();
-                        let dev_name = device.display_name.clone();
-                        let dev_loc = device.location.clone();
-                        let is_tv_target = device.device_type == "android_tv";
-                        let configured_addr = device.configured_address.clone().unwrap_or_default();
-
-                        let status_color = if vm.status == "Blocked" {
-                            rgb(0xd9534f)
-                        } else if vm.status == "Unverified" {
-                            rgb(0xe0a838)
-                        } else if vm.status == "Online" {
-                            rgb(0x44cc44)
-                        } else {
-                            rgb(0xff6b6b)
-                        };
-
-                        let mut row = div()
+                    if devices.is_empty() {
+                        fleet_list =
+                            fleet_list.child(div().text_sm().text_color(rgb(0x8899aa)).child(
+                                if server_version == "Unavailable" {
+                                    "Server unavailable — the last known Fleet is shown below."
+                                } else {
+                                    "No Devices registered yet."
+                                },
+                            ));
+                    } else {
+                        let mut header_row = div()
                             .flex()
                             .gap_4()
-                            .items_center()
                             .py_1()
-                            .child(
-                                div()
-                                    .w(gpui::px(180.0))
-                                    .child(format!("{} ({})", vm.display_name, vm.device_id)),
-                            )
-                            .child(
-                                div()
-                                    .w(gpui::px(80.0))
-                                    .text_color(rgb(0xaaaaaa))
-                                    .child(vm.device_type),
-                            )
-                            .child(
-                                div()
-                                    .w(gpui::px(120.0))
-                                    .text_color(rgb(0xaaaaaa))
-                                    .child(vm.location),
-                            )
-                            .child(
-                                div()
-                                    .w(gpui::px(140.0))
-                                    .text_color(rgb(0xaaaaaa))
-                                    .child(vm.last_address),
-                            )
-                            .child(
-                                div()
-                                    .w(gpui::px(140.0))
-                                    .text_color(rgb(0xaaaaaa))
-                                    .child(vm.configured_address),
-                            )
-                            .child(
-                                div()
-                                    .w(gpui::px(90.0))
-                                    .text_color(status_color)
-                                    .child(vm.status),
-                            )
-                            .child(
-                                div()
-                                    .w(gpui::px(100.0))
-                                    .text_color(rgb(0x8899aa))
-                                    .text_sm()
-                                    .child(vm.last_seen),
-                            );
+                            .border_b_1()
+                            .border_color(rgb(0x334455))
+                            .text_sm()
+                            .text_color(rgb(0x8899aa))
+                            .child(div().w(gpui::px(180.0)).child("Device"))
+                            .child(div().w(gpui::px(80.0)).child("Type"))
+                            .child(div().w(gpui::px(120.0)).child("Location"))
+                            .child(div().w(gpui::px(140.0)).child("Last Address"))
+                            .child(div().w(gpui::px(140.0)).child("Config Address"))
+                            .child(div().w(gpui::px(90.0)).child("Status"))
+                            .child(div().w(gpui::px(100.0)).child("Last Seen"));
                         if is_admin {
-                            if is_tv_target {
-                                let dev_id_for_remove = dev_id.clone();
-                                row = row.child(
+                            header_row =
+                                header_row.child(div().w(gpui::px(340.0)).child("Actions"));
+                        }
+                        fleet_list = fleet_list.child(header_row);
+
+                        for device in devices {
+                            let vm = format_device_row(device);
+                            let dev_id = device.device_id.clone();
+                            let dev_name = device.display_name.clone();
+                            let dev_loc = device.location.clone();
+                            let is_tv_target = device.device_type == "android_tv";
+                            let configured_addr =
+                                device.configured_address.clone().unwrap_or_default();
+
+                            let status_color = if vm.status == "Blocked" {
+                                rgb(0xd9534f)
+                            } else if vm.status == "Unverified" {
+                                rgb(0xe0a838)
+                            } else if vm.status == "Online" {
+                                rgb(0x44cc44)
+                            } else {
+                                rgb(0xff6b6b)
+                            };
+
+                            let mut row = div()
+                                .flex()
+                                .gap_4()
+                                .items_center()
+                                .py_1()
+                                .child(
                                     div()
-                                        .w(gpui::px(340.0))
-                                        .flex()
-                                        .gap_2()
-                                        .child(
+                                        .w(gpui::px(180.0))
+                                        .child(format!("{} ({})", vm.display_name, vm.device_id)),
+                                )
+                                .child(
+                                    div()
+                                        .w(gpui::px(80.0))
+                                        .text_color(rgb(0xaaaaaa))
+                                        .child(vm.device_type),
+                                )
+                                .child(
+                                    div()
+                                        .w(gpui::px(120.0))
+                                        .text_color(rgb(0xaaaaaa))
+                                        .child(vm.location),
+                                )
+                                .child(
+                                    div()
+                                        .w(gpui::px(140.0))
+                                        .text_color(rgb(0xaaaaaa))
+                                        .child(vm.last_address),
+                                )
+                                .child(
+                                    div()
+                                        .w(gpui::px(140.0))
+                                        .text_color(rgb(0xaaaaaa))
+                                        .child(vm.configured_address),
+                                )
+                                .child(
+                                    div()
+                                        .w(gpui::px(90.0))
+                                        .text_color(status_color)
+                                        .child(vm.status),
+                                )
+                                .child(
+                                    div()
+                                        .w(gpui::px(100.0))
+                                        .text_color(rgb(0x8899aa))
+                                        .text_sm()
+                                        .child(vm.last_seen),
+                                );
+                            if is_admin {
+                                if is_tv_target {
+                                    let dev_id_for_remove = dev_id.clone();
+                                    row = row.child(
+                                        div()
+                                            .w(gpui::px(340.0))
+                                            .flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .bg(rgb(0x3a5a7a))
+                                                    .text_color(rgb(0xffffff))
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .id(format!(
+                                                        "edit-target-btn-{}",
+                                                        device.device_id
+                                                    ))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.open_edit_target(
+                                                            dev_id.clone(),
+                                                            dev_name.clone(),
+                                                            configured_addr.clone(),
+                                                            dev_loc.clone(),
+                                                            cx,
+                                                        );
+                                                    }))
+                                                    .child("Edit"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .bg(rgb(0x883333))
+                                                    .text_color(rgb(0xffffff))
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .id(format!(
+                                                        "remove-target-btn-{}",
+                                                        device.device_id
+                                                    ))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.submit_remove_target(
+                                                            dev_id_for_remove.clone(),
+                                                            cx,
+                                                        );
+                                                    }))
+                                                    .child("Remove"),
+                                            ),
+                                    );
+                                } else {
+                                    let is_blocked = device.blocked || device.status == "blocked";
+                                    let dev_id_for_edit = dev_id.clone();
+                                    let dev_id_for_replace = dev_id.clone();
+                                    let mut actions_div =
+                                        div().w(gpui::px(340.0)).flex().gap_2().child(
                                             div()
                                                 .px_2()
                                                 .py_1()
@@ -4440,19 +4555,44 @@ impl Render for ControllerApp {
                                                 .rounded_md()
                                                 .text_xs()
                                                 .cursor_pointer()
-                                                .id(format!("edit-target-btn-{}", device.device_id))
+                                                .id(format!("edit-device-btn-{}", device.device_id))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.open_edit_target(
-                                                        dev_id.clone(),
+                                                    this.open_edit_device(
+                                                        dev_id_for_edit.clone(),
                                                         dev_name.clone(),
-                                                        configured_addr.clone(),
                                                         dev_loc.clone(),
                                                         cx,
                                                     );
                                                 }))
                                                 .child("Edit"),
-                                        )
-                                        .child(
+                                        );
+
+                                    if is_blocked {
+                                        let dev_id_for_unblock = dev_id.clone();
+                                        actions_div = actions_div.child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .bg(rgb(0x2d884d))
+                                                .text_color(rgb(0xffffff))
+                                                .rounded_md()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .id(format!(
+                                                    "unblock-device-btn-{}",
+                                                    device.device_id
+                                                ))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.submit_unblock_device(
+                                                        dev_id_for_unblock.clone(),
+                                                        cx,
+                                                    );
+                                                }))
+                                                .child("Unblock"),
+                                        );
+                                    } else {
+                                        let dev_id_for_block = dev_id.clone();
+                                        actions_div = actions_div.child(
                                             div()
                                                 .px_2()
                                                 .py_1()
@@ -4462,142 +4602,80 @@ impl Render for ControllerApp {
                                                 .text_xs()
                                                 .cursor_pointer()
                                                 .id(format!(
-                                                    "remove-target-btn-{}",
+                                                    "block-device-btn-{}",
                                                     device.device_id
                                                 ))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.submit_remove_target(
-                                                        dev_id_for_remove.clone(),
+                                                    this.submit_block_device(
+                                                        dev_id_for_block.clone(),
                                                         cx,
                                                     );
                                                 }))
-                                                .child("Remove"),
-                                        ),
-                                );
-                            } else {
-                                let is_blocked = device.blocked || device.status == "blocked";
-                                let dev_id_for_edit = dev_id.clone();
-                                let dev_id_for_replace = dev_id.clone();
-                                let mut actions_div =
-                                    div().w(gpui::px(340.0)).flex().gap_2().child(
-                                        div()
-                                            .px_2()
-                                            .py_1()
-                                            .bg(rgb(0x3a5a7a))
-                                            .text_color(rgb(0xffffff))
-                                            .rounded_md()
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .id(format!("edit-device-btn-{}", device.device_id))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_edit_device(
-                                                    dev_id_for_edit.clone(),
-                                                    dev_name.clone(),
-                                                    dev_loc.clone(),
-                                                    cx,
-                                                );
-                                            }))
-                                            .child("Edit"),
-                                    );
-
-                                if is_blocked {
-                                    let dev_id_for_unblock = dev_id.clone();
-                                    actions_div = actions_div.child(
-                                        div()
-                                            .px_2()
-                                            .py_1()
-                                            .bg(rgb(0x2d884d))
-                                            .text_color(rgb(0xffffff))
-                                            .rounded_md()
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .id(format!("unblock-device-btn-{}", device.device_id))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.submit_unblock_device(
-                                                    dev_id_for_unblock.clone(),
-                                                    cx,
-                                                );
-                                            }))
-                                            .child("Unblock"),
-                                    );
-                                } else {
-                                    let dev_id_for_block = dev_id.clone();
-                                    actions_div = actions_div.child(
-                                        div()
-                                            .px_2()
-                                            .py_1()
-                                            .bg(rgb(0x883333))
-                                            .text_color(rgb(0xffffff))
-                                            .rounded_md()
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .id(format!("block-device-btn-{}", device.device_id))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.submit_block_device(
-                                                    dev_id_for_block.clone(),
-                                                    cx,
-                                                );
-                                            }))
-                                            .child("Block"),
-                                    );
-
-                                    if !device.online || device.status == "offline" {
-                                        let dev_id_for_clean = dev_id.clone();
-                                        actions_div = actions_div.child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .bg(rgb(0x7a4a3a))
-                                                .text_color(rgb(0xffffff))
-                                                .rounded_md()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .id(format!(
-                                                    "clean-device-btn-{}",
-                                                    device.device_id
-                                                ))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.submit_clean_offline_device(
-                                                        dev_id_for_clean.clone(),
-                                                        cx,
-                                                    );
-                                                }))
-                                                .child("Clean"),
+                                                .child("Block"),
                                         );
-                                    }
-                                }
 
-                                actions_div = actions_div.child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x4a6a8a))
-                                        .text_color(rgb(0xffffff))
-                                        .rounded_md()
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .id(format!("replace-device-btn-{}", device.device_id))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.open_replace_device(
-                                                dev_id_for_replace.clone(),
-                                                String::new(),
-                                                cx,
+                                        if !device.online || device.status == "offline" {
+                                            let dev_id_for_clean = dev_id.clone();
+                                            actions_div = actions_div.child(
+                                                div()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .bg(rgb(0x7a4a3a))
+                                                    .text_color(rgb(0xffffff))
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .id(format!(
+                                                        "clean-device-btn-{}",
+                                                        device.device_id
+                                                    ))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.submit_clean_offline_device(
+                                                            dev_id_for_clean.clone(),
+                                                            cx,
+                                                        );
+                                                    }))
+                                                    .child("Clean"),
                                             );
-                                        }))
-                                        .child("Replace"),
-                                );
+                                        }
+                                    }
 
-                                row = row.child(actions_div);
+                                    actions_div = actions_div.child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(0x4a6a8a))
+                                            .text_color(rgb(0xffffff))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .id(format!("replace-device-btn-{}", device.device_id))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_replace_device(
+                                                    dev_id_for_replace.clone(),
+                                                    String::new(),
+                                                    cx,
+                                                );
+                                            }))
+                                            .child("Replace"),
+                                    );
+
+                                    row = row.child(actions_div);
+                                }
                             }
+                            fleet_list = fleet_list.child(row);
                         }
-                        fleet_list = fleet_list.child(row);
                     }
+                    content = content.child(fleet_list);
                 }
-                content = content.child(fleet_list);
-
-                if !matches!(self.overlay, Overlay::None) {
-                    content = content.child(self.render_overlay_form(cx));
-                } else if is_admin {
+                if matches!(active, Route::Remote | Route::Audit) {
+                    content = content.child(div().text_xl().child(active.label())).child(
+                        div()
+                            .text_color(rgb(self.theme.text_muted))
+                            .child("This workspace is not available yet."),
+                    );
+                }
+                if is_admin && matches!(active, Route::Accounts | Route::Deployment) {
                     let user_active = self.active_field == ActiveField::NewAccountUsername;
                     let pass_active = self.active_field == ActiveField::NewAccountPassword;
                     let masked_new_pass = "•".repeat(new_account_password.len());
@@ -5026,23 +5104,33 @@ impl Render for ControllerApp {
                         }
                     }
 
-                    content = content
-                        .child(accounts_list)
-                        .child(create_form)
-                        .child(auth_list);
-                } else {
-                    content = content.child(
-                        div()
-                            .mt_4()
-                            .p_4()
-                            .bg(rgb(0x16212e))
-                            .rounded_lg()
-                            .text_color(rgb(0x8899aa))
-                            .child("Staff account administration is restricted to Admins. Fleet monitoring mode is active."),
-                    );
+                    if active == Route::Accounts {
+                        content = content.child(accounts_list).child(create_form);
+                    }
+                    if active == Route::Deployment {
+                        content = content
+                            .child(div().text_xl().child("Agent Deployment"))
+                            .child(
+                                Button::new("deployment-package-btn")
+                                    .label("Create Agent Package")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_prepare_installation_artifact(cx)
+                                    })),
+                            )
+                            .child(auth_list);
+                    }
                 }
-
-                container.child(content)
+                if !matches!(self.overlay, Overlay::None) {
+                    content = content.child(self.render_overlay_form(cx));
+                }
+                container.child(header).child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(sidebar)
+                        .child(content),
+                )
             }
         }
     }
@@ -5135,24 +5223,30 @@ pub fn open(config: ControllerConfig, config_path: std::path::PathBuf) -> Result
     let runtime = tokio::runtime::Runtime::new()?;
     let handle = runtime.handle().clone();
 
-    gpui::application().run(move |cx: &mut App| {
-        gpui::init(cx);
-        gpui::component::theme::Theme::change(gpui::component::theme::ThemeMode::Dark, None, cx);
-        gpui::component::theme::Theme::update(cx, |kit| {
-            kit.colors.button = rgb(theme.bg_surface_hover).into();
-            kit.colors.button_hover = rgb(theme.border_subtle).into();
-            kit.colors.button_active = rgb(theme.border_focus).into();
-            kit.colors.button_foreground = rgb(theme.text_primary).into();
+    gpui::application()
+        .with_assets(gpui::assets::AllAssets)
+        .run(move |cx: &mut App| {
+            gpui::init(cx);
+            gpui::component::theme::Theme::change(
+                gpui::component::theme::ThemeMode::Dark,
+                None,
+                cx,
+            );
+            gpui::component::theme::Theme::update(cx, |kit| {
+                kit.colors.button = rgb(theme.bg_surface_hover).into();
+                kit.colors.button_hover = rgb(theme.border_subtle).into();
+                kit.colors.button_active = rgb(theme.border_focus).into();
+                kit.colors.button_foreground = rgb(theme.text_primary).into();
+            });
+            cx.open_window(WindowOptions::default(), |window, cx| {
+                let view = cx.new(|cx| ControllerApp::new(theme, config, config_path, handle, cx));
+                let focus = view.read(cx).focus_handle.clone();
+                window.focus(&focus, cx);
+                view
+            })
+            .expect("open RustCtrl window");
+            cx.activate(true);
         });
-        cx.open_window(WindowOptions::default(), |window, cx| {
-            let view = cx.new(|cx| ControllerApp::new(theme, config, config_path, handle, cx));
-            let focus = view.read(cx).focus_handle.clone();
-            window.focus(&focus, cx);
-            view
-        })
-        .expect("open RustCtrl window");
-        cx.activate(true);
-    });
     runtime.shutdown_background();
     Ok(())
 }
