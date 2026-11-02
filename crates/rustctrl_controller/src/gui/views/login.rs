@@ -1,5 +1,9 @@
 use super::super::*;
 use gpui::component::button::Button;
+use gpui::{
+    Context, InteractiveElement as _, ParentElement as _, Styled as _, div,
+    prelude::FluentBuilder as _, rgb,
+};
 
 impl ControllerApp {
     pub(in crate::gui) fn render_login(
@@ -56,7 +60,7 @@ impl ControllerApp {
                 .child("Password")
                 .child(input(self.active_field == ActiveField::Password).id("password-input").on_click(cx.listener(|this, _, window, cx| { this.active_field = ActiveField::Password; window.focus(&this.focus_handle, cx); cx.notify(); })).child(if password.is_empty() { "Enter password".to_string() } else if self.show_password { password.clone() } else { "•".repeat(password.chars().count()) }))
                 .child(div().border_1().border_color(rgb(if self.active_field == ActiveField::PasswordVisibility { theme.border_focus } else { theme.bg_surface })).child(Button::new("password-visibility").track_focus(&self.visibility_focus).label(if self.show_password { "Hide password" } else { "Show password" }).on_click(cx.listener(|this, _, _, cx| { this.active_field = ActiveField::PasswordVisibility; this.show_password = !this.show_password; cx.notify(); }))))
-                .child(div().border_1().border_color(rgb(if self.active_field == ActiveField::RememberLogin { theme.border_focus } else { theme.bg_surface })).child(Button::new("remember-toggle").track_focus(&self.remember_focus).label(if *remember { "✓ Remember this computer" } else { "Remember this computer" }).on_click(cx.listener(|this, _, _, cx| { this.active_field = ActiveField::RememberLogin; if let ScreenState::Login { remember, .. } = &mut this.state { *remember = !*remember; cx.notify(); } }))))
+                .child(div().border_1().border_color(rgb(if self.active_field == ActiveField::RememberLogin { theme.border_focus } else { theme.bg_surface })).child(Button::new("remember-toggle").track_focus(&self.remember_focus).label(if *remember { "✓ Remember this computer" } else { "Remember this computer" }).on_click(cx.listener(|this, _, _, cx| { this.active_field = ActiveField::RememberLogin; if let ScreenState::Login { remember: rem, .. } = &mut this.state { *rem = !*rem; cx.notify(); } }))))
                 .children(error.as_ref().map(|err| div().text_color(rgb(theme.status_blocked)).text_sm().child(err.clone())))
                 .child(Button::new("signin-btn").label(if *in_flight { "Signing in..." } else { "Sign in" }).loading(*in_flight).on_click(cx.listener(|this, _, window, cx| { window.focus(&this.focus_handle, cx); this.submit_login(cx); })))
         )
