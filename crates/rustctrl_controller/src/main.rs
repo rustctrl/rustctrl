@@ -15,6 +15,8 @@ use rustctrl_protocol::auth::{
 use rustctrl_protocol::bootstrap::HealthRequest;
 use std::path::PathBuf;
 
+#[cfg(any(feature = "gui", test))]
+mod fleet;
 #[cfg(feature = "gui")]
 mod gui;
 #[cfg(any(feature = "gui", test))]
