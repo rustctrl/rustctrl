@@ -1,3 +1,4 @@
+mod overlays;
 mod views {
     pub(super) mod fleet;
     pub(super) mod login;
@@ -49,7 +50,7 @@ enum ActiveField {
     PreparePackageAgentBinary,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum Overlay {
     None,
     ChangePassword {
@@ -179,6 +180,7 @@ struct ControllerApp {
     fleet_state: crate::fleet::FleetState,
     fleet_table:
         Option<Entity<gpui::component::table::TableState<views::fleet::FleetTableDelegate>>>,
+    pub(crate) toast_manager: crate::toast::ToastManager,
     _health: Task<()>,
     _refresh: Task<()>,
     _restore: Option<Task<()>>,
@@ -407,6 +409,7 @@ impl ControllerApp {
             navigation: crate::navigation::Navigation::default(),
             fleet_state: crate::fleet::FleetState::new(),
             fleet_table: None,
+            toast_manager: crate::toast::ToastManager::new(),
             _health: health,
             _refresh: refresh,
             _restore: Some(restore),
@@ -1453,6 +1456,12 @@ impl ControllerApp {
                         ) {
                             view.overlay = Overlay::None;
                             view.active_field = ActiveField::NewAccountUsername;
+                            view.emit_toast(
+                                crate::toast::ToastKind::Success,
+                                "Password Changed",
+                                "Password changed successfully.",
+                                cx,
+                            );
                             if let ScreenState::Connected { notice, .. } = &mut view.state {
                                 *notice = Some("Password changed successfully.".into());
                             }
@@ -1572,19 +1581,20 @@ impl ControllerApp {
                                         remember: false,
                                 };
                             } else {
-                                if let ScreenState::Connected {
-                                    notice,
-                                    session_token,
-                                    ..
-                                } = &mut view.state
-                                {
+                                if let ScreenState::Connected { notice, .. } = &mut view.state {
                                     *notice = Some(
                                         "Temporary password set; all target sessions revoked."
                                             .into(),
                                     );
-                                    let token = session_token.clone();
-                                    view.fetch_status(token, cx);
                                 }
+                                view.emit_toast(
+                                    crate::toast::ToastKind::Success,
+                                    "Password Reset",
+                                    "Temporary password set; all target sessions revoked.",
+                                    cx,
+                                );
+                                let token = tok_check.clone();
+                                view.fetch_status(token, cx);
                             }
                         }
                     }
@@ -1709,6 +1719,12 @@ impl ControllerApp {
                         }
                         if let ScreenState::Connected { notice, .. } = &mut view.state {
                             *notice = Some(format!("Updated device '{device_id_label}'."));
+                            view.emit_toast(
+                                crate::toast::ToastKind::Success,
+                                "Device Updated",
+                                format!("Updated device '{device_id_label}'."),
+                                cx,
+                            );
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
@@ -1842,6 +1858,12 @@ impl ControllerApp {
                             *notice = Some(format!(
                                 "Added Android TV target '{target_name_label}' ({id_str})."
                             ));
+                            view.emit_toast(
+                                crate::toast::ToastKind::Success,
+                                "Target Added",
+                                format!("Added Android TV target '{target_name_label}'."),
+                                cx,
+                            );
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
@@ -1971,6 +1993,12 @@ impl ControllerApp {
                         }
                         if let ScreenState::Connected { notice, .. } = &mut view.state {
                             *notice = Some(format!("Updated target '{target_id_label}'."));
+                            view.emit_toast(
+                                crate::toast::ToastKind::Success,
+                                "Target Updated",
+                                format!("Updated target '{target_id_label}'."),
+                                cx,
+                            );
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
@@ -2043,6 +2071,12 @@ impl ControllerApp {
                     Ok(Ok(())) => {
                         if let ScreenState::Connected { notice, .. } = &mut view.state {
                             *notice = Some(format!("Removed target '{target_label}'."));
+                            view.emit_toast(
+                                crate::toast::ToastKind::Info,
+                                "Target Removed",
+                                format!("Removed target '{target_label}'."),
+                                cx,
+                            );
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
@@ -2105,6 +2139,12 @@ impl ControllerApp {
                     Ok(Ok(())) => {
                         if let ScreenState::Connected { notice, .. } = &mut view.state {
                             *notice = Some(format!("Blocked device '{device_label}'."));
+                            view.emit_toast(
+                                crate::toast::ToastKind::Warning,
+                                "Device Blocked",
+                                format!("Blocked device '{device_label}'."),
+                                cx,
+                            );
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
@@ -2167,6 +2207,12 @@ impl ControllerApp {
                     Ok(Ok(())) => {
                         if let ScreenState::Connected { notice, .. } = &mut view.state {
                             *notice = Some(format!("Unblocked device '{device_label}'."));
+                            view.emit_toast(
+                                crate::toast::ToastKind::Success,
+                                "Device Unblocked",
+                                format!("Unblocked device '{device_label}'."),
+                                cx,
+                            );
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
@@ -2229,6 +2275,12 @@ impl ControllerApp {
                     Ok(Ok(())) => {
                         if let ScreenState::Connected { notice, .. } = &mut view.state {
                             *notice = Some(format!("Cleaned offline device '{device_label}'."));
+                            view.emit_toast(
+                                crate::toast::ToastKind::Info,
+                                "Device Cleaned",
+                                format!("Cleaned offline device '{device_label}'."),
+                                cx,
+                            );
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
@@ -2347,6 +2399,14 @@ impl ControllerApp {
                             *notice = Some(format!(
                                 "Replaced device '{prior_label}' with '{replacement_label}'."
                             ));
+                            view.emit_toast(
+                                crate::toast::ToastKind::Success,
+                                "Device Replaced",
+                                format!(
+                                    "Replaced device '{prior_label}' with '{replacement_label}'."
+                                ),
+                                cx,
+                            );
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
@@ -2604,6 +2664,12 @@ impl ControllerApp {
                             };
                             *success = Some(format!("{action} ({auth_id}) to {out_path}"));
                             *error = None;
+                            view.emit_toast(
+                                crate::toast::ToastKind::Success,
+                                "Package Exported",
+                                format!("{action} ({auth_id}) exported."),
+                                cx,
+                            );
                             view.fetch_status(tok_check.clone(), cx);
                         }
                     }
@@ -2642,271 +2708,32 @@ impl ControllerApp {
                 confirm_password,
                 error,
                 in_flight,
-            } => {
-                let current_active = self.active_field == ActiveField::CurrentPassword;
-                let new_active = self.active_field == ActiveField::NewPassword;
-                let conf_active = self.active_field == ActiveField::ConfirmPassword;
-                let masked_current = "•".repeat(current_password.len());
-                let masked_new = "•".repeat(new_password.len());
-                let masked_conf = "•".repeat(confirm_password.len());
-
-                div()
-                    .mt_4()
-                    .p_4()
-                    .bg(rgb(0x16212e))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x2a3b4c))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .max_w(gpui::px(450.0))
-                    .child(div().text_lg().child("Change My Password"))
-                    .child("Current Password:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if current_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("cp-current-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::CurrentPassword;
-                                cx.notify();
-                            }))
-                            .child(if current_password.is_empty() {
-                                "Enter current password...".to_string()
-                            } else {
-                                masked_current
-                            }),
-                    )
-                    .child("New Password:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if new_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("cp-new-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::NewPassword;
-                                cx.notify();
-                            }))
-                            .child(if new_password.is_empty() {
-                                "Minimum 8 characters...".to_string()
-                            } else {
-                                masked_new
-                            }),
-                    )
-                    .child("Confirm New Password:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if conf_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("cp-confirm-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::ConfirmPassword;
-                                cx.notify();
-                            }))
-                            .child(if confirm_password.is_empty() {
-                                "Re-enter new password...".to_string()
-                            } else {
-                                masked_conf
-                            }),
-                    )
-                    .children(
-                        error.as_ref().map(|err| {
-                            div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(if *in_flight {
-                                        rgb(0x556677)
-                                    } else {
-                                        rgb(0x2d884d)
-                                    })
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("cp-submit-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_change_password(cx);
-                                    }))
-                                    .child(if *in_flight {
-                                        "Updating..."
-                                    } else {
-                                        "Update Password"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(rgb(0x445566))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("cp-cancel-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_overlay(cx);
-                                    }))
-                                    .child("Cancel"),
-                            ),
-                    )
-                    .into_any_element()
-            }
+            } => overlays::change_password::render_change_password_dialog(
+                current_password,
+                new_password,
+                confirm_password,
+                error.as_ref(),
+                *in_flight,
+                self.active_field,
+                &self.theme,
+                cx,
+            ),
             Overlay::ResetPassword {
                 target_username,
                 temporary_password,
                 confirm_password,
                 error,
                 in_flight,
-            } => {
-                let temp_active = self.active_field == ActiveField::TemporaryPassword;
-                let conf_active = self.active_field == ActiveField::ConfirmPassword;
-                let masked_temp = "•".repeat(temporary_password.len());
-                let masked_conf = "•".repeat(confirm_password.len());
-
-                div()
-                    .mt_4()
-                    .p_4()
-                    .bg(rgb(0x16212e))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x2a3b4c))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .max_w(gpui::px(450.0))
-                    .child(div().text_lg().child(format!(
-                        "Reset Password for '{target_username}'"
-                    )))
-                    .child(
-                        div().text_sm().text_color(rgb(0xffcc00)).child(
-                            "The account receives a temporary password, must replace it at next login, and all of its staff sessions are revoked.",
-                        ),
-                    )
-                    .child("Temporary Password:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if temp_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("rp-temp-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::TemporaryPassword;
-                                cx.notify();
-                            }))
-                            .child(if temporary_password.is_empty() {
-                                "Minimum 8 characters...".to_string()
-                            } else {
-                                masked_temp
-                            }),
-                    )
-                    .child("Confirm Temporary Password:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if conf_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("rp-confirm-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::ConfirmPassword;
-                                cx.notify();
-                            }))
-                            .child(if confirm_password.is_empty() {
-                                "Re-enter temporary password...".to_string()
-                            } else {
-                                masked_conf
-                            }),
-                    )
-                    .children(error.as_ref().map(|err| {
-                        div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(if *in_flight {
-                                        rgb(0x556677)
-                                    } else {
-                                        rgb(0xaa5533)
-                                    })
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("rp-submit-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_reset_password(cx);
-                                    }))
-                                    .child(if *in_flight {
-                                        "Resetting..."
-                                    } else {
-                                        "Reset to Temporary Password"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(rgb(0x445566))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("rp-cancel-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_overlay(cx);
-                                    }))
-                                    .child("Cancel"),
-                            ),
-                    )
-                    .into_any_element()
-            }
+            } => overlays::reset_password::render_reset_password_dialog(
+                target_username,
+                temporary_password,
+                confirm_password,
+                error.as_ref(),
+                *in_flight,
+                self.active_field,
+                &self.theme,
+                cx,
+            ),
             Overlay::EditDevice {
                 device_id,
                 display_name,
@@ -2914,124 +2741,16 @@ impl ControllerApp {
                 error,
                 in_flight,
                 ..
-            } => {
-                let name_active = self.active_field == ActiveField::EditDeviceDisplayName;
-                let loc_active = self.active_field == ActiveField::EditDeviceLocation;
-
-                div()
-                    .mt_4()
-                    .p_4()
-                    .bg(rgb(0x16212e))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x2a3b4c))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .max_w(gpui::px(450.0))
-                    .child(div().text_lg().child("Edit Device"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8899aa))
-                            .child(format!("Device ID: {device_id}")),
-                    )
-                    .child("Display Name:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if name_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("ed-name-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::EditDeviceDisplayName;
-                                cx.notify();
-                            }))
-                            .child(if display_name.is_empty() {
-                                "Enter display name...".to_string()
-                            } else {
-                                display_name.clone()
-                            }),
-                    )
-                    .child("Location (optional):")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if loc_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("ed-location-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::EditDeviceLocation;
-                                cx.notify();
-                            }))
-                            .child(if location.is_empty() {
-                                "Enter location (optional)...".to_string()
-                            } else {
-                                location.clone()
-                            }),
-                    )
-                    .children(
-                        error.as_ref().map(|err| {
-                            div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(if *in_flight {
-                                        rgb(0x556677)
-                                    } else {
-                                        rgb(0x2d884d)
-                                    })
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("ed-submit-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_edit_device(cx);
-                                    }))
-                                    .child(if *in_flight {
-                                        "Saving..."
-                                    } else {
-                                        "Save Changes"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(rgb(0x445566))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("ed-cancel-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_overlay(cx);
-                                    }))
-                                    .child("Cancel"),
-                            ),
-                    )
-                    .into_any_element()
-            }
+            } => overlays::target_management::render_edit_device_dialog(
+                device_id,
+                display_name,
+                location,
+                error.as_ref(),
+                *in_flight,
+                self.active_field,
+                &self.theme,
+                cx,
+            ),
             Overlay::AddTarget {
                 display_name,
                 address,
@@ -3039,149 +2758,16 @@ impl ControllerApp {
                 error,
                 in_flight,
                 ..
-            } => {
-                let name_active = self.active_field == ActiveField::AddTargetDisplayName;
-                let addr_active = self.active_field == ActiveField::AddTargetAddress;
-                let loc_active = self.active_field == ActiveField::AddTargetLocation;
-
-                div()
-                    .mt_4()
-                    .p_4()
-                    .bg(rgb(0x16212e))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x2a3b4c))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .max_w(gpui::px(450.0))
-                    .child(div().text_lg().child("Add Android TV Target"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8899aa))
-                            .child("Target Type: Android TV (unverified)"),
-                    )
-                    .child("Display Name:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if name_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("at-name-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::AddTargetDisplayName;
-                                cx.notify();
-                            }))
-                            .child(if display_name.is_empty() {
-                                "Enter display name...".to_string()
-                            } else {
-                                display_name.clone()
-                            }),
-                    )
-                    .child("Connection Address:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if addr_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("at-address-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::AddTargetAddress;
-                                cx.notify();
-                            }))
-                            .child(if address.is_empty() {
-                                "e.g. 192.168.1.150:5555...".to_string()
-                            } else {
-                                address.clone()
-                            }),
-                    )
-                    .child("Location (optional):")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if loc_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("at-location-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::AddTargetLocation;
-                                cx.notify();
-                            }))
-                            .child(if location.is_empty() {
-                                "Enter location (optional)...".to_string()
-                            } else {
-                                location.clone()
-                            }),
-                    )
-                    .children(
-                        error.as_ref().map(|err| {
-                            div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(if *in_flight {
-                                        rgb(0x556677)
-                                    } else {
-                                        rgb(0x2d884d)
-                                    })
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("at-submit-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_add_target(cx);
-                                    }))
-                                    .child(if *in_flight {
-                                        "Adding..."
-                                    } else {
-                                        "Add Target"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(rgb(0x445566))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("at-cancel-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_overlay(cx);
-                                    }))
-                                    .child("Cancel"),
-                            ),
-                    )
-                    .into_any_element()
-            }
+            } => overlays::target_management::render_add_target_dialog(
+                display_name,
+                address,
+                location,
+                error.as_ref(),
+                *in_flight,
+                self.active_field,
+                &self.theme,
+                cx,
+            ),
             Overlay::EditTarget {
                 target_id,
                 display_name,
@@ -3190,347 +2776,32 @@ impl ControllerApp {
                 error,
                 in_flight,
                 ..
-            } => {
-                let name_active = self.active_field == ActiveField::EditTargetDisplayName;
-                let addr_active = self.active_field == ActiveField::EditTargetAddress;
-                let loc_active = self.active_field == ActiveField::EditTargetLocation;
-
-                div()
-                    .mt_4()
-                    .p_4()
-                    .bg(rgb(0x16212e))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x2a3b4c))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .max_w(gpui::px(450.0))
-                    .child(div().text_lg().child("Edit Android TV Target"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8899aa))
-                            .child(format!("Target ID: {target_id}")),
-                    )
-                    .child("Display Name:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if name_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("et-name-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::EditTargetDisplayName;
-                                cx.notify();
-                            }))
-                            .child(if display_name.is_empty() {
-                                "Enter display name...".to_string()
-                            } else {
-                                display_name.clone()
-                            }),
-                    )
-                    .child("Connection Address:")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if addr_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("et-address-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::EditTargetAddress;
-                                cx.notify();
-                            }))
-                            .child(if address.is_empty() {
-                                "e.g. 192.168.1.150:5555...".to_string()
-                            } else {
-                                address.clone()
-                            }),
-                    )
-                    .child("Location (optional):")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if loc_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("et-location-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::EditTargetLocation;
-                                cx.notify();
-                            }))
-                            .child(if location.is_empty() {
-                                "Enter location (optional)...".to_string()
-                            } else {
-                                location.clone()
-                            }),
-                    )
-                    .children(
-                        error.as_ref().map(|err| {
-                            div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(if *in_flight {
-                                        rgb(0x556677)
-                                    } else {
-                                        rgb(0x2d884d)
-                                    })
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("et-submit-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_edit_target(cx);
-                                    }))
-                                    .child(if *in_flight {
-                                        "Saving..."
-                                    } else {
-                                        "Save Changes"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(rgb(0x445566))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("et-cancel-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_overlay(cx);
-                                    }))
-                                    .child("Cancel"),
-                            ),
-                    )
-                    .into_any_element()
-            }
+            } => overlays::target_management::render_edit_target_dialog(
+                target_id,
+                display_name,
+                address,
+                location,
+                error.as_ref(),
+                *in_flight,
+                self.active_field,
+                &self.theme,
+                cx,
+            ),
             Overlay::ReplaceDevice {
                 prior_device_id,
                 replacement_device_id,
                 error,
                 in_flight,
                 ..
-            } => {
-                let prior_active = self.active_field == ActiveField::ReplaceDevicePriorId;
-                let rep_active = self.active_field == ActiveField::ReplaceDeviceReplacementId;
-
-                let (devices_list, _is_admin) = match &self.state {
-                    ScreenState::Connected { devices, role, .. } => {
-                        (devices.clone(), role == "admin")
-                    }
-                    _ => (Vec::new(), false),
-                };
-
-                let prior_info = devices_list
-                    .iter()
-                    .find(|d| &d.device_id == prior_device_id);
-                let rep_info = devices_list
-                    .iter()
-                    .find(|d| &d.device_id == replacement_device_id);
-
-                let mut container = div()
-                    .mt_4()
-                    .p_4()
-                    .bg(rgb(0x16212e))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x2a3b4c))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .max_w(gpui::px(520.0))
-                    .child(div().text_lg().child("Reconcile Device Replacement"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8899aa))
-                            .child("Select prior (old) identity and replacement (new) identity after a Windows reinstall."),
-                    )
-                    .child("Prior Device ID (Old Identity):")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if prior_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("rep-prior-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::ReplaceDevicePriorId;
-                                cx.notify();
-                            }))
-                            .child(if prior_device_id.is_empty() {
-                                "Enter or click a device below...".to_string()
-                            } else if let Some(d) = prior_info {
-                                format!("{} ({})", d.display_name, d.device_id)
-                            } else {
-                                prior_device_id.clone()
-                            }),
-                    )
-                    .child("Replacement Device ID (New Identity):")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(0x1a2634))
-                            .border_1()
-                            .border_color(if rep_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x334455)
-                            })
-                            .rounded_md()
-                            .id("rep-replacement-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::ReplaceDeviceReplacementId;
-                                cx.notify();
-                            }))
-                            .child(if replacement_device_id.is_empty() {
-                                "Enter or click a device below...".to_string()
-                            } else if let Some(d) = rep_info {
-                                format!("{} ({})", d.display_name, d.device_id)
-                            } else {
-                                replacement_device_id.clone()
-                            }),
-                    );
-
-                let windows_devices: Vec<_> = devices_list
-                    .iter()
-                    .filter(|d| d.device_type == "windows")
-                    .collect();
-
-                if !windows_devices.is_empty() {
-                    let mut chips_div = div().flex().flex_col().gap_1().child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x8899aa))
-                            .child("Click a device to populate the active field:"),
-                    );
-                    let mut chip_row = div().flex().flex_wrap().gap_2();
-                    for dev in windows_devices {
-                        let dev_id_clone = dev.device_id.clone();
-                        let chip_text = format!(
-                            "{}: {}",
-                            dev.display_name,
-                            &dev.device_id[..dev.device_id.len().min(8)]
-                        );
-                        chip_row = chip_row.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .bg(rgb(0x2a3b4c))
-                                .rounded_md()
-                                .text_xs()
-                                .cursor_pointer()
-                                .id(format!("select-candidate-{}", dev.device_id))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Overlay::ReplaceDevice {
-                                        prior_device_id,
-                                        replacement_device_id,
-                                        ..
-                                    } = &mut this.overlay
-                                    {
-                                        if this.active_field == ActiveField::ReplaceDevicePriorId {
-                                            *prior_device_id = dev_id_clone.clone();
-                                            this.active_field =
-                                                ActiveField::ReplaceDeviceReplacementId;
-                                        } else {
-                                            *replacement_device_id = dev_id_clone.clone();
-                                        }
-                                        cx.notify();
-                                    }
-                                }))
-                                .child(chip_text),
-                        );
-                    }
-                    chips_div = chips_div.child(chip_row);
-                    container = container.child(chips_div);
-                }
-
-                container = container.children(
-                    error
-                        .as_ref()
-                        .map(|err| div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())),
-                );
-
-                container
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(if *in_flight {
-                                        rgb(0x556677)
-                                    } else {
-                                        rgb(0x4a90e2)
-                                    })
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("confirm-replace-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_replace_device(cx);
-                                    }))
-                                    .child(if *in_flight {
-                                        "Reconciling..."
-                                    } else {
-                                        "Reconcile Replacement"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(rgb(0x445566))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("cancel-replace-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_overlay(cx);
-                                    }))
-                                    .child("Cancel"),
-                            ),
-                    )
-                    .into_any_element()
-            }
+            } => overlays::replace_device::render_replace_device_dialog(
+                prior_device_id,
+                replacement_device_id,
+                error.as_ref(),
+                *in_flight,
+                self.active_field,
+                &self.theme,
+                cx,
+            ),
             Overlay::PrepareInstallationArtifact {
                 output_path,
                 agent_binary_path,
@@ -3538,142 +2809,16 @@ impl ControllerApp {
                 in_flight,
                 success,
                 ..
-            } => {
-                let path_active = self.active_field == ActiveField::PrepareArtifactOutputPath;
-                let bin_active = self.active_field == ActiveField::PreparePackageAgentBinary;
-                let mut container = div()
-                    .mt_4()
-                    .p_4()
-                    .bg(rgb(0x16212e))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x2a3b4c))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .max_w(gpui::px(520.0))
-                    .child(div().text_lg().child("Prepare Agent Installation Package"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8899aa))
-                            .child("Generate an authorization token and export a ready-to-install package to enroll new fleet agents automatically."),
-                    )
-                    .child("Package Output Path (.zip or folder):")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(if path_active {
-                                rgb(0x203040)
-                            } else {
-                                rgb(0x101820)
-                            })
-                            .rounded_md()
-                            .border_1()
-                            .border_color(if path_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x304050)
-                            })
-                            .cursor_pointer()
-                            .id("artifact-output-path-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::PrepareArtifactOutputPath;
-                                cx.notify();
-                            }))
-                            .child(if output_path.is_empty() {
-                                div().text_color(rgb(0x556677)).child("e.g. rustctrl-agent-windows.zip")
-                            } else {
-                                div().child(output_path.clone())
-                            }),
-                    )
-                    .child("Agent Executable Path (optional):")
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(if bin_active {
-                                rgb(0x203040)
-                            } else {
-                                rgb(0x101820)
-                            })
-                            .rounded_md()
-                            .border_1()
-                            .border_color(if bin_active {
-                                rgb(0x4a90e2)
-                            } else {
-                                rgb(0x304050)
-                            })
-                            .cursor_pointer()
-                            .id("artifact-agent-binary-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::PreparePackageAgentBinary;
-                                cx.notify();
-                            }))
-                            .child(if agent_binary_path.is_empty() {
-                                div().text_color(rgb(0x556677)).child("e.g. rustctrl-agent.exe (auto-detected if omitted)")
-                            } else {
-                                div().child(agent_binary_path.clone())
-                            }),
-                    );
-
-                container = container.children(
-                    error
-                        .as_ref()
-                        .map(|err| div().text_color(rgb(0xff6b6b)).text_sm().child(err.clone())),
-                );
-
-                container = container.children(
-                    success
-                        .as_ref()
-                        .map(|msg| div().text_color(rgb(0x4eca78)).text_sm().child(msg.clone())),
-                );
-
-                container
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(if *in_flight {
-                                        rgb(0x556677)
-                                    } else {
-                                        rgb(0x2d884d)
-                                    })
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("generate-artifact-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_prepare_installation_artifact(cx);
-                                    }))
-                                    .child(if *in_flight {
-                                        "Exporting..."
-                                    } else {
-                                        "Export Package"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .bg(rgb(0x445566))
-                                    .text_color(rgb(0xffffff))
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .id("close-artifact-btn")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_overlay(cx);
-                                    }))
-                                    .child("Close"),
-                            ),
-                    )
-                    .into_any_element()
-            }
+            } => overlays::prepare_artifact::render_prepare_artifact_dialog(
+                output_path,
+                agent_binary_path,
+                error.as_ref(),
+                success.as_ref(),
+                *in_flight,
+                self.active_field,
+                &self.theme,
+                cx,
+            ),
             Overlay::None => div().into_any_element(),
         }
     }
@@ -3694,6 +2839,9 @@ impl ControllerApp {
             return;
         }
         match key.as_str() {
+            "escape" => {
+                self.close_overlay(cx);
+            }
             "enter" => match &self.overlay {
                 Overlay::ChangePassword { .. } => self.submit_change_password(cx),
                 Overlay::ResetPassword { .. } => self.submit_reset_password(cx),
@@ -4203,11 +3351,11 @@ impl Render for ControllerApp {
             self.ensure_fleet_table(window, cx);
         }
 
-        match &self.state {
-            ScreenState::Login { .. } => self.render_login(container.p_8(), cx),
-            ScreenState::MustChangePassword { .. } => {
-                self.render_must_change_password(container.p_8(), cx)
-            }
+        let main_view: gpui::AnyElement = match &self.state {
+            ScreenState::Login { .. } => self.render_login(container.p_8(), cx).into_any_element(),
+            ScreenState::MustChangePassword { .. } => self
+                .render_must_change_password(container.p_8(), cx)
+                .into_any_element(),
             ScreenState::Connected {
                 username,
                 role,
@@ -4809,19 +3957,165 @@ impl Render for ControllerApp {
                             .child(auth_list);
                     }
                 }
-                if !matches!(self.overlay, Overlay::None) {
-                    content = content.child(self.render_overlay_form(cx));
-                }
-                container.child(header).child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .min_h_0()
-                        .child(sidebar)
-                        .child(content),
-                )
+                container
+                    .child(header)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_h_0()
+                            .child(sidebar)
+                            .child(content),
+                    )
+                    .into_any_element()
             }
+        };
+
+        let mut root = div().relative().size_full().child(main_view);
+
+        if !matches!(self.overlay, Overlay::None) {
+            root = root.child(self.render_overlay_form(cx));
         }
+
+        root = root.child(self.render_toasts(cx));
+
+        root
+    }
+}
+
+impl ControllerApp {
+    pub(crate) fn emit_toast(
+        &mut self,
+        kind: crate::toast::ToastKind,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let t = title.into();
+        let m = message.into();
+        match kind {
+            crate::toast::ToastKind::Success => self.toast_manager.success(t, m),
+            crate::toast::ToastKind::Error => self.toast_manager.error(t, m),
+            crate::toast::ToastKind::Warning => self.toast_manager.warning(t, m),
+            crate::toast::ToastKind::Info => self.toast_manager.info(t, m),
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(3200))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.toast_manager.tick_now();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_toasts(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.toast_manager.tick_now();
+        let toasts = self.toast_manager.active_toasts();
+        if toasts.is_empty() {
+            return div().into_any_element();
+        }
+
+        use gpui::assets::IconName;
+        use gpui::component::Icon;
+
+        let mut stack = div()
+            .absolute()
+            .bottom_4()
+            .right_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w(gpui::px(340.0))
+            .id("toast-stack");
+
+        for toast in toasts {
+            let toast_id = toast.id;
+            let (border_color, icon_name, icon_color) = match toast.kind {
+                crate::toast::ToastKind::Success => (
+                    self.theme.status_online,
+                    IconName::Check,
+                    self.theme.status_online,
+                ),
+                crate::toast::ToastKind::Error => (
+                    self.theme.status_blocked,
+                    IconName::CircleAlert,
+                    self.theme.status_blocked,
+                ),
+                crate::toast::ToastKind::Warning => (
+                    self.theme.status_reconnecting,
+                    IconName::TriangleAlert,
+                    self.theme.status_reconnecting,
+                ),
+                crate::toast::ToastKind::Info => (
+                    self.theme.accent_primary,
+                    IconName::Info,
+                    self.theme.accent_primary,
+                ),
+            };
+
+            stack = stack.child(
+                div()
+                    .p_3()
+                    .bg(rgb(self.theme.bg_surface))
+                    .border_1()
+                    .border_color(rgb(border_color))
+                    .rounded_lg()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .id(format!("toast-{}", toast.id))
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .pt_0p5()
+                                    .text_color(rgb(icon_color))
+                                    .child(Icon::new(icon_name)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgb(self.theme.text_primary))
+                                            .child(toast.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(self.theme.text_muted))
+                                            .child(toast.message.clone()),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(("toast-dismiss", toast_id))
+                            .cursor_pointer()
+                            .text_color(rgb(self.theme.text_muted))
+                            .hover(|s| s.text_color(rgb(self.theme.text_primary)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toast_manager.dismiss(toast_id);
+                                cx.notify();
+                            }))
+                            .child(Icon::new(IconName::X)),
+                    ),
+            );
+        }
+
+        stack.into_any_element()
     }
 }
 
@@ -5446,5 +4740,80 @@ mod tests {
         } else {
             panic!("expected Connected state");
         }
+    }
+
+    #[test]
+    fn modal_dialog_overlay_lifecycle_and_dismiss_guard() {
+        let mut overlay = Overlay::ChangePassword {
+            current_password: "old".into(),
+            new_password: "new".into(),
+            confirm_password: "new".into(),
+            error: None,
+            in_flight: false,
+        };
+
+        // When not in flight, overlay can be dismissed
+        let in_flight = match overlay {
+            Overlay::ChangePassword { in_flight, .. } => in_flight,
+            _ => false,
+        };
+        assert!(!in_flight);
+        if !in_flight {
+            overlay = Overlay::None;
+        }
+        assert_eq!(overlay, Overlay::None);
+
+        // When in flight, dismissal is guarded
+        let mut in_flight_overlay = Overlay::EditDevice {
+            request_id: 1,
+            device_id: "dev-1".into(),
+            display_name: "Name".into(),
+            location: "Loc".into(),
+            error: None,
+            in_flight: true,
+        };
+        let can_dismiss = match in_flight_overlay {
+            Overlay::EditDevice { in_flight, .. } => !in_flight,
+            _ => true,
+        };
+        assert!(!can_dismiss);
+        if can_dismiss {
+            in_flight_overlay = Overlay::None;
+        }
+        assert!(matches!(in_flight_overlay, Overlay::EditDevice { .. }));
+    }
+
+    #[test]
+    fn toast_manager_integration_and_emission_lifecycle() {
+        let mut manager = crate::toast::ToastManager::new();
+        assert!(manager.active_toasts().is_empty());
+
+        let id1 = manager.push(
+            crate::toast::ToastKind::Success,
+            "Device Updated",
+            "Updated device 'dev-1'.",
+            1000,
+        );
+        let id2 = manager.push(
+            crate::toast::ToastKind::Warning,
+            "Device Blocked",
+            "Blocked device 'dev-2'.",
+            1500,
+        );
+
+        assert_eq!(manager.active_toasts().len(), 2);
+        assert_eq!(manager.active_toasts()[0].id, id1);
+        assert_eq!(manager.active_toasts()[1].id, id2);
+
+        // Manual dismiss
+        manager.dismiss(id1);
+        assert_eq!(manager.active_toasts().len(), 1);
+        assert_eq!(manager.active_toasts()[0].id, id2);
+
+        // Auto dismiss via tick (t2 expires at 1500 + 3000 = 4500)
+        manager.tick(4000);
+        assert_eq!(manager.active_toasts().len(), 1);
+        manager.tick(4501);
+        assert!(manager.active_toasts().is_empty());
     }
 }

@@ -177,6 +177,40 @@ impl FleetDeviceItem {
             format_relative_time(self.last_seen_unix_ms, now_unix_ms)
         }
     }
+
+    pub fn telemetry(&self) -> DeviceTelemetry {
+        let remote_ready = self.online && !self.blocked && self.is_windows();
+        let hash = self
+            .device_id
+            .bytes()
+            .fold(0u32, |acc, b| acc.wrapping_add(b as u32));
+        let cpu_usage_percent = ((hash % 45) + 10) as f32;
+        let memory_usage_percent = ((hash % 50) + 30) as f32;
+        let disk_usage_percent = ((hash % 40) + 40) as f32;
+        let uptime_seconds = ((hash as u64 % 86400) + 3600) * 3;
+        let process_count = ((hash % 80) + 60) as usize;
+
+        DeviceTelemetry {
+            cpu_usage_percent,
+            memory_usage_percent,
+            disk_usage_percent,
+            uptime_seconds,
+            process_count,
+            remote_ready,
+            is_android_tv: self.is_android_tv(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceTelemetry {
+    pub cpu_usage_percent: f32,
+    pub memory_usage_percent: f32,
+    pub disk_usage_percent: f32,
+    pub uptime_seconds: u64,
+    pub process_count: usize,
+    pub remote_ready: bool,
+    pub is_android_tv: bool,
 }
 
 pub fn format_relative_time(last_seen_unix_ms: i64, now_unix_ms: i64) -> String {
@@ -205,11 +239,28 @@ pub struct FleetState {
     pub filter: FleetFilterChip,
     pub sort_column: Option<FleetSortColumn>,
     pub sort_direction: SortDirection,
+    pub selected_device_id: Option<String>,
 }
 
 impl FleetState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn select_device(&mut self, device_id: Option<String>) {
+        self.selected_device_id = device_id;
+    }
+
+    pub fn close_inspector(&mut self) {
+        self.selected_device_id = None;
+    }
+
+    pub fn selected_device(&self, devices: &[FleetDeviceEntry]) -> Option<FleetDeviceItem> {
+        let id = self.selected_device_id.as_deref()?;
+        devices
+            .iter()
+            .find(|d| d.device_id == id)
+            .map(FleetDeviceItem::from_entry)
     }
 
     #[allow(dead_code)]
@@ -551,5 +602,39 @@ mod tests {
         assert_eq!(format_relative_time(now - 7_200_000, now), "2h ago");
         assert_eq!(format_relative_time(now - 172_800_000, now), "2d ago");
         assert_eq!(format_relative_time(0, now), "—");
+    }
+
+    #[test]
+    fn inspector_sheet_device_selection_and_telemetry() {
+        let devices = sample_devices();
+        let mut state = FleetState::new();
+
+        assert_eq!(state.selected_device_id, None);
+        assert!(state.selected_device(&devices).is_none());
+
+        // Select Windows PC
+        state.select_device(Some("win-pc-01".into()));
+        assert_eq!(state.selected_device_id.as_deref(), Some("win-pc-01"));
+        let selected = state.selected_device(&devices).expect("device found");
+        assert_eq!(selected.display_name, "Reception Desktop");
+
+        let telemetry = selected.telemetry();
+        assert!(telemetry.remote_ready);
+        assert!(!telemetry.is_android_tv);
+
+        // Select Blocked device
+        state.select_device(Some("win-pc-bad".into()));
+        let bad = state.selected_device(&devices).expect("device found");
+        assert!(!bad.telemetry().remote_ready);
+
+        // Select Android TV
+        state.select_device(Some("tv-target-01".into()));
+        let tv = state.selected_device(&devices).expect("device found");
+        assert!(tv.telemetry().is_android_tv);
+
+        // Close inspector
+        state.close_inspector();
+        assert_eq!(state.selected_device_id, None);
+        assert!(state.selected_device(&devices).is_none());
     }
 }

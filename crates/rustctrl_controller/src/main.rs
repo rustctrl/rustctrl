@@ -24,6 +24,8 @@ mod navigation;
 mod session;
 #[cfg(feature = "gui")]
 mod theme;
+#[cfg(any(feature = "gui", test))]
+pub mod toast;
 
 #[derive(Parser)]
 #[command(
