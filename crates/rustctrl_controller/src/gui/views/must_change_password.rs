@@ -1,4 +1,5 @@
 use super::super::*;
+use gpui::{Context, InteractiveElement as _, ParentElement as _, Styled as _, div, rgb};
 
 impl ControllerApp {
     pub(in crate::gui) fn render_must_change_password(
