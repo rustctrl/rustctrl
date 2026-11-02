@@ -21,6 +21,8 @@ mod fleet;
 mod gui;
 #[cfg(any(feature = "gui", test))]
 mod navigation;
+#[cfg(any(feature = "gui", test))]
+pub mod remote;
 mod session;
 #[cfg(feature = "gui")]
 mod theme;

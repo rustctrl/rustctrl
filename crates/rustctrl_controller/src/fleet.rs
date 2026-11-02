@@ -178,8 +178,12 @@ impl FleetDeviceItem {
         }
     }
 
+    pub fn is_remote_ready(&self) -> bool {
+        self.online && !self.blocked && self.is_windows()
+    }
+
     pub fn telemetry(&self) -> DeviceTelemetry {
-        let remote_ready = self.online && !self.blocked && self.is_windows();
+        let remote_ready = self.is_remote_ready();
         let hash = self
             .device_id
             .bytes()

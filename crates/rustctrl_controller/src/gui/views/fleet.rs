@@ -369,6 +369,7 @@ impl TableDelegate for FleetTableDelegate {
                 let is_offline = !item.online || item.status == DeviceStatusKind::Offline;
 
                 let app_remote = app.clone();
+                let remote_item = item.clone();
                 div()
                     .flex()
                     .items_center()
@@ -378,12 +379,9 @@ impl TableDelegate for FleetTableDelegate {
                         Button::new(format!("remote-btn-{}", item.device_id))
                             .label("Remote")
                             .on_click(move |_, _, cx| {
+                                let item = remote_item.clone();
                                 app_remote.update(cx, |this, cx| {
-                                    if let ScreenState::Connected { role, .. } = &this.state {
-                                        this.navigation
-                                            .select(crate::navigation::Route::Remote, role);
-                                        cx.notify();
-                                    }
+                                    this.launch_remote_for_item(&item, cx);
                                 });
                             }),
                     )
@@ -538,11 +536,12 @@ impl ControllerApp {
                             }
                         }
                     }
-                    TableEvent::DoubleClickedRow(_row_ix) => {
-                        if let ScreenState::Connected { role, .. } = &this.state {
-                            this.navigation
-                                .select(crate::navigation::Route::Remote, role);
-                            cx.notify();
+                    TableEvent::DoubleClickedRow(row_ix) => {
+                        if let ScreenState::Connected { devices, .. } = &this.state {
+                            let filtered = this.fleet_state.filter_and_sort(devices);
+                            if let Some(item) = filtered.get(*row_ix) {
+                                this.launch_remote_for_item(item, cx);
+                            }
                         }
                     }
                     _ => {}
@@ -1084,18 +1083,15 @@ impl ControllerApp {
                                     }),
                             ),
                     )
-                    .child(
+                    .child({
+                        let inspector_item = item.clone();
                         Button::new("inspector-start-remote-btn")
                             .primary()
                             .label("Start Remote Session")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let ScreenState::Connected { role, .. } = &this.state {
-                                    this.navigation
-                                        .select(crate::navigation::Route::Remote, role);
-                                    cx.notify();
-                                }
-                            })),
-                    ),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.launch_remote_for_item(&inspector_item, cx);
+                            }))
+                    }),
             )
     }
 }
