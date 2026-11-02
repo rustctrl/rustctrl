@@ -110,7 +110,6 @@ impl TableDelegate for FleetTableDelegate {
             .id(("row", row_ix))
             .border_b_1()
             .border_color(rgb(theme.border_subtle))
-            .hover(move |style| style.bg(rgb(theme.bg_surface_hover)))
     }
 
     fn render_th(
