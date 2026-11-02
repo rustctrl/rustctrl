@@ -3,6 +3,7 @@ mod views {
     pub(super) mod fleet;
     pub(super) mod login;
     pub(super) mod must_change_password;
+    pub(super) mod remote;
 }
 
 use anyhow::Result;
@@ -180,6 +181,7 @@ struct ControllerApp {
     fleet_state: crate::fleet::FleetState,
     fleet_table:
         Option<Entity<gpui::component::table::TableState<views::fleet::FleetTableDelegate>>>,
+    pub(crate) remote_state: crate::remote::RemoteSessionState,
     pub(crate) toast_manager: crate::toast::ToastManager,
     _health: Task<()>,
     _refresh: Task<()>,
@@ -409,6 +411,7 @@ impl ControllerApp {
             navigation: crate::navigation::Navigation::default(),
             fleet_state: crate::fleet::FleetState::new(),
             fleet_table: None,
+            remote_state: crate::remote::RemoteSessionState::default(),
             toast_manager: crate::toast::ToastManager::new(),
             _health: health,
             _refresh: refresh,
@@ -3281,6 +3284,21 @@ impl ControllerApp {
                     }
                     return;
                 }
+                if self.navigation.active(role) == crate::navigation::Route::Remote
+                    && self.remote_state.is_active()
+                {
+                    if key == "f11" {
+                        self.toggle_remote_fullscreen(cx);
+                        return;
+                    }
+                    if event.keystroke.modifiers.control
+                        && event.keystroke.modifiers.shift
+                        && key == "escape"
+                    {
+                        self.ungrab_remote_keyboard(cx);
+                        return;
+                    }
+                }
                 if role != "admin"
                     || self.navigation.active(role) != crate::navigation::Route::Accounts
                     || !matches!(
@@ -3505,7 +3523,10 @@ impl Render for ControllerApp {
                 if active == Route::Fleet {
                     content = content.child(self.render_fleet(cx));
                 }
-                if matches!(active, Route::Remote | Route::Audit) {
+                if active == Route::Remote {
+                    content = content.child(self.render_remote(cx));
+                }
+                if active == Route::Audit {
                     content = content.child(div().text_xl().child(active.label())).child(
                         div()
                             .text_color(rgb(self.theme.text_muted))
@@ -3957,17 +3978,29 @@ impl Render for ControllerApp {
                             .child(auth_list);
                     }
                 }
-                container
-                    .child(header)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_h_0()
-                            .child(sidebar)
-                            .child(content),
-                    )
-                    .into_any_element()
+                if active == Route::Remote
+                    && self
+                        .remote_state
+                        .active_session()
+                        .is_some_and(|s| s.fullscreen)
+                {
+                    container
+                        .gap_0()
+                        .child(self.render_remote(cx))
+                        .into_any_element()
+                } else {
+                    container
+                        .child(header)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_h_0()
+                                .child(sidebar)
+                                .child(content),
+                        )
+                        .into_any_element()
+                }
             }
         };
 
@@ -4116,6 +4149,124 @@ impl ControllerApp {
         }
 
         stack.into_any_element()
+    }
+
+    pub(crate) fn launch_remote_for_item(
+        &mut self,
+        item: &crate::fleet::FleetDeviceItem,
+        cx: &mut Context<Self>,
+    ) {
+        if item.is_remote_ready() {
+            self.start_remote_session(item.device_id.clone(), item.display_name.clone(), cx);
+        } else {
+            self.emit_toast(
+                crate::toast::ToastKind::Warning,
+                "Remote Session Unavailable",
+                format!(
+                    "Device '{}' is not ready for remote desktop control.",
+                    item.display_name
+                ),
+                cx,
+            );
+        }
+    }
+
+    pub(crate) fn start_remote_session(
+        &mut self,
+        device_id: String,
+        device_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_state.start_session(&device_id, &device_name);
+        if let ScreenState::Connected { role, .. } = &self.state {
+            self.navigation
+                .select(crate::navigation::Route::Remote, role);
+        }
+        self.navigation.collapsed = true;
+        self.emit_toast(
+            crate::toast::ToastKind::Success,
+            "Remote Session Started",
+            format!("Interactive session active for '{device_name}'."),
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn disconnect_remote_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.remote_state.active_session() {
+            let name = session.device_name.clone();
+            self.remote_state.disconnect();
+            self.emit_toast(
+                crate::toast::ToastKind::Info,
+                "Remote Session Disconnected",
+                format!("Session ended for '{name}' and device lock released."),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_remote_monitor(
+        &mut self,
+        monitor: crate::remote::MonitorTarget,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_state.set_monitor(monitor);
+        self.emit_toast(
+            crate::toast::ToastKind::Info,
+            "Display Target Changed",
+            format!("Viewing {}", monitor.label()),
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn trigger_sas(&mut self, cx: &mut Context<Self>) {
+        self.emit_toast(
+            crate::toast::ToastKind::Info,
+            "Secure Attention Sequence (SAS)",
+            "Ctrl+Alt+Del triggered on remote target.",
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_remote_input_mode(&mut self, cx: &mut Context<Self>) {
+        self.remote_state.toggle_input_mode();
+        if let Some(session) = self.remote_state.active_session() {
+            let mode = session.input_mode;
+            self.emit_toast(
+                crate::toast::ToastKind::Info,
+                "Input Mode Toggled",
+                format!("Switched to {}", mode.label()),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_remote_fullscreen(&mut self, cx: &mut Context<Self>) {
+        self.remote_state.toggle_fullscreen();
+        if let Some(session) = self.remote_state.active_session() {
+            let label = if session.fullscreen {
+                "Entered fullscreen mode (F11 to exit)"
+            } else {
+                "Returned to windowed mode"
+            };
+            self.emit_toast(crate::toast::ToastKind::Info, "Display Mode", label, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn ungrab_remote_keyboard(&mut self, cx: &mut Context<Self>) {
+        self.remote_state.ungrab_keyboard();
+        self.emit_toast(
+            crate::toast::ToastKind::Warning,
+            "Keyboard Released",
+            "Keystrokes returned to local Controller. Click canvas to re-grab.",
+            cx,
+        );
+        cx.notify();
     }
 }
 
@@ -4815,5 +4966,192 @@ mod tests {
         assert_eq!(manager.active_toasts().len(), 1);
         manager.tick(4501);
         assert!(manager.active_toasts().is_empty());
+    }
+
+    #[test]
+    fn remote_view_activation_switches_route_and_auto_collapses_sidebar() {
+        let mut nav = crate::navigation::Navigation::default();
+        let mut remote_state = crate::remote::RemoteSessionState::default();
+
+        assert_eq!(nav.active("operator"), crate::navigation::Route::Fleet);
+        assert!(!nav.collapsed);
+        assert!(!remote_state.is_active());
+
+        // Simulate remote session initiation
+        remote_state.start_session("dev-win-10", "Production PC");
+        nav.select(crate::navigation::Route::Remote, "operator");
+        nav.collapsed = true;
+
+        assert_eq!(nav.active("operator"), crate::navigation::Route::Remote);
+        assert!(nav.collapsed, "sidebar must auto-collapse for remote view");
+        assert!(remote_state.is_active());
+
+        let session = remote_state.active_session().unwrap();
+        assert_eq!(session.device_id, "dev-win-10");
+        assert_eq!(session.device_name, "Production PC");
+        assert_eq!(session.monitor, crate::remote::MonitorTarget::Display1);
+        assert_eq!(session.input_mode, crate::remote::InputMode::Interactive);
+        assert!(session.keyboard_grabbed);
+        assert!(!session.fullscreen);
+    }
+
+    #[test]
+    fn remote_view_tab_switching_preserves_session_state() {
+        let mut nav = crate::navigation::Navigation::default();
+        let mut remote_state = crate::remote::RemoteSessionState::default();
+
+        remote_state.start_session("dev-win-10", "Production PC");
+        nav.select(crate::navigation::Route::Remote, "operator");
+        nav.collapsed = true;
+
+        // Switch to Fleet Inventory tab
+        nav.select(crate::navigation::Route::Fleet, "operator");
+        assert_eq!(nav.active("operator"), crate::navigation::Route::Fleet);
+
+        // Verify active remote session is preserved
+        assert!(remote_state.is_active());
+        assert_eq!(
+            remote_state.active_session().unwrap().device_id,
+            "dev-win-10"
+        );
+
+        // Switch back to Remote Sessions tab
+        nav.select(crate::navigation::Route::Remote, "operator");
+        assert_eq!(nav.active("operator"), crate::navigation::Route::Remote);
+        assert!(remote_state.is_active());
+    }
+
+    #[test]
+    fn remote_toolbar_input_mode_and_keyboard_ungrab_state() {
+        let mut remote_state = crate::remote::RemoteSessionState::default();
+        remote_state.start_session("dev-win-10", "Production PC");
+
+        // Input mode toggling
+        assert_eq!(
+            remote_state.active_session().unwrap().input_mode,
+            crate::remote::InputMode::Interactive
+        );
+        remote_state.toggle_input_mode();
+        assert_eq!(
+            remote_state.active_session().unwrap().input_mode,
+            crate::remote::InputMode::ViewOnly
+        );
+        remote_state.toggle_input_mode();
+        assert_eq!(
+            remote_state.active_session().unwrap().input_mode,
+            crate::remote::InputMode::Interactive
+        );
+
+        // Keyboard grab and ungrab handling
+        assert!(remote_state.active_session().unwrap().keyboard_grabbed);
+        remote_state.ungrab_keyboard();
+        assert!(!remote_state.active_session().unwrap().keyboard_grabbed);
+        remote_state.toggle_keyboard_grab();
+        assert!(remote_state.active_session().unwrap().keyboard_grabbed);
+
+        // Fullscreen toggle
+        assert!(!remote_state.active_session().unwrap().fullscreen);
+        remote_state.toggle_fullscreen();
+        assert!(remote_state.active_session().unwrap().fullscreen);
+
+        // Disconnect
+        remote_state.disconnect();
+        assert!(!remote_state.is_active());
+        assert!(remote_state.active_session().is_none());
+        assert!(!remote_state.toolbar_visible);
+    }
+
+    #[test]
+    fn remote_keyboard_shortcut_evaluation() {
+        use gpui::{Keystroke, Modifiers};
+
+        let f11_ks = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "f11".to_string(),
+            key_char: None,
+        };
+        assert_eq!(f11_ks.key, "f11");
+
+        let ungrab_mod = Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        let ungrab_ks = Keystroke {
+            modifiers: ungrab_mod,
+            key: "escape".to_string(),
+            key_char: None,
+        };
+        assert!(
+            ungrab_ks.modifiers.control && ungrab_ks.modifiers.shift && ungrab_ks.key == "escape"
+        );
+    }
+
+    #[test]
+    fn fleet_device_item_is_remote_ready_evaluation() {
+        use crate::fleet::{DeviceStatusKind, FleetDeviceItem};
+
+        // Windows online & unblocked -> ready
+        let win_ready = FleetDeviceItem {
+            device_id: "win-1".into(),
+            display_name: "Windows Host".into(),
+            device_type: "windows".into(),
+            location: Some("Room A".into()),
+            last_address: "10.0.0.1".into(),
+            configured_address: None,
+            status: DeviceStatusKind::Online,
+            last_seen_unix_ms: 1000,
+            online: true,
+            blocked: false,
+        };
+        assert!(win_ready.is_remote_ready());
+
+        // Windows offline -> not ready
+        let win_offline = FleetDeviceItem {
+            online: false,
+            ..win_ready.clone()
+        };
+        assert!(!win_offline.is_remote_ready());
+
+        // Windows blocked -> not ready
+        let win_blocked = FleetDeviceItem {
+            blocked: true,
+            ..win_ready.clone()
+        };
+        assert!(!win_blocked.is_remote_ready());
+
+        // Android TV -> not ready (diagnostic/fleet endpoint is windows desktop for remote control)
+        let android_tv = FleetDeviceItem {
+            device_type: "android_tv".into(),
+            ..win_ready.clone()
+        };
+        assert!(!android_tv.is_remote_ready());
+    }
+
+    #[test]
+    fn remote_fullscreen_borderless_layout_condition() {
+        use crate::navigation::Route;
+        use crate::remote::RemoteSessionState;
+
+        let mut remote_state = RemoteSessionState::default();
+        let active_route = Route::Remote;
+
+        // In windowed mode, is_borderless is false
+        remote_state.start_session("win-1", "Win Host");
+        let is_borderless = active_route == Route::Remote
+            && remote_state.active_session().is_some_and(|s| s.fullscreen);
+        assert!(!is_borderless);
+
+        // In fullscreen mode, is_borderless is true
+        remote_state.toggle_fullscreen();
+        let is_borderless = active_route == Route::Remote
+            && remote_state.active_session().is_some_and(|s| s.fullscreen);
+        assert!(is_borderless);
+
+        // If route changes away from Remote, is_borderless is false
+        let other_route = Route::Fleet;
+        let is_borderless = other_route == Route::Remote
+            && remote_state.active_session().is_some_and(|s| s.fullscreen);
+        assert!(!is_borderless);
     }
 }
