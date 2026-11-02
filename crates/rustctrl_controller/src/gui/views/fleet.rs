@@ -7,7 +7,7 @@ use crate::theme::Theme;
 use gpui::assets::IconName;
 use gpui::base::StyledExt as _;
 use gpui::component::Icon;
-use gpui::component::button::Button;
+use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::empty::{
     Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
 };
@@ -528,14 +528,24 @@ impl ControllerApp {
             let table = cx.new(|cx| TableState::new(delegate, window, cx));
             cx.subscribe(
                 &table,
-                |this: &mut ControllerApp, _table, event: &TableEvent, cx| {
-                    if let TableEvent::DoubleClickedRow(_row_ix) = event
-                        && let ScreenState::Connected { role, .. } = &this.state
-                    {
-                        this.navigation
-                            .select(crate::navigation::Route::Remote, role);
-                        cx.notify();
+                |this: &mut ControllerApp, _table, event: &TableEvent, cx| match event {
+                    TableEvent::SelectRow(row_ix) => {
+                        if let ScreenState::Connected { devices, .. } = &this.state {
+                            let filtered = this.fleet_state.filter_and_sort(devices);
+                            if let Some(item) = filtered.get(*row_ix) {
+                                this.fleet_state.select_device(Some(item.device_id.clone()));
+                                cx.notify();
+                            }
+                        }
                     }
+                    TableEvent::DoubleClickedRow(_row_ix) => {
+                        if let ScreenState::Connected { role, .. } = &this.state {
+                            this.navigation
+                                .select(crate::navigation::Route::Remote, role);
+                            cx.notify();
+                        }
+                    }
+                    _ => {}
                 },
             )
             .detach();
@@ -766,22 +776,387 @@ impl ControllerApp {
 
         fleet_view = fleet_view.child(controls_bar);
 
-        // 3. DataTable
+        // 3. DataTable & Inspector Sheet
         if let Some(table) = &self.fleet_table {
-            fleet_view = fleet_view.child(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(400.))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(theme.border_subtle))
-                    .bg(rgb(theme.bg_surface))
-                    .overflow_hidden()
-                    .child(DataTable::new(table).bordered(false)),
-            );
+            let mut main_area = div().flex().flex_1().gap_4().w_full().min_h(px(400.));
+
+            let table_container = div()
+                .flex_1()
+                .w_full()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(theme.border_subtle))
+                .bg(rgb(theme.bg_surface))
+                .overflow_hidden()
+                .child(DataTable::new(table).bordered(false));
+
+            main_area = main_area.child(table_container);
+
+            if let Some(selected) = self.fleet_state.selected_device(devices) {
+                let telemetry = selected.telemetry();
+                let inspector = self.render_inspector_sheet(&selected, &telemetry, &theme, cx);
+                main_area = main_area.child(inspector);
+            }
+
+            fleet_view = fleet_view.child(main_area);
         }
 
         fleet_view
     }
+
+    fn render_inspector_sheet(
+        &self,
+        item: &FleetDeviceItem,
+        telemetry: &crate::fleet::DeviceTelemetry,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (status_text, status_color) = match item.status {
+            DeviceStatusKind::Online => ("Online", theme.status_online),
+            DeviceStatusKind::Offline => ("Offline", theme.status_offline),
+            DeviceStatusKind::Blocked => ("Blocked", theme.status_blocked),
+            DeviceStatusKind::InSession => ("In Session", theme.accent_primary),
+            DeviceStatusKind::Unverified => ("Unverified", theme.status_reconnecting),
+        };
+
+        let uptime_str = format_uptime(telemetry.uptime_seconds);
+        let remote_ready = telemetry.remote_ready;
+
+        div()
+            .w(px(340.0))
+            .bg(rgb(theme.bg_surface))
+            .border_1()
+            .border_color(rgb(theme.border_subtle))
+            .rounded_lg()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .id("inspector-sheet")
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_semibold()
+                                    .text_color(rgb(theme.text_primary))
+                                    .child(item.display_label().to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child(item.device_id.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("close-inspector-btn")
+                            .cursor_pointer()
+                            .p_1()
+                            .rounded_md()
+                            .text_color(rgb(theme.text_muted))
+                            .hover(|s| s.text_color(rgb(theme.text_primary)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.fleet_state.close_inspector();
+                                cx.notify();
+                            }))
+                            .child(Icon::new(IconName::X)),
+                    ),
+            )
+            .child(
+                div()
+                    .p_3()
+                    .bg(rgb(theme.bg_app))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme.border_subtle))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Status"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(div().size_2().rounded_full().bg(rgb(status_color)))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_medium()
+                                            .text_color(rgb(status_color))
+                                            .child(status_text),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Platform"),
+                            )
+                            .child(div().text_xs().text_color(rgb(theme.text_primary)).child(
+                                if item.is_android_tv() {
+                                    "Android TV"
+                                } else {
+                                    "Windows PC"
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Address"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_primary))
+                                    .child(item.primary_address().to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Location"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_primary))
+                                    .child(item.location_label().to_string()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(rgb(theme.text_muted))
+                            .child("LIVE TELEMETRY"),
+                    )
+                    .child(render_telemetry_bar(
+                        "CPU Utilization",
+                        telemetry.cpu_usage_percent,
+                        theme,
+                    ))
+                    .child(render_telemetry_bar(
+                        "Memory Usage",
+                        telemetry.memory_usage_percent,
+                        theme,
+                    ))
+                    .child(render_telemetry_bar(
+                        "Disk Usage",
+                        telemetry.disk_usage_percent,
+                        theme,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .p_2()
+                            .bg(rgb(theme.bg_app))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(theme.border_subtle))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Uptime"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(rgb(theme.text_primary))
+                                    .child(uptime_str),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .p_2()
+                            .bg(rgb(theme.bg_app))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(theme.border_subtle))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Processes"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(rgb(theme.text_primary))
+                                    .child(telemetry.process_count.to_string()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(theme.border_subtle))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Remote Readiness"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(rgb(if remote_ready {
+                                        theme.status_online
+                                    } else {
+                                        theme.status_blocked
+                                    }))
+                                    .child(if remote_ready {
+                                        "Ready"
+                                    } else if telemetry.is_android_tv {
+                                        "TV (Restricted)"
+                                    } else {
+                                        "Unavailable"
+                                    }),
+                            ),
+                    )
+                    .child(
+                        Button::new("inspector-start-remote-btn")
+                            .primary()
+                            .label("Start Remote Session")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let ScreenState::Connected { role, .. } = &this.state {
+                                    this.navigation
+                                        .select(crate::navigation::Route::Remote, role);
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            )
+    }
+}
+
+fn format_uptime(uptime_seconds: u64) -> String {
+    let days = uptime_seconds / 86400;
+    let hours = (uptime_seconds % 86400) / 3600;
+    let mins = (uptime_seconds % 3600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m")
+    }
+}
+
+fn render_telemetry_bar(label: &str, percent: f32, theme: &Theme) -> impl IntoElement {
+    let bar_color = if percent > 85.0 {
+        theme.status_blocked
+    } else if percent > 70.0 {
+        theme.status_reconnecting
+    } else {
+        theme.status_online
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .text_xs()
+                .child(
+                    div()
+                        .text_color(rgb(theme.text_muted))
+                        .child(label.to_string()),
+                )
+                .child(
+                    div()
+                        .font_medium()
+                        .text_color(rgb(theme.text_primary))
+                        .child(format!("{percent:.1}%")),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(6.0))
+                .bg(rgb(theme.bg_surface_hover))
+                .rounded_full()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(percent.clamp(0.0, 100.0) / 100.0))
+                        .bg(rgb(bar_color))
+                        .rounded_full(),
+                ),
+        )
 }
