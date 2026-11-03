@@ -14,7 +14,7 @@ pub use helpers::*;
 pub use state::*;
 
 use anyhow::Result;
-use gpui::{App, WindowOptions, rgb};
+use gpui::{App, WindowOptions};
 use rustctrl_core::ControllerConfig;
 
 pub fn open(config: ControllerConfig, config_path: std::path::PathBuf) -> Result<()> {
@@ -47,13 +47,13 @@ pub fn open(config: ControllerConfig, config_path: std::path::PathBuf) -> Result
                 cx,
             );
             gpui::component::theme::Theme::update(cx, |kit| {
-                kit.colors.button = rgb(theme.bg_surface_hover).into();
-                kit.colors.button_hover = rgb(theme.border_subtle).into();
-                kit.colors.button_active = rgb(theme.border_focus).into();
-                kit.colors.button_foreground = rgb(theme.text_primary).into();
+                helpers::configure_tokyo_night_theme(theme, kit);
             });
-            cx.open_window(WindowOptions::default(), |window, cx| {
-                let view = cx.new(|cx| ControllerApp::new(theme, config, config_path, handle, cx));
+            gpui::open_window(WindowOptions::default(), cx, |window, cx| {
+                let window_handle = window.window_handle();
+                let view = cx.new(|cx| {
+                    ControllerApp::new(theme, config, config_path, handle, Some(window_handle), cx)
+                });
                 let focus = view.read(cx).focus_handle.clone();
                 window.focus(&focus, cx);
                 view

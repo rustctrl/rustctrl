@@ -2,6 +2,72 @@ use gpui::Keystroke;
 #[cfg(test)]
 use rustctrl_protocol::auth::FleetDeviceEntry;
 
+pub fn configure_tokyo_night_theme(
+    theme: crate::theme::Theme,
+    kit: &mut gpui::component::theme::Theme,
+) {
+    use gpui::rgb;
+
+    // Window surface and typography
+    kit.background = rgb(theme.bg_app).into();
+    kit.foreground = rgb(theme.text_primary).into();
+    kit.border = rgb(theme.border_subtle).into();
+
+    // Semantic roles
+    kit.primary = rgb(0x7aa2f7).into();
+    kit.primary_hover = rgb(0x89b4fa).into();
+    kit.primary_active = rgb(0x7dcfff).into();
+    kit.primary_foreground = rgb(theme.bg_app).into();
+
+    kit.accent = rgb(theme.accent_primary).into();
+    kit.accent_foreground = rgb(theme.bg_app).into();
+
+    kit.danger = rgb(theme.status_blocked).into();
+    kit.danger_hover = rgb(0xff9eaf).into();
+    kit.danger_active = rgb(theme.status_blocked).into();
+    kit.danger_foreground = rgb(theme.bg_app).into();
+
+    kit.warning = rgb(theme.status_reconnecting).into();
+    kit.warning_hover = rgb(0xffc777).into();
+    kit.warning_active = rgb(theme.status_reconnecting).into();
+    kit.warning_foreground = rgb(theme.bg_app).into();
+
+    kit.success = rgb(theme.status_online).into();
+    kit.success_hover = rgb(0xb9f27c).into();
+    kit.success_active = rgb(theme.status_online).into();
+    kit.success_foreground = rgb(theme.bg_app).into();
+
+    kit.info = rgb(0x7aa2f7).into();
+    kit.info_hover = rgb(0x89b4fa).into();
+    kit.info_active = rgb(0x7aa2f7).into();
+    kit.info_foreground = rgb(theme.bg_app).into();
+
+    // Controls & surfaces
+    kit.input = rgb(theme.border_subtle).into();
+    kit.muted = rgb(theme.bg_surface).into();
+    kit.muted_foreground = rgb(theme.text_muted).into();
+    kit.popover = rgb(theme.bg_surface).into();
+    kit.popover_foreground = rgb(theme.text_primary).into();
+
+    // Navigation and data tables
+    kit.sidebar = rgb(0x16161e).into();
+    kit.sidebar_border = rgb(theme.border_subtle).into();
+    kit.sidebar_foreground = rgb(theme.text_primary).into();
+    kit.sidebar_accent = rgb(theme.bg_surface_hover).into();
+    kit.sidebar_accent_foreground = rgb(theme.accent_primary).into();
+
+    kit.table = rgb(theme.bg_app).into();
+    kit.table_head = rgb(theme.bg_surface).into();
+    kit.table_hover = rgb(theme.bg_surface_hover).into();
+    kit.table_row_border = rgb(theme.border_subtle).into();
+
+    // Buttons
+    kit.button = rgb(theme.bg_surface_hover).into();
+    kit.button_hover = rgb(theme.border_subtle).into();
+    kit.button_active = rgb(theme.border_focus).into();
+    kit.button_foreground = rgb(theme.text_primary).into();
+}
+
 pub fn resolve_typed_text(keystroke: &Keystroke) -> Option<&str> {
     if keystroke.modifiers.control || keystroke.modifiers.platform {
         return None;
