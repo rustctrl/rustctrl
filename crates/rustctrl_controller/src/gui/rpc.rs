@@ -124,7 +124,6 @@ impl ControllerApp {
                                 error: warning,
                                 in_flight: false,
                             };
-                            view.active_field = ActiveField::NewPassword;
                         } else {
                             view.login_password_input = None;
                             if !remember {
@@ -369,7 +368,7 @@ impl ControllerApp {
         self.navigation.reset();
         // Any open password form belongs to the session being left behind.
         self.overlay = Overlay::None;
-        self.active_field = ActiveField::Username;
+        self.modal_inputs = None;
         self.login_username_input = None;
         self.login_password_input = None;
         self.must_change_new_password_input = None;
@@ -592,25 +591,29 @@ impl ControllerApp {
                 error,
                 ..
             } if role == "admin" && !*in_flight => {
-                let user = new_account_username.trim().to_string();
+                let user = self
+                    .new_account_username_input
+                    .as_ref()
+                    .map(|input| input.read(cx).text().to_string().trim().to_string())
+                    .unwrap_or_else(|| new_account_username.trim().to_string());
                 if user.is_empty() {
                     *error = Some("Username is required.".into());
                     cx.notify();
                     return;
                 }
-                if new_account_password.len() < 8 {
+                let pass = self
+                    .new_account_password_input
+                    .as_ref()
+                    .map(|input| input.read(cx).text().to_string())
+                    .unwrap_or_else(|| new_account_password.clone());
+                if pass.len() < 8 {
                     *error = Some("Temporary password must contain at least 8 characters.".into());
                     cx.notify();
                     return;
                 }
                 *in_flight = true;
                 *error = None;
-                (
-                    session_token.clone(),
-                    user,
-                    new_account_role.clone(),
-                    new_account_password.clone(),
-                )
+                (session_token.clone(), user, new_account_role.clone(), pass)
             }
             _ => return,
         };
@@ -650,6 +653,8 @@ impl ControllerApp {
                         Ok(Ok(_reply)) => {
                             new_account_username.clear();
                             new_account_password.clear();
+                            view.new_account_username_input = None;
+                            view.new_account_password_input = None;
                             *error = None;
                             let token = session_token.clone();
                             view.fetch_status(token, cx);
@@ -754,7 +759,6 @@ impl ControllerApp {
                             in_flight: false,
                             remember: false,
                         };
-                        view.active_field = ActiveField::Username;
                     } else if let ScreenState::Connected {
                         notice,
                         session_token,
@@ -852,7 +856,6 @@ impl ControllerApp {
                 error: None,
                 in_flight: false,
             };
-            self.active_field = ActiveField::CurrentPassword;
             cx.notify();
         }
     }
@@ -868,7 +871,6 @@ impl ControllerApp {
                 error: None,
                 in_flight: false,
             };
-            self.active_field = ActiveField::TemporaryPassword;
             cx.notify();
         }
     }
@@ -899,7 +901,6 @@ impl ControllerApp {
                 error: None,
                 in_flight: false,
             };
-            self.active_field = ActiveField::EditDeviceDisplayName;
             cx.notify();
         }
     }
@@ -924,7 +925,6 @@ impl ControllerApp {
                 error: None,
                 in_flight: false,
             };
-            self.active_field = ActiveField::AddTargetDisplayName;
             cx.notify();
         }
     }
@@ -957,7 +957,6 @@ impl ControllerApp {
                 error: None,
                 in_flight: false,
             };
-            self.active_field = ActiveField::EditTargetDisplayName;
             cx.notify();
         }
     }
@@ -980,11 +979,6 @@ impl ControllerApp {
             self.next_replace_device_request_id =
                 self.next_replace_device_request_id.wrapping_add(1);
             let request_id = self.next_replace_device_request_id;
-            let active_field = if prior_device_id.is_empty() {
-                ActiveField::ReplaceDevicePriorId
-            } else {
-                ActiveField::ReplaceDeviceReplacementId
-            };
             self.overlay = Overlay::ReplaceDevice {
                 request_id,
                 prior_device_id,
@@ -992,7 +986,6 @@ impl ControllerApp {
                 error: None,
                 in_flight: false,
             };
-            self.active_field = active_field;
             cx.notify();
         }
     }
@@ -1018,18 +1011,34 @@ impl ControllerApp {
                 in_flight: false,
                 success: None,
             };
-            self.active_field = ActiveField::PrepareArtifactOutputPath;
             cx.notify();
         }
     }
 
     pub(crate) fn close_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay = Overlay::None;
-        self.active_field = ActiveField::NewAccountUsername;
+        self.modal_inputs = None;
         cx.notify();
     }
 
     pub(crate) fn submit_change_password(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalInputs::ChangePassword {
+            current_password: cur_in,
+            new_password: new_in,
+            confirm_password: conf_in,
+        }) = &self.modal_inputs
+            && let Overlay::ChangePassword {
+                current_password,
+                new_password,
+                confirm_password,
+                ..
+            } = &mut self.overlay
+        {
+            *current_password = cur_in.read(cx).text().to_string();
+            *new_password = new_in.read(cx).text().to_string();
+            *confirm_password = conf_in.read(cx).text().to_string();
+        }
+
         let (session_token, current, new_password) = match &mut self.overlay {
             Overlay::ChangePassword {
                 current_password,
@@ -1093,7 +1102,7 @@ impl ControllerApp {
                             ScreenState::Connected { session_token, .. } if *session_token == tok_check
                         ) {
                             view.overlay = Overlay::None;
-                            view.active_field = ActiveField::NewAccountUsername;
+                            view.modal_inputs = None;
                             view.emit_toast(
                                 crate::toast::ToastKind::Success,
                                 "Password Changed",
@@ -1131,6 +1140,20 @@ impl ControllerApp {
     }
 
     pub(crate) fn submit_reset_password(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalInputs::ResetPassword {
+            temporary_password: temp_in,
+            confirm_password: conf_in,
+        }) = &self.modal_inputs
+            && let Overlay::ResetPassword {
+                temporary_password,
+                confirm_password,
+                ..
+            } = &mut self.overlay
+        {
+            *temporary_password = temp_in.read(cx).text().to_string();
+            *confirm_password = conf_in.read(cx).text().to_string();
+        }
+
         let (session_token, target, temporary) = match &mut self.overlay {
             Overlay::ResetPassword {
                 target_username,
@@ -1204,7 +1227,7 @@ impl ControllerApp {
                                 ScreenState::Connected { username, .. } if *username == target_label
                             );
                             view.overlay = Overlay::None;
-                            view.active_field = ActiveField::Username;
+                            view.modal_inputs = None;
                             if self_reset {
                                 // Resetting the own account revokes this session by design.
                                 view.state = ScreenState::Login {
@@ -1262,6 +1285,20 @@ impl ControllerApp {
     }
 
     pub(crate) fn submit_edit_device(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalInputs::EditDevice {
+            display_name: dn_in,
+            location: loc_in,
+        }) = &self.modal_inputs
+            && let Overlay::EditDevice {
+                display_name,
+                location,
+                ..
+            } = &mut self.overlay
+        {
+            *display_name = dn_in.read(cx).text().to_string();
+            *location = loc_in.read(cx).text().to_string();
+        }
+
         let (request_id, session_token, target_id, target_name, target_location) =
             match &mut self.overlay {
                 Overlay::EditDevice {
@@ -1395,6 +1432,23 @@ impl ControllerApp {
     }
 
     pub(crate) fn submit_add_target(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalInputs::AddTarget {
+            display_name: dn_in,
+            address: addr_in,
+            location: loc_in,
+        }) = &self.modal_inputs
+            && let Overlay::AddTarget {
+                display_name,
+                address,
+                location,
+                ..
+            } = &mut self.overlay
+        {
+            *display_name = dn_in.read(cx).text().to_string();
+            *address = addr_in.read(cx).text().to_string();
+            *location = loc_in.read(cx).text().to_string();
+        }
+
         let (request_id, session_token, target_name, target_addr, target_location) =
             match &mut self.overlay {
                 Overlay::AddTarget {
@@ -1534,6 +1588,23 @@ impl ControllerApp {
     }
 
     pub(crate) fn submit_edit_target(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalInputs::EditTarget {
+            display_name: dn_in,
+            address: addr_in,
+            location: loc_in,
+        }) = &self.modal_inputs
+            && let Overlay::EditTarget {
+                display_name,
+                address,
+                location,
+                ..
+            } = &mut self.overlay
+        {
+            *display_name = dn_in.read(cx).text().to_string();
+            *address = addr_in.read(cx).text().to_string();
+            *location = loc_in.read(cx).text().to_string();
+        }
+
         let (request_id, session_token, target_id, target_name, target_addr, target_location) =
             match &mut self.overlay {
                 Overlay::EditTarget {
@@ -1945,6 +2016,20 @@ impl ControllerApp {
     }
 
     pub(crate) fn submit_replace_device(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalInputs::ReplaceDevice {
+            prior_device_id: prior_in,
+            replacement_device_id: repl_in,
+        }) = &self.modal_inputs
+            && let Overlay::ReplaceDevice {
+                prior_device_id,
+                replacement_device_id,
+                ..
+            } = &mut self.overlay
+        {
+            *prior_device_id = prior_in.read(cx).text().to_string();
+            *replacement_device_id = repl_in.read(cx).text().to_string();
+        }
+
         let (request_id, session_token, prior_id, replacement_id) = match &mut self.overlay {
             Overlay::ReplaceDevice {
                 request_id,
@@ -2178,6 +2263,20 @@ impl ControllerApp {
     }
 
     pub(crate) fn submit_prepare_installation_artifact(&mut self, cx: &mut Context<Self>) {
+        if let Some(ModalInputs::PrepareArtifact {
+            output_path: out_in,
+            agent_binary_path: bin_in,
+        }) = &self.modal_inputs
+            && let Overlay::PrepareInstallationArtifact {
+                output_path,
+                agent_binary_path,
+                ..
+            } = &mut self.overlay
+        {
+            *output_path = out_in.read(cx).text().to_string();
+            *agent_binary_path = bin_in.read(cx).text().to_string();
+        }
+
         let (request_id, session_token, out_path, agent_bin_path) = match &mut self.overlay {
             Overlay::PrepareInstallationArtifact {
                 request_id,

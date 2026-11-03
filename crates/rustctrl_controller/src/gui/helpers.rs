@@ -1,3 +1,4 @@
+#[cfg(test)]
 use gpui::Keystroke;
 #[cfg(test)]
 use rustctrl_protocol::auth::FleetDeviceEntry;
@@ -68,6 +69,7 @@ pub fn configure_tokyo_night_theme(
     kit.button_foreground = rgb(theme.text_primary).into();
 }
 
+#[cfg(test)]
 pub fn resolve_typed_text(keystroke: &Keystroke) -> Option<&str> {
     if keystroke.modifiers.control || keystroke.modifiers.platform {
         return None;
