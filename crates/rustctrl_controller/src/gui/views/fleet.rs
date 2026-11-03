@@ -1,19 +1,22 @@
 use super::super::*;
 use crate::fleet::{
-    DeviceStatusKind, FleetDeviceItem, FleetEmptyState, FleetFilterChip, FleetSortColumn,
-    SortDirection,
+    DeviceStatusKind, DeviceTelemetry, FleetDeviceItem, FleetEmptyState, FleetFilterChip,
+    FleetSortColumn, SortDirection,
 };
 use crate::theme::Theme;
 use gpui::assets::IconName;
 use gpui::base::StyledExt as _;
-use gpui::component::Icon;
-use gpui::component::button::{Button, ButtonVariants as _};
+use gpui::component::badge::Badge;
+use gpui::component::button::{Button, ButtonVariants as _, Toggle, ToggleVariants as _};
 use gpui::component::empty::{
     Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
 };
+use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::component::table::{
     Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
 };
+use gpui::component::tag::Tag;
+use gpui::component::{Icon, Sizable as _, WindowExt as _};
 use gpui::{
     App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Stateful,
     Styled as _, Window, div, prelude::FluentBuilder as _, px, rgb,
@@ -216,6 +219,7 @@ impl TableDelegate for FleetTableDelegate {
                             .on_click(move |_, _, cx| {
                                 app.update(cx, |this, cx| {
                                     this.fleet_state.reset_filters();
+                                    this.fleet_search_input = None;
                                     cx.notify();
                                 });
                             }),
@@ -240,19 +244,21 @@ impl TableDelegate for FleetTableDelegate {
 
         match col_ix {
             0 => {
-                let (status_text, status_color, status_bg) = match item.status {
-                    DeviceStatusKind::Online => ("Online", theme.status_online, theme.bg_surface),
+                let (status_text, status_color, tag) = match item.status {
+                    DeviceStatusKind::Online => {
+                        ("Online", rgb(theme.status_online), Tag::success())
+                    }
                     DeviceStatusKind::Offline => {
-                        ("Offline", theme.status_offline, theme.bg_surface)
+                        ("Offline", rgb(theme.status_offline), Tag::secondary())
                     }
                     DeviceStatusKind::Blocked => {
-                        ("Blocked", theme.status_blocked, theme.bg_surface)
+                        ("Blocked", rgb(theme.status_blocked), Tag::danger())
                     }
                     DeviceStatusKind::InSession => {
-                        ("In Session", theme.accent_primary, theme.bg_surface)
+                        ("In Session", rgb(theme.accent_primary), Tag::info())
                     }
                     DeviceStatusKind::Unverified => {
-                        ("Unverified", theme.status_reconnecting, theme.bg_surface)
+                        ("Unverified", rgb(theme.status_reconnecting), Tag::warning())
                     }
                 };
 
@@ -261,24 +267,10 @@ impl TableDelegate for FleetTableDelegate {
                     .items_center()
                     .h_full()
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(rgb(status_color))
-                            .bg(rgb(status_bg))
-                            .child(div().size_2().rounded_full().bg(rgb(status_color)))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_color(rgb(status_color))
-                                    .child(status_text),
-                            ),
+                        Badge::new()
+                            .dot()
+                            .color(status_color)
+                            .child(tag.rounded_full().child(status_text)),
                     )
                     .into_any_element()
             }
@@ -551,6 +543,96 @@ impl ControllerApp {
         }
     }
 
+    pub(in crate::gui) fn ensure_fleet_search_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.fleet_search_input.is_none() {
+            let default_query = self.fleet_state.search_query.clone();
+            let search = cx.new(|cx| {
+                let mut state = InputState::new(window, cx)
+                    .placeholder("Search by name, ID, IP, location...")
+                    .clean_on_escape();
+                if !default_query.is_empty() {
+                    state = state.default_value(default_query);
+                }
+                state
+            });
+
+            cx.subscribe(
+                &search,
+                |this: &mut ControllerApp, input, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let text = input.read(cx).text().to_string();
+                        this.fleet_state.search_query = text;
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+
+            self.fleet_search_input = Some(search);
+        }
+    }
+
+    pub(in crate::gui) fn sync_fleet_inspector_sheet(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let has_active_sheet = window.has_active_sheet(cx);
+        let selected_id = self.fleet_state.selected_device_id.clone();
+
+        if selected_id.is_some() {
+            if !has_active_sheet {
+                let app = cx.entity().clone();
+                window.open_sheet(cx, move |mut sheet, _window, cx| {
+                    let (selected, telemetry, theme) = {
+                        let app_ref = app.read(cx);
+                        let theme = app_ref.theme;
+                        let devices = match &app_ref.state {
+                            ScreenState::Connected { devices, .. } => devices.as_slice(),
+                            _ => &[][..],
+                        };
+                        let selected = app_ref.fleet_state.selected_device(devices);
+                        let telemetry = selected.as_ref().map(|s| s.telemetry());
+                        (selected, telemetry, theme)
+                    };
+
+                    let Some(item) = selected else {
+                        return sheet;
+                    };
+                    let Some(telemetry) = telemetry else {
+                        return sheet;
+                    };
+
+                    let app_close = app.clone();
+                    sheet = sheet
+                        .size(px(380.0))
+                        .title(render_inspector_title(&item, &theme))
+                        .footer(render_inspector_footer(
+                            &item,
+                            &telemetry,
+                            &theme,
+                            app.clone(),
+                        ))
+                        .on_close(move |_, _, cx| {
+                            app_close.update(cx, |this, cx| {
+                                this.fleet_state.close_inspector();
+                                cx.notify();
+                            });
+                        })
+                        .child(render_inspector_body(&item, &telemetry, &theme));
+
+                    sheet
+                });
+            }
+        } else if has_active_sheet {
+            window.close_sheet(cx);
+        }
+    }
+
     pub(in crate::gui) fn render_fleet(&self, cx: &mut Context<Self>) -> gpui::Div {
         let (devices, is_admin) = match &self.state {
             ScreenState::Connected { devices, role, .. } => (devices.as_slice(), role == "admin"),
@@ -575,8 +657,6 @@ impl ControllerApp {
             });
         }
 
-        let is_search_active = self.active_field == ActiveField::FleetSearch;
-        let search_query = &self.fleet_state.search_query;
         let active_chip = self.fleet_state.filter;
 
         let mut fleet_view = div().flex().flex_col().gap_4().flex_1();
@@ -644,109 +724,38 @@ impl ControllerApp {
         fleet_view = fleet_view.child(title_bar);
 
         // 2. Search & Filter Bar
-        let search_box = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_1p5()
-            .w(px(360.))
-            .bg(rgb(theme.bg_surface))
-            .border_1()
-            .border_color(rgb(if is_search_active {
-                theme.border_focus
-            } else {
-                theme.border_subtle
-            }))
-            .rounded_md()
-            .cursor_text()
-            .id("fleet-search-input")
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.active_field = ActiveField::FleetSearch;
-                window.focus(&this.focus_handle, cx);
-                cx.notify();
-            }))
-            .child(
-                Icon::new(IconName::Search)
-                    .size_4()
-                    .text_color(rgb(theme.text_muted)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .text_sm()
-                    .text_color(if search_query.is_empty() {
-                        rgb(theme.text_muted)
-                    } else {
-                        rgb(theme.text_primary)
-                    })
-                    .child(if search_query.is_empty() {
-                        "Search by name, ID, IP, location...".to_string()
-                    } else {
-                        search_query.clone()
-                    }),
-            )
-            .when(!search_query.is_empty(), |box_el| {
-                box_el.child(
-                    div()
-                        .cursor_pointer()
-                        .id("clear-search-btn")
-                        .p_1()
-                        .rounded_md()
-                        .hover(|s| s.bg(rgb(theme.bg_surface_hover)))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.fleet_state.search_query.clear();
-                            cx.notify();
-                        }))
-                        .child(
-                            Icon::new(IconName::SearchX)
+        let search_box = div().w(px(360.)).id("fleet-search-input").when_some(
+            self.fleet_search_input.as_ref(),
+            |el, input_state| {
+                el.child(
+                    Input::new(input_state)
+                        .prefix(
+                            Icon::new(IconName::Search)
                                 .size_4()
                                 .text_color(rgb(theme.text_muted)),
-                        ),
+                        )
+                        .cleanable(true),
                 )
-            });
+            },
+        );
 
         let mut filter_row = div().flex().items_center().gap_2().flex_wrap();
         for chip in FleetFilterChip::ALL {
             let is_selected = active_chip == chip;
             let label = chip.label();
             filter_row = filter_row.child(
-                div()
-                    .id(format!(
-                        "filter-chip-{}",
-                        label.to_lowercase().replace(' ', "-")
-                    ))
-                    .px_3()
-                    .py_1()
-                    .rounded_full()
-                    .text_xs()
-                    .font_medium()
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(rgb(if is_selected {
-                        theme.accent_primary
-                    } else {
-                        theme.border_subtle
-                    }))
-                    .bg(rgb(if is_selected {
-                        theme.bg_surface_hover
-                    } else {
-                        theme.bg_surface
-                    }))
-                    .text_color(rgb(if is_selected {
-                        theme.accent_primary
-                    } else {
-                        theme.text_muted
-                    }))
-                    .hover(|s| {
-                        s.bg(rgb(theme.bg_surface_hover))
-                            .text_color(rgb(theme.text_primary))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.fleet_state.set_filter(chip);
-                        cx.notify();
-                    }))
-                    .child(label),
+                Toggle::new(format!(
+                    "filter-chip-{}",
+                    label.to_lowercase().replace(' ', "-")
+                ))
+                .outline()
+                .small()
+                .checked(is_selected)
+                .label(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.fleet_state.set_filter(chip);
+                    cx.notify();
+                })),
             );
         }
 
@@ -758,6 +767,7 @@ impl ControllerApp {
                     .label("Reset Filter")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.fleet_state.reset_filters();
+                        this.fleet_search_input = None;
                         cx.notify();
                     })),
             );
@@ -774,13 +784,12 @@ impl ControllerApp {
 
         fleet_view = fleet_view.child(controls_bar);
 
-        // 3. DataTable & Inspector Sheet
+        // 3. DataTable
         if let Some(table) = &self.fleet_table {
-            let mut main_area = div().flex().flex_1().gap_4().w_full().min_h(px(400.));
-
             let table_container = div()
                 .flex_1()
                 .w_full()
+                .min_h(px(400.))
                 .rounded_lg()
                 .border_1()
                 .border_color(rgb(theme.border_subtle))
@@ -788,311 +797,281 @@ impl ControllerApp {
                 .overflow_hidden()
                 .child(DataTable::new(table).bordered(false));
 
-            main_area = main_area.child(table_container);
-
-            if let Some(selected) = self.fleet_state.selected_device(devices) {
-                let telemetry = selected.telemetry();
-                let inspector = self.render_inspector_sheet(&selected, &telemetry, &theme, cx);
-                main_area = main_area.child(inspector);
-            }
-
-            fleet_view = fleet_view.child(main_area);
+            fleet_view = fleet_view.child(table_container);
         }
 
         fleet_view
     }
+}
 
-    fn render_inspector_sheet(
-        &self,
-        item: &FleetDeviceItem,
-        telemetry: &crate::fleet::DeviceTelemetry,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let (status_text, status_color) = match item.status {
-            DeviceStatusKind::Online => ("Online", theme.status_online),
-            DeviceStatusKind::Offline => ("Offline", theme.status_offline),
-            DeviceStatusKind::Blocked => ("Blocked", theme.status_blocked),
-            DeviceStatusKind::InSession => ("In Session", theme.accent_primary),
-            DeviceStatusKind::Unverified => ("Unverified", theme.status_reconnecting),
-        };
+fn render_inspector_title(item: &FleetDeviceItem, theme: &Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .child(
+            div()
+                .text_base()
+                .font_semibold()
+                .text_color(rgb(theme.text_primary))
+                .child(item.display_label().to_string()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme.text_muted))
+                .child(item.device_id.clone()),
+        )
+}
 
-        let uptime_str = format_uptime(telemetry.uptime_seconds);
-        let remote_ready = telemetry.remote_ready;
+fn render_inspector_body(
+    item: &FleetDeviceItem,
+    telemetry: &DeviceTelemetry,
+    theme: &Theme,
+) -> impl IntoElement {
+    let (status_text, status_color, tag) = match item.status {
+        DeviceStatusKind::Online => ("Online", rgb(theme.status_online), Tag::success()),
+        DeviceStatusKind::Offline => ("Offline", rgb(theme.status_offline), Tag::secondary()),
+        DeviceStatusKind::Blocked => ("Blocked", rgb(theme.status_blocked), Tag::danger()),
+        DeviceStatusKind::InSession => ("In Session", rgb(theme.accent_primary), Tag::info()),
+        DeviceStatusKind::Unverified => {
+            ("Unverified", rgb(theme.status_reconnecting), Tag::warning())
+        }
+    };
 
-        div()
-            .w(px(340.0))
-            .bg(rgb(theme.bg_surface))
-            .border_1()
-            .border_color(rgb(theme.border_subtle))
-            .rounded_lg()
-            .p_4()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .id("inspector-sheet")
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_semibold()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(item.display_label().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child(item.device_id.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("close-inspector-btn")
-                            .cursor_pointer()
-                            .p_1()
-                            .rounded_md()
-                            .text_color(rgb(theme.text_muted))
-                            .hover(|s| s.text_color(rgb(theme.text_primary)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.fleet_state.close_inspector();
-                                cx.notify();
-                            }))
-                            .child(Icon::new(IconName::X)),
-                    ),
-            )
-            .child(
-                div()
-                    .p_3()
-                    .bg(rgb(theme.bg_app))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border_subtle))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Status"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .child(div().size_2().rounded_full().bg(rgb(status_color)))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_medium()
-                                            .text_color(rgb(status_color))
-                                            .child(status_text),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Platform"),
-                            )
-                            .child(div().text_xs().text_color(rgb(theme.text_primary)).child(
-                                if item.is_android_tv() {
-                                    "Android TV"
-                                } else {
-                                    "Windows PC"
-                                },
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Address"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(item.primary_address().to_string()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Location"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(item.location_label().to_string()),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(rgb(theme.text_muted))
-                            .child("LIVE TELEMETRY"),
-                    )
-                    .child(render_telemetry_bar(
-                        "CPU Utilization",
-                        telemetry.cpu_usage_percent,
-                        theme,
-                    ))
-                    .child(render_telemetry_bar(
-                        "Memory Usage",
-                        telemetry.memory_usage_percent,
-                        theme,
-                    ))
-                    .child(render_telemetry_bar(
-                        "Disk Usage",
-                        telemetry.disk_usage_percent,
-                        theme,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .p_2()
-                            .bg(rgb(theme.bg_app))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(theme.border_subtle))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Uptime"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(uptime_str),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .p_2()
-                            .bg(rgb(theme.bg_app))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(theme.border_subtle))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Processes"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(telemetry.process_count.to_string()),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .pt_2()
-                    .border_t_1()
-                    .border_color(rgb(theme.border_subtle))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Remote Readiness"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_color(rgb(if remote_ready {
-                                        theme.status_online
-                                    } else {
-                                        theme.status_blocked
-                                    }))
-                                    .child(if remote_ready {
-                                        "Ready"
-                                    } else if telemetry.is_android_tv {
-                                        "TV (Restricted)"
-                                    } else {
-                                        "Unavailable"
-                                    }),
-                            ),
-                    )
-                    .child({
-                        let inspector_item = item.clone();
-                        Button::new("inspector-start-remote-btn")
-                            .primary()
-                            .label("Start Remote Session")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.launch_remote_for_item(&inspector_item, cx);
-                            }))
-                    }),
-            )
-    }
+    let uptime_str = format_uptime(telemetry.uptime_seconds);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_4()
+        .id("inspector-sheet")
+        .child(
+            div()
+                .p_3()
+                .bg(rgb(theme.bg_app))
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(theme.border_subtle))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child("Status"),
+                        )
+                        .child(
+                            Badge::new()
+                                .dot()
+                                .color(status_color)
+                                .child(tag.rounded_full().child(status_text)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child("Platform"),
+                        )
+                        .child(div().text_xs().text_color(rgb(theme.text_primary)).child(
+                            if item.is_android_tv() {
+                                "Android TV"
+                            } else {
+                                "Windows PC"
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child("Address"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_primary))
+                                .child(item.primary_address().to_string()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child("Location"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_primary))
+                                .child(item.location_label().to_string()),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(rgb(theme.text_muted))
+                        .child("LIVE TELEMETRY"),
+                )
+                .child(render_telemetry_bar(
+                    "CPU Utilization",
+                    telemetry.cpu_usage_percent,
+                    theme,
+                ))
+                .child(render_telemetry_bar(
+                    "Memory Usage",
+                    telemetry.memory_usage_percent,
+                    theme,
+                ))
+                .child(render_telemetry_bar(
+                    "Disk Usage",
+                    telemetry.disk_usage_percent,
+                    theme,
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .p_2()
+                        .bg(rgb(theme.bg_app))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(theme.border_subtle))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child("Uptime"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(rgb(theme.text_primary))
+                                .child(uptime_str),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .p_2()
+                        .bg(rgb(theme.bg_app))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(theme.border_subtle))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child("Processes"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(rgb(theme.text_primary))
+                                .child(telemetry.process_count.to_string()),
+                        ),
+                ),
+        )
+}
+
+fn render_inspector_footer(
+    item: &FleetDeviceItem,
+    telemetry: &DeviceTelemetry,
+    theme: &Theme,
+    app: Entity<ControllerApp>,
+) -> impl IntoElement {
+    let remote_ready = telemetry.remote_ready;
+    let inspector_item = item.clone();
+
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme.text_muted))
+                        .child("Remote Readiness"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(rgb(if remote_ready {
+                            theme.status_online
+                        } else {
+                            theme.status_blocked
+                        }))
+                        .child(if remote_ready {
+                            "Ready"
+                        } else if telemetry.is_android_tv {
+                            "TV (Restricted)"
+                        } else {
+                            "Unavailable"
+                        }),
+                ),
+        )
+        .child(
+            Button::new("inspector-start-remote-btn")
+                .primary()
+                .label("Start Remote Session")
+                .on_click(move |_, window, cx| {
+                    use gpui::component::WindowExt as _;
+                    let item = inspector_item.clone();
+                    window.close_sheet(cx);
+                    app.update(cx, |this, cx| {
+                        this.fleet_state.close_inspector();
+                        this.launch_remote_for_item(&item, cx);
+                    });
+                }),
+        )
 }
 
 fn format_uptime(uptime_seconds: u64) -> String {

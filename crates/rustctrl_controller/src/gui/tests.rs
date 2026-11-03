@@ -947,3 +947,32 @@ fn login_and_must_change_password_states_initial_values() {
         panic!("expected must change password screen state");
     }
 }
+
+#[test]
+fn fleet_search_and_filter_state_toggles() {
+    let mut fleet_state = crate::fleet::FleetState::new();
+    assert_eq!(fleet_state.filter, crate::fleet::FleetFilterChip::All);
+    assert!(fleet_state.search_query.is_empty());
+
+    fleet_state.set_filter(crate::fleet::FleetFilterChip::Windows);
+    assert_eq!(fleet_state.filter, crate::fleet::FleetFilterChip::Windows);
+
+    fleet_state.set_search("workstation");
+    assert_eq!(fleet_state.search_query, "workstation");
+
+    fleet_state.reset_filters();
+    assert_eq!(fleet_state.filter, crate::fleet::FleetFilterChip::All);
+    assert!(fleet_state.search_query.is_empty());
+}
+
+#[test]
+fn fleet_inspector_selection_lifecycle() {
+    let mut fleet_state = crate::fleet::FleetState::new();
+    assert!(fleet_state.selected_device_id.is_none());
+
+    fleet_state.select_device(Some("dev-pc-01".into()));
+    assert_eq!(fleet_state.selected_device_id.as_deref(), Some("dev-pc-01"));
+
+    fleet_state.close_inspector();
+    assert!(fleet_state.selected_device_id.is_none());
+}

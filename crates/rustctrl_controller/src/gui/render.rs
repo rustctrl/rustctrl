@@ -468,25 +468,6 @@ impl ControllerApp {
                 if *in_flight {
                     return;
                 }
-                if self.active_field == ActiveField::FleetSearch {
-                    match key.as_str() {
-                        "escape" => {
-                            self.fleet_state.search_query.clear();
-                            cx.notify();
-                        }
-                        "backspace" => {
-                            self.fleet_state.search_query.pop();
-                            cx.notify();
-                        }
-                        _ => {
-                            if let Some(text) = resolve_typed_text(&event.keystroke) {
-                                self.fleet_state.search_query.push_str(text);
-                                cx.notify();
-                            }
-                        }
-                    }
-                    return;
-                }
                 if self.navigation.active(role) == crate::navigation::Route::Remote
                     && self.remote_state.is_active()
                 {
@@ -577,6 +558,13 @@ impl Render for ControllerApp {
 
         if matches!(self.state, ScreenState::Connected { .. }) {
             self.ensure_fleet_table(window, cx);
+            self.ensure_fleet_search_input(window, cx);
+        } else {
+            use gpui::component::WindowExt as _;
+            if window.has_active_sheet(cx) {
+                window.close_sheet(cx);
+                self.fleet_state.close_inspector();
+            }
         }
 
         let main_view: gpui::AnyElement = match &self.state {
@@ -724,7 +712,14 @@ impl Render for ControllerApp {
                 }
 
                 if active == Route::Fleet {
+                    self.sync_fleet_inspector_sheet(window, cx);
                     content = content.child(self.render_fleet(cx));
+                } else {
+                    use gpui::component::WindowExt as _;
+                    if window.has_active_sheet(cx) {
+                        window.close_sheet(cx);
+                        self.fleet_state.close_inspector();
+                    }
                 }
                 if active == Route::Remote {
                     content = content.child(self.render_remote(cx));

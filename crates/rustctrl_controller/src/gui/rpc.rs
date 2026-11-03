@@ -374,6 +374,9 @@ impl ControllerApp {
         self.login_password_input = None;
         self.must_change_new_password_input = None;
         self.must_change_confirm_password_input = None;
+        self.fleet_search_input = None;
+        self.fleet_table = None;
+        self.fleet_state.close_inspector();
         cx.notify();
 
         let client_cfg = self.config.server.clone();
