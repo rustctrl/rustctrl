@@ -16,7 +16,7 @@ use gpui::component::table::{
     Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState,
 };
 use gpui::component::tag::Tag;
-use gpui::component::{Icon, Sizable as _, WindowExt as _};
+use gpui::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _};
 use gpui::{
     App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Stateful,
     Styled as _, Window, div, prelude::FluentBuilder as _, px, rgb,
@@ -28,6 +28,14 @@ pub(crate) struct FleetTableDelegate {
     pub(crate) is_admin: bool,
     pub(crate) empty_state: FleetEmptyState,
     pub(crate) app: Entity<ControllerApp>,
+}
+
+fn action_icon_button(
+    id: impl Into<gpui::ElementId>,
+    icon: IconName,
+    tooltip: &'static str,
+) -> Button {
+    Button::new(id).ghost().small().icon(icon).tooltip(tooltip)
 }
 
 impl TableDelegate for FleetTableDelegate {
@@ -43,27 +51,27 @@ impl TableDelegate for FleetTableDelegate {
         match col_ix {
             0 => Column::new("status", "Status")
                 .width(px(130.))
-                .min_width(px(100.))
+                .min_width(px(110.))
                 .sortable(),
             1 => Column::new("name", "Device Name")
                 .width(px(240.))
-                .min_width(px(160.))
+                .min_width(px(180.))
                 .sortable(),
             2 => Column::new("platform", "Platform")
                 .width(px(130.))
-                .min_width(px(100.))
+                .min_width(px(110.))
                 .sortable(),
             3 => Column::new("network_location", "Network & Location")
-                .width(px(250.))
+                .width(px(220.))
                 .min_width(px(180.))
                 .sortable(),
             4 => Column::new("last_seen", "Last Heartbeat")
-                .width(px(140.))
+                .width(px(130.))
                 .min_width(px(110.))
                 .sortable(),
             5 => Column::new("actions", "Actions")
-                .width(px(220.))
-                .min_width(px(160.))
+                .width(px(230.))
+                .min_width(px(180.))
                 .resizable(false)
                 .movable(false),
             _ => unreachable!(),
@@ -111,6 +119,7 @@ impl TableDelegate for FleetTableDelegate {
         let theme = self.theme;
         div()
             .id(("row", row_ix))
+            .h(px(52.))
             .border_b_1()
             .border_color(rgb(theme.border_subtle))
     }
@@ -124,6 +133,7 @@ impl TableDelegate for FleetTableDelegate {
         let theme = self.theme;
         div()
             .size_full()
+            .px_3()
             .flex()
             .items_center()
             .text_xs()
@@ -235,14 +245,15 @@ impl TableDelegate for FleetTableDelegate {
         row_ix: usize,
         col_ix: usize,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let Some(item) = self.items.get(row_ix) else {
             return div().into_any_element();
         };
         let theme = self.theme;
+        let mono_font = cx.theme().mono_font_family.clone();
 
-        match col_ix {
+        let content = match col_ix {
             0 => {
                 let (status_text, status_color, tag) = match item.status {
                     DeviceStatusKind::Online => {
@@ -262,15 +273,14 @@ impl TableDelegate for FleetTableDelegate {
                     }
                 };
 
-                div()
-                    .flex()
-                    .items_center()
-                    .h_full()
+                tag.rounded_full()
                     .child(
-                        Badge::new()
-                            .dot()
-                            .color(status_color)
-                            .child(tag.rounded_full().child(status_text)),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(div().size_2().rounded_full().bg(status_color))
+                            .child(status_text),
                     )
                     .into_any_element()
             }
@@ -278,19 +288,21 @@ impl TableDelegate for FleetTableDelegate {
                 .flex()
                 .flex_col()
                 .justify_center()
-                .h_full()
                 .child(
                     div()
                         .text_sm()
                         .font_medium()
                         .text_color(rgb(theme.text_primary))
+                        .truncate()
                         .child(item.display_label().to_string()),
                 )
-                .when(!item.display_name.is_empty(), |d| {
-                    d.child(
+                .when(!item.display_name.is_empty(), |col| {
+                    col.child(
                         div()
+                            .font_family(mono_font)
                             .text_xs()
                             .text_color(rgb(theme.text_muted))
+                            .truncate()
                             .child(item.device_id.clone()),
                     )
                 })
@@ -306,7 +318,6 @@ impl TableDelegate for FleetTableDelegate {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h_full()
                     .child(
                         Icon::new(icon_name)
                             .size_4()
@@ -324,30 +335,36 @@ impl TableDelegate for FleetTableDelegate {
                 .flex()
                 .flex_col()
                 .justify_center()
-                .h_full()
                 .child(
                     div()
+                        .font_family(mono_font)
                         .text_sm()
                         .text_color(rgb(theme.text_primary))
                         .child(item.primary_address().to_string()),
                 )
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(theme.text_muted))
-                        .child(item.location_label().to_string()),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::MapPin)
+                                .size_3()
+                                .text_color(rgb(theme.text_muted)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .truncate()
+                                .child(item.location_label().to_string()),
+                        ),
                 )
                 .into_any_element(),
             4 => div()
-                .flex()
-                .items_center()
-                .h_full()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(theme.text_muted))
-                        .child(item.relative_last_seen()),
-                )
+                .text_sm()
+                .text_color(rgb(theme.text_muted))
+                .child(item.relative_last_seen())
                 .into_any_element(),
             5 => {
                 let app = self.app.clone();
@@ -364,10 +381,12 @@ impl TableDelegate for FleetTableDelegate {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .h_full()
+                    .gap_1p5()
                     .child(
                         Button::new(format!("remote-btn-{}", item.device_id))
+                            .primary()
+                            .small()
+                            .icon(IconName::Monitor)
                             .label("Remote")
                             .on_click(move |_, _, cx| {
                                 let item = remote_item.clone();
@@ -388,9 +407,13 @@ impl TableDelegate for FleetTableDelegate {
 
                             actions
                                 .child(
-                                    Button::new(format!("edit-target-btn-{}", id_edit))
-                                        .label("Edit")
-                                        .on_click(move |_, _, cx| {
+                                    action_icon_button(
+                                        format!("edit-target-btn-{}", id_edit),
+                                        IconName::Pencil,
+                                        "Edit Target",
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
                                             app_edit.update(cx, |this, cx| {
                                                 this.open_edit_target(
                                                     id_edit.clone(),
@@ -400,16 +423,22 @@ impl TableDelegate for FleetTableDelegate {
                                                     cx,
                                                 );
                                             });
-                                        }),
+                                        },
+                                    ),
                                 )
                                 .child(
-                                    Button::new(format!("remove-target-btn-{}", id_remove))
-                                        .label("Remove")
-                                        .on_click(move |_, _, cx| {
+                                    action_icon_button(
+                                        format!("remove-target-btn-{}", id_remove),
+                                        IconName::Trash,
+                                        "Remove Target",
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
                                             app_remove.update(cx, |this, cx| {
                                                 this.submit_remove_target(id_remove.clone(), cx);
                                             });
-                                        }),
+                                        },
+                                    ),
                                 )
                         } else {
                             let app_edit = app.clone();
@@ -418,58 +447,76 @@ impl TableDelegate for FleetTableDelegate {
                             let loc_edit = dev_loc.clone();
 
                             let mut act = actions.child(
-                                Button::new(format!("edit-device-btn-{}", id_edit))
-                                    .label("Edit")
-                                    .on_click(move |_, _, cx| {
-                                        app_edit.update(cx, |this, cx| {
-                                            this.open_edit_device(
-                                                id_edit.clone(),
-                                                name_edit.clone(),
-                                                loc_edit.clone(),
-                                                cx,
-                                            );
-                                        });
-                                    }),
+                                action_icon_button(
+                                    format!("edit-device-btn-{}", id_edit),
+                                    IconName::Pencil,
+                                    "Edit Device Details",
+                                )
+                                .on_click(move |_, _, cx| {
+                                    app_edit.update(cx, |this, cx| {
+                                        this.open_edit_device(
+                                            id_edit.clone(),
+                                            name_edit.clone(),
+                                            loc_edit.clone(),
+                                            cx,
+                                        );
+                                    });
+                                }),
                             );
 
                             if is_blocked {
                                 let app_unblock = app.clone();
                                 let id_unblock = dev_id.clone();
                                 act = act.child(
-                                    Button::new(format!("unblock-device-btn-{}", id_unblock))
-                                        .label("Unblock")
-                                        .on_click(move |_, _, cx| {
+                                    action_icon_button(
+                                        format!("unblock-device-btn-{}", id_unblock),
+                                        IconName::LockOpen,
+                                        "Unblock Device",
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
                                             app_unblock.update(cx, |this, cx| {
                                                 this.submit_unblock_device(id_unblock.clone(), cx);
                                             });
-                                        }),
+                                        },
+                                    ),
                                 );
                             } else {
                                 let app_block = app.clone();
                                 let id_block = dev_id.clone();
                                 act = act.child(
-                                    Button::new(format!("block-device-btn-{}", id_block))
-                                        .label("Block")
-                                        .on_click(move |_, _, cx| {
+                                    action_icon_button(
+                                        format!("block-device-btn-{}", id_block),
+                                        IconName::Lock,
+                                        "Block Device",
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
                                             app_block.update(cx, |this, cx| {
                                                 this.submit_block_device(id_block.clone(), cx);
                                             });
-                                        }),
+                                        },
+                                    ),
                                 );
                                 if is_offline {
                                     let app_clean = app.clone();
                                     let id_clean = dev_id.clone();
                                     act = act.child(
-                                        Button::new(format!("clean-device-btn-{}", id_clean))
-                                            .label("Clean")
-                                            .on_click(move |_, _, cx| {
+                                        action_icon_button(
+                                            format!("clean-device-btn-{}", id_clean),
+                                            IconName::Eraser,
+                                            "Clean Offline Device",
+                                        )
+                                        .on_click(
+                                            move |_, _, cx| {
                                                 app_clean.update(cx, |this, cx| {
                                                     this.submit_clean_offline_device(
                                                         id_clean.clone(),
                                                         cx,
                                                     );
                                                 });
-                                            }),
+                                            },
+                                        ),
                                     );
                                 }
                             }
@@ -477,17 +524,20 @@ impl TableDelegate for FleetTableDelegate {
                             let app_replace = app.clone();
                             let id_replace = dev_id.clone();
                             act = act.child(
-                                Button::new(format!("replace-device-btn-{}", id_replace))
-                                    .label("Replace")
-                                    .on_click(move |_, _, cx| {
-                                        app_replace.update(cx, |this, cx| {
-                                            this.open_replace_device(
-                                                id_replace.clone(),
-                                                String::new(),
-                                                cx,
-                                            );
-                                        });
-                                    }),
+                                action_icon_button(
+                                    format!("replace-device-btn-{}", id_replace),
+                                    IconName::Replace,
+                                    "Replace Device",
+                                )
+                                .on_click(move |_, _, cx| {
+                                    app_replace.update(cx, |this, cx| {
+                                        this.open_replace_device(
+                                            id_replace.clone(),
+                                            String::new(),
+                                            cx,
+                                        );
+                                    });
+                                }),
                             );
 
                             act
@@ -496,7 +546,15 @@ impl TableDelegate for FleetTableDelegate {
                     .into_any_element()
             }
             _ => div().into_any_element(),
-        }
+        };
+
+        div()
+            .size_full()
+            .px_3()
+            .flex()
+            .items_center()
+            .child(content)
+            .into_any_element()
     }
 }
 

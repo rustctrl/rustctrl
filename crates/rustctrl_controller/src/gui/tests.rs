@@ -924,3 +924,47 @@ fn unified_shell_route_labels_and_sidebar_header_state() {
     nav.collapsed = false;
     assert!(!nav.collapsed);
 }
+
+#[test]
+fn fleet_device_item_presentation_attributes() {
+    use crate::fleet::{DeviceStatusKind, FleetDeviceItem};
+
+    let pc_entry = FleetDeviceEntry {
+        device_id: "dev-win-desktop-01".into(),
+        display_name: "Finance Desktop".into(),
+        online: true,
+        last_seen_unix_ms: 1_700_000_000_000,
+        last_address: "192.168.1.100".into(),
+        location: Some("Floor 2 - Room 204".into()),
+        device_type: "windows".into(),
+        configured_address: None,
+        status: "online".into(),
+        blocked: false,
+    };
+    let pc_item = FleetDeviceItem::from_entry(&pc_entry);
+    assert_eq!(pc_item.display_label(), "Finance Desktop");
+    assert_eq!(pc_item.device_id, "dev-win-desktop-01");
+    assert_eq!(pc_item.primary_address(), "192.168.1.100");
+    assert_eq!(pc_item.location_label(), "Floor 2 - Room 204");
+    assert_eq!(pc_item.status, DeviceStatusKind::Online);
+    assert!(!pc_item.is_android_tv());
+
+    let tv_entry = FleetDeviceEntry {
+        device_id: "tv-target-meeting".into(),
+        display_name: String::new(),
+        online: false,
+        last_seen_unix_ms: 0,
+        last_address: String::new(),
+        location: None,
+        device_type: "android_tv".into(),
+        configured_address: Some("192.168.1.250:5555".into()),
+        status: "unverified".into(),
+        blocked: false,
+    };
+    let tv_item = FleetDeviceItem::from_entry(&tv_entry);
+    assert_eq!(tv_item.display_label(), "tv-target-meeting");
+    assert_eq!(tv_item.primary_address(), "192.168.1.250:5555");
+    assert_eq!(tv_item.location_label(), "—");
+    assert_eq!(tv_item.status, DeviceStatusKind::Unverified);
+    assert!(tv_item.is_android_tv());
+}
