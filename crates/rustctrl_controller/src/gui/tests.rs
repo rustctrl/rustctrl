@@ -877,3 +877,23 @@ fn audit_history_entry_generation_and_attribution() {
     assert_eq!(remote_entry.category, "Remote Session");
     assert_eq!(remote_entry.result, "Active");
 }
+
+#[test]
+fn configure_tokyo_night_theme_registers_semantic_tokens() {
+    let theme = crate::theme::Theme::tokyo_night();
+    let mut kit_theme = gpui::component::theme::Theme::default();
+    configure_tokyo_night_theme(theme, &mut kit_theme);
+
+    assert_eq!(kit_theme.background, gpui::rgb(theme.bg_app).into());
+    assert_eq!(kit_theme.foreground, gpui::rgb(theme.text_primary).into());
+    assert_eq!(kit_theme.border, gpui::rgb(theme.border_subtle).into());
+    assert_eq!(kit_theme.primary, gpui::rgb(0x7aa2f7).into());
+    assert_eq!(kit_theme.danger, gpui::rgb(theme.status_blocked).into());
+    assert_eq!(
+        kit_theme.warning,
+        gpui::rgb(theme.status_reconnecting).into()
+    );
+    assert_eq!(kit_theme.success, gpui::rgb(theme.status_online).into());
+    assert_eq!(kit_theme.info, gpui::rgb(0x7aa2f7).into());
+    assert_eq!(kit_theme.sidebar, gpui::rgb(0x16161e).into());
+}

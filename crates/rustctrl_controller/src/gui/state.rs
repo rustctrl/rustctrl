@@ -164,6 +164,7 @@ pub struct ControllerApp {
         Entity<gpui::component::table::TableState<crate::gui::views::fleet::FleetTableDelegate>>,
     >,
     pub(crate) remote_state: crate::remote::RemoteSessionState,
+    pub(crate) window_handle: Option<gpui::AnyWindowHandle>,
     pub(crate) toast_manager: crate::toast::ToastManager,
     pub(crate) _health: Task<()>,
     pub(crate) _refresh: Task<()>,
@@ -176,6 +177,7 @@ impl ControllerApp {
         config: ControllerConfig,
         config_path: std::path::PathBuf,
         tokio_handle: tokio::runtime::Handle,
+        window_handle: Option<gpui::AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
@@ -372,10 +374,25 @@ impl ControllerApp {
             fleet_state: crate::fleet::FleetState::new(),
             fleet_table: None,
             remote_state: crate::remote::RemoteSessionState::default(),
+            window_handle,
             toast_manager: crate::toast::ToastManager::new(),
             _health: health,
             _refresh: refresh,
             _restore: Some(restore),
+        }
+    }
+
+    pub(crate) fn push_notification(
+        &mut self,
+        note: impl Into<gpui::component::notification::Notification>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.window_handle {
+            use gpui::component::WindowExt as _;
+            let note = note.into();
+            let _ = handle.update(cx, |_, window, cx| {
+                window.push_notification(note, cx);
+            });
         }
     }
 
@@ -386,25 +403,33 @@ impl ControllerApp {
         message: impl Into<String>,
         cx: &mut Context<Self>,
     ) {
+        use gpui::component::notification::Notification;
+
         let t = title.into();
         let m = message.into();
         match kind {
-            crate::toast::ToastKind::Success => self.toast_manager.success(t, m),
-            crate::toast::ToastKind::Error => self.toast_manager.error(t, m),
-            crate::toast::ToastKind::Warning => self.toast_manager.warning(t, m),
-            crate::toast::ToastKind::Info => self.toast_manager.info(t, m),
+            crate::toast::ToastKind::Success => {
+                self.toast_manager.success(t.clone(), m.clone());
+            }
+            crate::toast::ToastKind::Error => {
+                self.toast_manager.error(t.clone(), m.clone());
+            }
+            crate::toast::ToastKind::Warning => {
+                self.toast_manager.warning(t.clone(), m.clone());
+            }
+            crate::toast::ToastKind::Info => {
+                self.toast_manager.info(t.clone(), m.clone());
+            }
         };
+
+        let notification = match kind {
+            crate::toast::ToastKind::Success => Notification::success(m).title(t),
+            crate::toast::ToastKind::Error => Notification::error(m).title(t),
+            crate::toast::ToastKind::Warning => Notification::warning(m).title(t),
+            crate::toast::ToastKind::Info => Notification::info(m).title(t),
+        };
+        self.push_notification(notification, cx);
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(3200))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.toast_manager.tick_now();
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     pub(crate) fn launch_remote_for_item(
