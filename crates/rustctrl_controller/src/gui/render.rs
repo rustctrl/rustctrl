@@ -579,10 +579,14 @@ impl Render for ControllerApp {
             } => {
                 use crate::navigation::{Navigation, Route};
                 use gpui::assets::IconName;
-                use gpui::component::button::Button;
+                use gpui::component::Sizable as _;
+                use gpui::component::button::{Button, ButtonVariants as _};
+                use gpui::component::separator::Separator;
                 use gpui::component::sidebar::{
                     Sidebar, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
                 };
+                use gpui::component::tag::Tag;
+                use gpui::px;
 
                 let is_admin = role == "admin";
                 let active = self.navigation.active(role);
@@ -608,17 +612,47 @@ impl Render for ControllerApp {
                             })),
                     );
                 }
-                let sidebar =
-                    Sidebar::new("navigation")
-                        .w(gpui::px(220.))
+
+                let toggle_button =
+                    SidebarToggleButton::new()
                         .collapsed(collapsed)
-                        .header(SidebarToggleButton::new().collapsed(collapsed).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.navigation.collapsed = !this.navigation.collapsed;
-                                cx.notify();
-                            }),
-                        ))
-                        .child(menu);
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.navigation.collapsed = !this.navigation.collapsed;
+                            cx.notify();
+                        }));
+
+                let sidebar_header = if collapsed {
+                    div()
+                        .w_full()
+                        .h(px(48.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(toggle_button)
+                } else {
+                    div()
+                        .w_full()
+                        .h(px(48.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_bold()
+                                .text_color(rgb(self.theme.accent_primary))
+                                .child("RustCtrl"),
+                        )
+                        .child(toggle_button)
+                };
+
+                let sidebar = Sidebar::new("navigation")
+                    .w(gpui::px(220.))
+                    .collapsed(collapsed)
+                    .header(sidebar_header)
+                    .child(menu);
+
                 let (status, status_color) = match self.server_status {
                     crate::login_state::ServerStatus::Connecting => {
                         ("Connecting", self.theme.status_reconnecting)
@@ -630,88 +664,100 @@ impl Render for ControllerApp {
                         ("Server unreachable", self.theme.status_blocked)
                     }
                 };
-                let header =
-                    div()
-                        .p_4()
-                        .bg(rgb(self.theme.bg_surface))
-                        .border_b_1()
-                        .border_color(rgb(self.theme.border_subtle))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_4()
-                                .child(
-                                    div()
-                                        .text_xl()
-                                        .font_bold()
-                                        .text_color(rgb(self.theme.accent_primary))
-                                        .child("RustCtrl"),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(div().size_2().rounded_full().bg(rgb(status_color)))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(self.theme.text_muted))
-                                                .child(status),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(self.theme.text_muted))
-                                        .child(format!("Server {server_version}")),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(self.theme.text_muted))
-                                        .child(format!("{registered_devices} registered")),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(self.theme.text_primary))
-                                        .child(username.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_md()
-                                        .text_color(rgb(self.theme.text_muted))
-                                        .bg(rgb(self.theme.bg_surface_hover))
-                                        .child(if is_admin { "Admin" } else { "Operator" }),
-                                )
-                                .child(
-                                    Button::new("change-password-btn")
-                                        .label("Change Password")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_change_password(cx)
-                                        })),
-                                )
-                                .child(Button::new("signout-btn").label("Sign Out").on_click(
-                                    cx.listener(|this, _, _, cx| this.submit_logout(cx)),
-                                )),
-                        );
+
+                let topbar = div()
+                    .h(px(48.0))
+                    .px_4()
+                    .bg(rgb(self.theme.bg_app))
+                    .border_b_1()
+                    .border_color(rgb(self.theme.border_subtle))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .text_color(rgb(self.theme.text_primary))
+                                    .child(active.label()),
+                            )
+                            .child(Separator::vertical().h(px(16.0)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().size_2().rounded_full().bg(rgb(status_color)))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(self.theme.text_muted))
+                                            .child(status),
+                                    ),
+                            )
+                            .child(Separator::vertical().h(px(16.0)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(self.theme.text_muted))
+                                    .child(format!("Server {server_version}")),
+                            )
+                            .child(Separator::vertical().h(px(16.0)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(self.theme.text_muted))
+                                    .child(format!("{registered_devices} registered")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_medium()
+                                    .text_color(rgb(self.theme.text_primary))
+                                    .child(username.clone()),
+                            )
+                            .child(if is_admin {
+                                Tag::primary().child("Admin")
+                            } else {
+                                Tag::secondary().child("Operator")
+                            })
+                            .child(Separator::vertical().h(px(16.0)))
+                            .child(
+                                Button::new("change-password-btn")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Key)
+                                    .tooltip("Change Password")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_change_password(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("signout-btn")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::LogOut)
+                                    .tooltip("Sign Out")
+                                    .on_click(cx.listener(|this, _, _, cx| this.submit_logout(cx))),
+                            ),
+                    );
+
                 let mut content = div()
                     .id("connected-scroll")
-                    .size_full()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
                     .p_4()
                     .flex()
                     .flex_col()
@@ -771,13 +817,17 @@ impl Render for ControllerApp {
                         .into_any_element()
                 } else {
                     container
-                        .child(header)
+                        .flex_row()
+                        .gap_0()
+                        .child(sidebar)
                         .child(
                             div()
                                 .flex()
+                                .flex_col()
                                 .flex_1()
-                                .min_h_0()
-                                .child(sidebar)
+                                .min_w_0()
+                                .h_full()
+                                .child(topbar)
                                 .child(content),
                         )
                         .into_any_element()

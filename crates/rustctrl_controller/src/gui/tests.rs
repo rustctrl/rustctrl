@@ -904,3 +904,23 @@ fn fleet_inspector_selection_lifecycle() {
     fleet_state.close_inspector();
     assert!(fleet_state.selected_device_id.is_none());
 }
+
+#[test]
+fn unified_shell_route_labels_and_sidebar_header_state() {
+    use crate::navigation::{Navigation, Route};
+
+    let mut nav = Navigation::default();
+    assert_eq!(nav.active("operator"), Route::Fleet);
+    assert_eq!(Route::Fleet.label(), "Fleet Inventory");
+    assert_eq!(Route::Remote.label(), "Remote Sessions");
+    assert_eq!(Route::Accounts.label(), "Staff Accounts");
+    assert_eq!(Route::Deployment.label(), "Agent Deployment");
+    assert_eq!(Route::Audit.label(), "Audit History");
+
+    // Initially expanded
+    assert!(!nav.collapsed);
+    nav.collapsed = true;
+    assert!(nav.collapsed);
+    nav.collapsed = false;
+    assert!(!nav.collapsed);
+}
