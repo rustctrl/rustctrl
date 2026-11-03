@@ -3,9 +3,12 @@ use gpui::assets::IconName;
 use gpui::base::StyledExt as _;
 use gpui::component::Icon;
 use gpui::component::button::{Button, ButtonVariants as _};
-use gpui::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div, px, rgb,
+use gpui::component::empty::{
+    Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
 };
+use gpui::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
+use gpui::component::tag::Tag;
+use gpui::{Context, IntoElement, ParentElement as _, Styled as _, div, px, rgb};
 
 impl ControllerApp {
     pub(in crate::gui) fn render_deployment(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -51,153 +54,111 @@ impl ControllerApp {
         );
 
         if authorizations.is_empty() {
-            let empty_text = if error.is_some() {
-                "Unable to load installation authorizations from server."
+            let (title, description) = if error.is_some() {
+                (
+                    "Error Loading Authorizations",
+                    "Unable to load installation authorizations from server.",
+                )
             } else {
-                "No installation authorizations issued yet. Generate a package above to enroll agents."
+                (
+                    "No Installation Authorizations",
+                    "No installation authorizations issued yet. Generate a package above to enroll agents.",
+                )
             };
             auth_list = auth_list.child(
-                div()
-                    .p_6()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(theme.border_subtle))
-                    .bg(rgb(theme.bg_surface))
-                    .text_sm()
-                    .text_color(rgb(theme.text_muted))
-                    .child(empty_text),
+                Empty::new().header(
+                    EmptyHeader::new()
+                        .media(
+                            EmptyMedia::new()
+                                .with_variant(EmptyMediaVariant::Icon)
+                                .child(Icon::new(IconName::Key)),
+                        )
+                        .title(EmptyTitle::new().child(title))
+                        .description(EmptyDescription::new().child(description)),
+                ),
             );
         } else {
-            let header_row = div()
-                .flex()
-                .gap_4()
-                .px_4()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(theme.border_subtle))
-                .bg(rgb(theme.bg_surface))
-                .rounded_t_lg()
-                .text_xs()
-                .font_semibold()
-                .text_color(rgb(theme.text_muted))
-                .child(div().w(px(280.0)).child("AUTHORIZATION ID"))
-                .child(div().w(px(140.0)).child("CREATED BY"))
-                .child(div().w(px(160.0)).child("STATUS"))
-                .child(div().flex_1().child("ACTIONS"));
-
-            let mut table_container = div()
+            let table = Table::new()
                 .rounded_lg()
                 .border_1()
                 .border_color(rgb(theme.border_subtle))
-                .bg(rgb(theme.bg_surface))
-                .child(header_row);
+                .overflow_hidden()
+                .child(
+                    TableHeader::new().child(
+                        TableRow::new()
+                            .child(TableHead::new().w(px(280.0)).child("AUTHORIZATION ID"))
+                            .child(TableHead::new().w(px(140.0)).child("CREATED BY"))
+                            .child(TableHead::new().w(px(160.0)).child("STATUS"))
+                            .child(TableHead::new().flex_1().child("ACTIONS")),
+                    ),
+                )
+                .child(TableBody::new().children(authorizations.iter().map(|auth| {
+                    let auth_id = auth.authorization_id.clone();
+                    let is_revoked = auth.revoked_at_unix_ms.is_some();
 
-            for (ix, auth) in authorizations.iter().enumerate() {
-                let auth_id = auth.authorization_id.clone();
-                let is_revoked = auth.revoked_at_unix_ms.is_some();
+                    let status_badge = if let Some(revoked_at) = auth.revoked_at_unix_ms {
+                        Tag::danger().child(format!("Revoked ({revoked_at})"))
+                    } else {
+                        Tag::success().child("Active")
+                    };
 
-                let status_badge = if let Some(revoked_at) = auth.revoked_at_unix_ms {
-                    div()
-                        .w(px(160.0))
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(div().size_2().rounded_full().bg(rgb(theme.status_blocked)))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(theme.status_blocked))
-                                .child(format!("Revoked ({revoked_at})")),
-                        )
-                } else {
-                    div()
-                        .w(px(160.0))
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(div().size_2().rounded_full().bg(rgb(theme.status_online)))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(theme.status_online))
-                                .child("Active"),
-                        )
-                };
-
-                let actions_cell = if !is_revoked {
-                    let auth_id_revoke = auth_id.clone();
-                    let auth_id_replace = auth_id.clone();
-                    div()
-                        .flex_1()
-                        .flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            Button::new(format!("revoke-btn-{}", auth_id))
-                                .danger()
-                                .label("Revoke")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.submit_revoke_authorization(
-                                        auth_id_revoke.clone(),
-                                        false,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .child(
-                            Button::new(format!("revoke-replace-btn-{}", auth_id))
-                                .secondary()
-                                .label("Revoke & Replace")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.submit_revoke_authorization(
-                                        auth_id_replace.clone(),
-                                        true,
-                                        cx,
-                                    );
-                                })),
-                        )
-                } else {
-                    div()
-                        .flex_1()
-                        .text_xs()
-                        .text_color(rgb(theme.text_muted))
-                        .child("No actions available")
-                };
-
-                let is_last = ix == authorizations.len() - 1;
-                let mut row = div()
-                    .flex()
-                    .gap_4()
-                    .items_center()
-                    .px_4()
-                    .py_2p5()
-                    .hover(|s| s.bg(rgb(theme.bg_surface_hover)));
-
-                if !is_last {
-                    row = row.border_b_1().border_color(rgb(theme.border_subtle));
-                }
-
-                row = row
-                    .child(
+                    let actions_cell = if !is_revoked {
+                        let auth_id_revoke = auth_id.clone();
+                        let auth_id_replace = auth_id.clone();
                         div()
-                            .w(px(280.0))
-                            .font_semibold()
-                            .text_color(rgb(theme.text_primary))
-                            .child(auth.authorization_id.clone()),
-                    )
-                    .child(
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new(format!("revoke-btn-{}", auth_id))
+                                    .danger()
+                                    .label("Revoke")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.submit_revoke_authorization(
+                                            auth_id_revoke.clone(),
+                                            false,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new(format!("revoke-replace-btn-{}", auth_id))
+                                    .secondary()
+                                    .label("Revoke & Replace")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.submit_revoke_authorization(
+                                            auth_id_replace.clone(),
+                                            true,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                    } else {
                         div()
-                            .w(px(140.0))
+                            .text_xs()
                             .text_color(rgb(theme.text_muted))
-                            .child(auth.created_by.clone()),
-                    )
-                    .child(status_badge)
-                    .child(actions_cell);
+                            .child("No actions available")
+                    };
 
-                table_container = table_container.child(row);
-            }
+                    TableRow::new()
+                        .child(
+                            TableCell::new()
+                                .w(px(280.0))
+                                .font_semibold()
+                                .text_color(rgb(theme.text_primary))
+                                .child(auth.authorization_id.clone()),
+                        )
+                        .child(
+                            TableCell::new()
+                                .w(px(140.0))
+                                .text_color(rgb(theme.text_muted))
+                                .child(auth.created_by.clone()),
+                        )
+                        .child(TableCell::new().w(px(160.0)).child(status_badge))
+                        .child(TableCell::new().flex_1().child(actions_cell))
+                })));
 
-            auth_list = auth_list.child(table_container);
+            auth_list = auth_list.child(table);
         }
 
         div()

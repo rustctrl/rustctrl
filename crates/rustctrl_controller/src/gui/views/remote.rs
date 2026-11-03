@@ -4,10 +4,14 @@ use crate::theme::Theme;
 use gpui::assets::IconName;
 use gpui::base::StyledExt as _;
 use gpui::component::Icon;
+use gpui::component::badge::Badge;
 use gpui::component::button::{Button, ButtonVariants as _};
 use gpui::component::empty::{
     Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
 };
+use gpui::component::separator::Separator;
+use gpui::component::tag::Tag;
+use gpui::component::toolbar::Toolbar;
 use gpui::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _, px, rgb,
@@ -181,8 +185,7 @@ impl ControllerApp {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
-            .id("remote-floating-toolbar")
+        Toolbar::new("remote-floating-toolbar")
             .bg(rgb(theme.bg_surface))
             .border_1()
             .border_color(rgb(theme.border_subtle))
@@ -190,11 +193,8 @@ impl ControllerApp {
             .shadow_lg()
             .px_3()
             .py_2()
-            .flex()
-            .items_center()
-            .gap_2()
             // 1. Target Endpoint info
-            .child(
+            .content(
                 div()
                     .flex()
                     .items_center()
@@ -209,9 +209,9 @@ impl ControllerApp {
                             .child(session.device_name.clone()),
                     ),
             )
-            .child(self.render_toolbar_separator(theme))
+            .content(Separator::vertical().h(px(20.0)))
             // 2. Multi-Monitor Selector
-            .child(
+            .content(
                 div()
                     .flex()
                     .items_center()
@@ -230,7 +230,7 @@ impl ControllerApp {
                         }
                     })),
             )
-            .child(self.render_toolbar_separator(theme))
+            .content(Separator::vertical().h(px(20.0)))
             // 3. SAS (Ctrl+Alt+Del) Button
             .child(
                 Button::new("remote-sas-btn")
@@ -240,7 +240,7 @@ impl ControllerApp {
                         this.trigger_sas(cx);
                     })),
             )
-            .child(self.render_toolbar_separator(theme))
+            .content(Separator::vertical().h(px(20.0)))
             // 4. Input Mode Toggle (Interactive Control vs View-Only Mode)
             .child(
                 Button::new("remote-input-mode-btn")
@@ -254,33 +254,15 @@ impl ControllerApp {
                         this.toggle_remote_input_mode(cx);
                     })),
             )
-            .child(self.render_toolbar_separator(theme))
+            .content(Separator::vertical().h(px(20.0)))
             // 5. Latency, FPS, and stream quality status badge
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2p5()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgb(theme.bg_surface))
-                    .border_1()
-                    .border_color(rgb(theme.border_subtle))
-                    .child(div().size_2().rounded_full().bg(rgb(theme.status_online)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(format!(
-                                "{}ms • {} FPS • {}",
-                                session.metrics.latency_ms,
-                                session.metrics.fps,
-                                session.metrics.quality_label
-                            )),
-                    ),
-            )
-            .child(self.render_toolbar_separator(theme))
+            .content(Badge::new().dot().color(rgb(theme.status_online)).child(
+                Tag::secondary().child(format!(
+                    "{}ms • {} FPS • {}",
+                    session.metrics.latency_ms, session.metrics.fps, session.metrics.quality_label
+                )),
+            ))
+            .content(Separator::vertical().h(px(20.0)))
             // 6. Fullscreen Toggle Button (with F11 shortcut)
             .child(
                 Button::new("remote-fullscreen-btn")
@@ -299,7 +281,7 @@ impl ControllerApp {
                         this.toggle_remote_fullscreen(cx);
                     })),
             )
-            .child(self.render_toolbar_separator(theme))
+            .content(Separator::vertical().h(px(20.0)))
             // 7. Keyboard Ungrab indicator & button (Ctrl+Shift+Esc)
             .child(
                 Button::new("remote-ungrab-btn")
@@ -314,7 +296,7 @@ impl ControllerApp {
                         this.ungrab_remote_keyboard(cx);
                     })),
             )
-            .child(self.render_toolbar_separator(theme))
+            .content(Separator::vertical().h(px(20.0)))
             // 8. Prominent Red Disconnect Button
             .child(
                 Button::new("remote-disconnect-btn")
@@ -335,14 +317,6 @@ impl ControllerApp {
                         cx.notify();
                     })),
             )
-    }
-
-    fn render_toolbar_separator(&self, theme: &Theme) -> AnyElement {
-        div()
-            .w(px(1.0))
-            .h(px(20.0))
-            .bg(rgb(theme.border_subtle))
-            .into_any_element()
     }
 
     fn render_display_viewport(
