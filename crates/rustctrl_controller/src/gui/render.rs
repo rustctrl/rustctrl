@@ -433,7 +433,7 @@ impl ControllerApp {
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !matches!(self.overlay, Overlay::None) {
@@ -442,121 +442,20 @@ impl ControllerApp {
         }
         let key = &event.keystroke.key;
         match &mut self.state {
-            ScreenState::Login {
-                username,
-                password,
-                in_flight,
-                ..
-            } => {
+            ScreenState::Login { in_flight, .. } => {
                 if *in_flight {
                     return;
                 }
-                match key.as_str() {
-                    "enter"
-                        if matches!(
-                            self.active_field,
-                            ActiveField::PasswordVisibility | ActiveField::RememberLogin
-                        ) => {}
-                    "enter" => self.submit_login(cx),
-                    "tab" => {
-                        self.active_field =
-                            match (self.active_field, event.keystroke.modifiers.shift) {
-                                (ActiveField::Username, false) => ActiveField::Password,
-                                (ActiveField::Password, false) => ActiveField::PasswordVisibility,
-                                (ActiveField::PasswordVisibility, false) => {
-                                    ActiveField::RememberLogin
-                                }
-                                (ActiveField::RememberLogin, true) => {
-                                    ActiveField::PasswordVisibility
-                                }
-                                (ActiveField::PasswordVisibility, true) => ActiveField::Password,
-                                (ActiveField::Password, true) => ActiveField::Username,
-                                (_, true) => ActiveField::RememberLogin,
-                                _ => ActiveField::Username,
-                            };
-                        let handle = match self.active_field {
-                            ActiveField::PasswordVisibility => &self.visibility_focus,
-                            ActiveField::RememberLogin => &self.remember_focus,
-                            _ => &self.focus_handle,
-                        };
-                        window.focus(handle, cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                    "backspace" => {
-                        match self.active_field {
-                            ActiveField::Username => {
-                                username.pop();
-                            }
-                            ActiveField::Password => {
-                                password.pop();
-                            }
-                            _ => {}
-                        }
-                        cx.notify();
-                    }
-                    _ => {
-                        if let Some(text) = resolve_typed_text(&event.keystroke) {
-                            match self.active_field {
-                                ActiveField::Username => {
-                                    username.push_str(text);
-                                }
-                                ActiveField::Password => {
-                                    password.push_str(text);
-                                }
-                                _ => {}
-                            }
-                            cx.notify();
-                        }
-                    }
+                if key == "enter" {
+                    self.submit_login(cx);
                 }
             }
-            ScreenState::MustChangePassword {
-                new_password,
-                confirm_password,
-                in_flight,
-                ..
-            } => {
+            ScreenState::MustChangePassword { in_flight, .. } => {
                 if *in_flight {
                     return;
                 }
-                match key.as_str() {
-                    "enter" => {
-                        self.submit_replace_password(cx);
-                    }
-                    "tab" => {
-                        self.active_field = match self.active_field {
-                            ActiveField::NewPassword => ActiveField::ConfirmPassword,
-                            _ => ActiveField::NewPassword,
-                        };
-                        cx.notify();
-                    }
-                    "backspace" => {
-                        match self.active_field {
-                            ActiveField::NewPassword => {
-                                new_password.pop();
-                            }
-                            ActiveField::ConfirmPassword => {
-                                confirm_password.pop();
-                            }
-                            _ => {}
-                        }
-                        cx.notify();
-                    }
-                    _ => {
-                        if let Some(text) = resolve_typed_text(&event.keystroke) {
-                            match self.active_field {
-                                ActiveField::NewPassword => {
-                                    new_password.push_str(text);
-                                }
-                                ActiveField::ConfirmPassword => {
-                                    confirm_password.push_str(text);
-                                }
-                                _ => {}
-                            }
-                            cx.notify();
-                        }
-                    }
+                if key == "enter" {
+                    self.submit_replace_password(cx);
                 }
             }
             ScreenState::Connected {
@@ -668,6 +567,13 @@ impl Render for ControllerApp {
             .flex()
             .flex_col()
             .gap_4();
+
+        if matches!(
+            self.state,
+            ScreenState::Login { .. } | ScreenState::MustChangePassword { .. }
+        ) {
+            self.ensure_auth_inputs(window, cx);
+        }
 
         if matches!(self.state, ScreenState::Connected { .. }) {
             self.ensure_fleet_table(window, cx);

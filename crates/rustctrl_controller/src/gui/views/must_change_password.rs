@@ -1,5 +1,9 @@
 use super::super::*;
-use gpui::{Context, InteractiveElement as _, ParentElement as _, Styled as _, div, rgb};
+use gpui::base::StyledExt as _;
+use gpui::component::alert::Alert;
+use gpui::component::button::{Button, ButtonVariants as _};
+use gpui::component::input::Input;
+use gpui::{Context, ParentElement as _, Styled as _, div, prelude::FluentBuilder as _, rgb};
 
 impl ControllerApp {
     pub(in crate::gui) fn render_must_change_password(
@@ -9,8 +13,6 @@ impl ControllerApp {
     ) -> gpui::Div {
         let ScreenState::MustChangePassword {
             username,
-            new_password,
-            confirm_password,
             error,
             in_flight,
             ..
@@ -18,94 +20,85 @@ impl ControllerApp {
         else {
             unreachable!()
         };
-        let new_active = self.active_field == ActiveField::NewPassword;
-        let conf_active = self.active_field == ActiveField::ConfirmPassword;
-        let masked_new = "•".repeat(new_password.chars().count());
-        let masked_conf = "•".repeat(confirm_password.chars().count());
+        let theme = self.theme;
 
-        container.items_center().justify_center()
-                    .child(div().text_3xl().child("RustCtrl"))
-                    .child(format!("Welcome, {username}"))
-                    .child(
-                        div()
-                            .text_color(rgb(self.theme.status_reconnecting))
-                            .child("A temporary password was used. You must set a permanent password before accessing the system."),
+        container.items_center().justify_center().child(
+            div()
+                .w_full()
+                .max_w(gpui::px(440.))
+                .p_6()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(theme.border_subtle))
+                .bg(rgb(theme.bg_surface))
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(div().text_3xl().font_bold().child("RustCtrl"))
+                .child(
+                    div()
+                        .text_color(rgb(theme.text_muted))
+                        .child(format!("Welcome, {username}")),
+                )
+                .child(
+                    Alert::warning(
+                        "must-change-password-notice",
+                        "A temporary password was used. You must set a permanent password before accessing the system.",
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .max_w(gpui::px(400.0))
-                            .child("New Permanent Password:")
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .bg(rgb(self.theme.bg_app))
-                                    .border_1()
-                                    .border_color(if new_active {
-                                        rgb(self.theme.border_focus)
-                                    } else {
-                                        rgb(self.theme.border_subtle)
-                                    })
-                                    .rounded_md()
-                                    .id("new-password-input")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        window.focus(&this.focus_handle, cx);
-                                        this.active_field = ActiveField::NewPassword;
-                                        cx.notify();
-                                    }))
-                                    .child(if new_password.is_empty() {
-                                        "Minimum 8 characters...".to_string()
-                                    } else {
-                                        masked_new
-                                    }),
-                            )
-                            .child("Confirm Permanent Password:")
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .bg(rgb(self.theme.bg_app))
-                                    .border_1()
-                                    .border_color(if conf_active {
-                                        rgb(self.theme.border_focus)
-                                    } else {
-                                        rgb(self.theme.border_subtle)
-                                    })
-                                    .rounded_md()
-                                    .id("confirm-password-input")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        window.focus(&this.focus_handle, cx);
-                                        this.active_field = ActiveField::ConfirmPassword;
-                                        cx.notify();
-                                    }))
-                                    .child(if confirm_password.is_empty() {
-                                        "Re-enter new password...".to_string()
-                                    } else {
-                                        masked_conf
-                                    }),
-                            )
-                            .children(error.as_ref().map(|err| {
-                                div().text_color(rgb(self.theme.status_blocked)).text_sm().child(err.clone())
-                            }))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_3()
-                                    .child(
-                                        gpui::component::button::Button::new("save-password-btn")
-                                            .label(if *in_flight { "Updating..." } else { "Save & Continue" })
-                                            .loading(*in_flight)
-                                            .on_click(cx.listener(|this, _, _, cx| this.submit_replace_password(cx))),
-                                    )
-                                    .child(
-                                        gpui::component::button::Button::new("cancel-btn")
-                                            .label("Cancel / Logout")
-                                            .on_click(cx.listener(|this, _, window, cx| { window.focus(&this.focus_handle, cx); this.submit_logout(cx); })),
-                                    ),
-                            ),
-                    )
+                    .title("Password Update Required"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .child("New Permanent Password:"),
+                )
+                .when_some(
+                    self.must_change_new_password_input.as_ref(),
+                    |form, input_state| {
+                        form.child(Input::new(input_state).mask_toggle())
+                    },
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .child("Confirm Permanent Password:"),
+                )
+                .when_some(
+                    self.must_change_confirm_password_input.as_ref(),
+                    |form, input_state| {
+                        form.child(Input::new(input_state).mask_toggle())
+                    },
+                )
+                .when_some(error.as_ref(), |form, err| {
+                    form.child(Alert::error("change-password-error", err.clone()))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(
+                            Button::new("save-password-btn")
+                                .primary()
+                                .label(if *in_flight {
+                                    "Updating..."
+                                } else {
+                                    "Save & Continue"
+                                })
+                                .loading(*in_flight)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.submit_replace_password(cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("cancel-btn")
+                                .label("Cancel / Logout")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.submit_logout(cx);
+                                })),
+                        ),
+                ),
+        )
     }
 }

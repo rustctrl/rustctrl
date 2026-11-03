@@ -15,20 +15,32 @@ impl ControllerApp {
     pub(crate) fn submit_login(&mut self, cx: &mut Context<Self>) {
         let (username, password, remember) = match &self.state {
             ScreenState::Login {
-                username,
-                password,
+                username: state_username,
+                password: state_password,
                 remember,
                 in_flight,
                 ..
             } => {
-                let decision = crate::login_state::submit_decision(username, password, *in_flight);
+                let username = self
+                    .login_username_input
+                    .as_ref()
+                    .map(|input| input.read(cx).text().to_string())
+                    .unwrap_or_else(|| state_username.clone());
+                let password = self
+                    .login_password_input
+                    .as_ref()
+                    .map(|input| input.read(cx).text().to_string())
+                    .unwrap_or_else(|| state_password.clone());
+
+                let decision =
+                    crate::login_state::submit_decision(&username, &password, *in_flight);
                 if decision == crate::login_state::SubmitDecision::AlreadySubmitting {
                     return;
                 }
                 if let crate::login_state::SubmitDecision::Invalid(message) = decision {
                     self.state = ScreenState::Login {
-                        username: username.clone(),
-                        password: password.clone(),
+                        username,
+                        password,
                         error: Some(message.into()),
                         notice: None,
                         remember: *remember,
@@ -37,7 +49,7 @@ impl ControllerApp {
                     cx.notify();
                     return;
                 }
-                (username.clone(), password.clone(), *remember)
+                (username, password, *remember)
             }
             _ => return,
         };
@@ -101,6 +113,8 @@ impl ControllerApp {
                     Ok(Ok((reply, persistence_warning))) => {
                         let warning = persistence_warning.map(|text| format!("Warning: {text}."));
                         if reply.must_change_password {
+                            view.must_change_new_password_input = None;
+                            view.must_change_confirm_password_input = None;
                             view.state = ScreenState::MustChangePassword {
                                 session_token: reply.session_token,
                                 username: reply.username,
@@ -112,6 +126,10 @@ impl ControllerApp {
                             };
                             view.active_field = ActiveField::NewPassword;
                         } else {
+                            view.login_password_input = None;
+                            if !remember {
+                                view.login_username_input = None;
+                            }
                             let token = reply.session_token.clone();
                             view.state = ScreenState::Connected {
                                 session_token: reply.session_token,
@@ -181,11 +199,22 @@ impl ControllerApp {
                 session_token,
                 username,
                 role,
-                new_password,
-                confirm_password,
+                new_password: state_new_password,
+                confirm_password: state_confirm_password,
                 in_flight: false,
                 ..
             } => {
+                let new_password = self
+                    .must_change_new_password_input
+                    .as_ref()
+                    .map(|input| input.read(cx).text().to_string())
+                    .unwrap_or_else(|| state_new_password.clone());
+                let confirm_password = self
+                    .must_change_confirm_password_input
+                    .as_ref()
+                    .map(|input| input.read(cx).text().to_string())
+                    .unwrap_or_else(|| state_confirm_password.clone());
+
                 if new_password.len() < 8 {
                     self.state = ScreenState::MustChangePassword {
                         session_token: session_token.clone(),
@@ -216,7 +245,7 @@ impl ControllerApp {
                     session_token.clone(),
                     username.clone(),
                     role.clone(),
-                    new_password.clone(),
+                    new_password,
                 )
             }
             _ => return,
@@ -252,6 +281,9 @@ impl ControllerApp {
             let _ = this.update(cx, |view, cx| {
                 match res {
                     Ok(Ok(())) => {
+                        view.must_change_new_password_input = None;
+                        view.must_change_confirm_password_input = None;
+                        view.login_password_input = None;
                         view.state = ScreenState::Connected {
                             session_token: session_token.clone(),
                             username: username.clone(),
@@ -334,11 +366,14 @@ impl ControllerApp {
             remember: false,
             in_flight: false,
         };
-        self.show_password = false;
         self.navigation.reset();
         // Any open password form belongs to the session being left behind.
         self.overlay = Overlay::None;
         self.active_field = ActiveField::Username;
+        self.login_username_input = None;
+        self.login_password_input = None;
+        self.must_change_new_password_input = None;
+        self.must_change_confirm_password_input = None;
         cx.notify();
 
         let client_cfg = self.config.server.clone();
