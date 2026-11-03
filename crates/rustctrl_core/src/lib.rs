@@ -820,6 +820,26 @@ pub fn read_config<T: DeserializeOwned>(path: &Path) -> Result<T> {
         .with_context(|| format!("read configuration {}", path.display()))?;
     toml::from_str(&body).with_context(|| format!("parse configuration {}", path.display()))
 }
+
+/// Generates a strong, random temporary password for staff account provisioning.
+///
+/// Produces a 16-character password containing upper and lowercase letters, numbers,
+/// and safe punctuation symbols (`!@#$-_`).
+pub fn generate_temporary_password() -> String {
+    const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$-_";
+    let u1 = uuid::Uuid::new_v4();
+    let u2 = uuid::Uuid::new_v4();
+    let bytes1 = u1.as_bytes();
+    let bytes2 = u2.as_bytes();
+
+    let mut result = String::with_capacity(16);
+    for i in 0..16 {
+        let b = bytes1[i] ^ bytes2[i];
+        let idx = (b as usize) % CHARSET.len();
+        result.push(CHARSET[idx] as char);
+    }
+    result
+}
 pub fn config_base(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new("."))
 }
@@ -999,5 +1019,24 @@ mod tests {
         assert!(AgentInstallationPackage::new(artifact, vec![]).is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn temporary_password_generation_meets_length_and_charset_rules() {
+        const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$-_";
+        for _ in 0..50 {
+            let pass = generate_temporary_password();
+            assert_eq!(pass.len(), 16);
+            assert!(
+                pass.len() >= 8,
+                "must satisfy server minimum password length"
+            );
+            for ch in pass.chars() {
+                assert!(
+                    CHARSET.contains(&(ch as u8)),
+                    "character '{ch}' must belong to allowed charset"
+                );
+            }
+        }
     }
 }

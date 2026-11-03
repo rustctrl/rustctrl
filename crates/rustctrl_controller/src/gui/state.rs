@@ -5,8 +5,19 @@ use rustctrl_protocol::auth::{
 };
 use std::time::Duration;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct StaffAccountCreatedInfo {
+    pub username: String,
+    pub role: String,
+    pub temporary_password: String,
+}
+
 #[derive(Clone)]
 pub(crate) enum ModalInputs {
+    CreateStaffAccount {
+        username: Entity<gpui::component::input::InputState>,
+        temporary_password: Entity<gpui::component::input::InputState>,
+    },
     ChangePassword {
         current_password: Entity<gpui::component::input::InputState>,
         new_password: Entity<gpui::component::input::InputState>,
@@ -97,6 +108,14 @@ pub enum Overlay {
         in_flight: bool,
         success: Option<String>,
     },
+    CreateStaffAccount {
+        username: String,
+        role: String,
+        temporary_password: String,
+        error: Option<String>,
+        in_flight: bool,
+        created: Option<StaffAccountCreatedInfo>,
+    },
 }
 
 #[derive(Clone)]
@@ -127,9 +146,6 @@ pub enum ScreenState {
         devices: Vec<FleetDeviceEntry>,
         accounts: Vec<StaffAccountEntry>,
         authorizations: Vec<InstallationAuthorizationEntry>,
-        new_account_username: String,
-        new_account_role: String,
-        new_account_password: String,
         error: Option<String>,
         notice: Option<String>,
         in_flight: bool,
@@ -174,8 +190,6 @@ pub struct ControllerApp {
     pub(crate) must_change_new_password_input: Option<Entity<gpui::component::input::InputState>>,
     pub(crate) must_change_confirm_password_input:
         Option<Entity<gpui::component::input::InputState>>,
-    pub(crate) new_account_username_input: Option<Entity<gpui::component::input::InputState>>,
-    pub(crate) new_account_password_input: Option<Entity<gpui::component::input::InputState>>,
     pub(crate) remote_state: crate::remote::RemoteSessionState,
     pub(crate) window_handle: Option<gpui::AnyWindowHandle>,
     pub(crate) toast_manager: crate::toast::ToastManager,
@@ -322,9 +336,6 @@ impl ControllerApp {
                                 devices: Vec::new(),
                                 accounts: Vec::new(),
                                 authorizations: Vec::new(),
-                                new_account_username: String::new(),
-                                new_account_role: "operator".into(),
-                                new_account_password: String::new(),
                                 error: None,
                                 notice: Some("Signed in with your remembered session.".into()),
                                 in_flight: false,
@@ -388,8 +399,6 @@ impl ControllerApp {
             login_password_input: None,
             must_change_new_password_input: None,
             must_change_confirm_password_input: None,
-            new_account_username_input: None,
-            new_account_password_input: None,
             remote_state: crate::remote::RemoteSessionState::default(),
             window_handle,
             toast_manager: crate::toast::ToastManager::new(),

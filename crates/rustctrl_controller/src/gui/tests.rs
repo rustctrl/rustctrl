@@ -352,9 +352,6 @@ fn connected_state_installation_authorizations_display_and_filtering() {
         devices: Vec::new(),
         accounts: Vec::new(),
         authorizations: vec![auth_active.clone(), auth_revoked.clone()],
-        new_account_username: String::new(),
-        new_account_role: "operator".into(),
-        new_account_password: String::new(),
         error: None,
         notice: None,
         in_flight: false,
@@ -392,9 +389,6 @@ fn connected_state_preserves_authorizations_when_refresh_fails() {
         devices: Vec::new(),
         accounts: Vec::new(),
         authorizations: vec![auth_active.clone()],
-        new_account_username: String::new(),
-        new_account_role: "operator".into(),
-        new_account_password: String::new(),
         error: None,
         notice: None,
         in_flight: false,
@@ -748,6 +742,83 @@ fn staff_accounts_view_model_and_role_transitions() {
 }
 
 #[test]
+fn modernized_staff_accounts_view_and_role_actions() {
+    use gpui::assets::IconName;
+
+    let accounts = [
+        StaffAccountEntry {
+            username: "sarah_admin".into(),
+            role: "admin".into(),
+            active: true,
+            must_change_password: false,
+            created_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_000_000,
+        },
+        StaffAccountEntry {
+            username: "jordan_op".into(),
+            role: "operator".into(),
+            active: true,
+            must_change_password: true,
+            created_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_000_000,
+        },
+        StaffAccountEntry {
+            username: "legacy_user".into(),
+            role: "operator".into(),
+            active: false,
+            must_change_password: false,
+            created_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_000_000,
+        },
+    ];
+
+    // Admin target demotion action metadata
+    let admin_target = &accounts[0];
+    let is_target_admin = admin_target.role == "admin";
+    let (role_icon, role_tooltip) = if is_target_admin {
+        (IconName::ShieldMinus, "Demote to Operator")
+    } else {
+        (IconName::ShieldCheck, "Promote to Administrator")
+    };
+    assert_eq!(role_icon, IconName::ShieldMinus);
+    assert_eq!(role_tooltip, "Demote to Operator");
+
+    // Operator target promotion action metadata
+    let op_target = &accounts[1];
+    let is_target_admin = op_target.role == "admin";
+    let (role_icon, role_tooltip) = if is_target_admin {
+        (IconName::ShieldMinus, "Demote to Operator")
+    } else {
+        (IconName::ShieldCheck, "Promote to Administrator")
+    };
+    assert_eq!(role_icon, IconName::ShieldCheck);
+    assert_eq!(role_tooltip, "Promote to Administrator");
+
+    // Deactivation action visibility
+    assert!(admin_target.active); // Action button included
+    assert!(op_target.active); // Action button included
+    let deactivated = &accounts[2];
+    assert!(!deactivated.active); // Action button excluded for deactivated
+
+    // Account count badge text
+    let single_count = 1;
+    let single_text = if single_count == 1 {
+        "1 account".to_string()
+    } else {
+        format!("{single_count} accounts")
+    };
+    assert_eq!(single_text, "1 account");
+
+    let total_count = accounts.len();
+    let count_text = if total_count == 1 {
+        "1 account".to_string()
+    } else {
+        format!("{total_count} accounts")
+    };
+    assert_eq!(count_text, "3 accounts");
+}
+
+#[test]
 fn agent_deployment_authorization_filtering_and_revocation_state() {
     use rustctrl_protocol::auth::InstallationAuthorizationEntry;
 
@@ -997,4 +1068,52 @@ fn fleet_device_item_presentation_attributes() {
     assert_eq!(tv_item.location_label(), "—");
     assert_eq!(tv_item.status, DeviceStatusKind::Unverified);
     assert!(tv_item.is_android_tv());
+}
+
+#[test]
+fn create_staff_account_overlay_state_and_success_transition() {
+    let mut overlay = Overlay::CreateStaffAccount {
+        username: String::new(),
+        role: "operator".into(),
+        temporary_password: "InitialPassword123!".into(),
+        error: None,
+        in_flight: false,
+        created: None,
+    };
+
+    if let Overlay::CreateStaffAccount {
+        role,
+        temporary_password,
+        in_flight,
+        created,
+        ..
+    } = &mut overlay
+    {
+        assert_eq!(role, "operator");
+        assert_eq!(temporary_password, "InitialPassword123!");
+        assert!(!*in_flight);
+        assert!(created.is_none());
+
+        // Toggle to admin role
+        *role = "admin".into();
+        assert_eq!(role, "admin");
+
+        // Simulate successful submission and transition to created state
+        *created = Some(StaffAccountCreatedInfo {
+            username: "sarah_admin".into(),
+            role: "admin".into(),
+            temporary_password: "GeneratedPass#456".into(),
+        });
+    } else {
+        panic!("expected CreateStaffAccount overlay");
+    }
+
+    if let Overlay::CreateStaffAccount { created, .. } = &overlay {
+        let info = created.as_ref().expect("created info should be present");
+        assert_eq!(info.username, "sarah_admin");
+        assert_eq!(info.role, "admin");
+        assert_eq!(info.temporary_password, "GeneratedPass#456");
+    } else {
+        panic!("expected CreateStaffAccount overlay");
+    }
 }

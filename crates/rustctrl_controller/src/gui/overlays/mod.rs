@@ -1,4 +1,5 @@
 pub(crate) mod change_password;
+pub(crate) mod create_account;
 pub(crate) mod prepare_artifact;
 pub(crate) mod replace_device;
 pub(crate) mod reset_password;

@@ -139,9 +139,6 @@ impl ControllerApp {
                                 devices: Vec::new(),
                                 accounts: Vec::new(),
                                 authorizations: Vec::new(),
-                                new_account_username: String::new(),
-                                new_account_role: "operator".into(),
-                                new_account_password: String::new(),
                                 error: None,
                                 notice: warning,
                                 in_flight: false,
@@ -292,9 +289,6 @@ impl ControllerApp {
                             devices: Vec::new(),
                             accounts: Vec::new(),
                             authorizations: Vec::new(),
-                            new_account_username: String::new(),
-                            new_account_role: "operator".into(),
-                            new_account_password: String::new(),
                             error: None,
                             notice: None,
                             in_flight: false,
@@ -474,9 +468,6 @@ impl ControllerApp {
                     devices,
                     accounts,
                     authorizations,
-                    new_account_username,
-                    new_account_role,
-                    new_account_password,
                     in_flight,
                     error,
                     notice,
@@ -527,9 +518,6 @@ impl ControllerApp {
                                 devices: devices_reply,
                                 accounts: updated_accounts,
                                 authorizations: updated_authorizations,
-                                new_account_username: new_account_username.clone(),
-                                new_account_role: new_account_role.clone(),
-                                new_account_password: new_account_password.clone(),
                                 error: keep_error,
                                 notice: keep_notice,
                                 in_flight: *in_flight,
@@ -548,9 +536,6 @@ impl ControllerApp {
                                 devices: devices.clone(),
                                 accounts: accounts.clone(),
                                 authorizations: authorizations.clone(),
-                                new_account_username: new_account_username.clone(),
-                                new_account_role: new_account_role.clone(),
-                                new_account_password: new_account_password.clone(),
                                 error: Some(err.to_string()),
                                 notice: notice.clone(),
                                 in_flight: false,
@@ -566,9 +551,6 @@ impl ControllerApp {
                                 devices: devices.clone(),
                                 accounts: accounts.clone(),
                                 authorizations: authorizations.clone(),
-                                new_account_username: new_account_username.clone(),
-                                new_account_role: new_account_role.clone(),
-                                new_account_password: new_account_password.clone(),
                                 error: Some(e.to_string()),
                                 notice: notice.clone(),
                                 in_flight: false,
@@ -582,41 +564,94 @@ impl ControllerApp {
         .detach();
     }
 
-    pub(crate) fn submit_create_account(&mut self, cx: &mut Context<Self>) {
-        let (session_token, new_user, new_role, new_pass) = match &mut self.state {
-            ScreenState::Connected {
-                session_token,
+    pub(crate) fn open_create_account(&mut self, cx: &mut Context<Self>) {
+        let temporary_password = rustctrl_core::generate_temporary_password();
+        self.overlay = Overlay::CreateStaffAccount {
+            username: String::new(),
+            role: "operator".into(),
+            temporary_password,
+            error: None,
+            in_flight: false,
+            created: None,
+        };
+        self.modal_inputs = None;
+        cx.notify();
+    }
+
+    pub(crate) fn submit_create_staff_account(&mut self, cx: &mut Context<Self>) {
+        let (session_token, user, role_str, pass) = match &mut self.overlay {
+            Overlay::CreateStaffAccount {
+                username,
                 role,
-                new_account_username,
-                new_account_role,
-                new_account_password,
-                in_flight,
+                temporary_password,
                 error,
-                ..
-            } if role == "admin" && !*in_flight => {
-                let user = self
-                    .new_account_username_input
-                    .as_ref()
-                    .map(|input| input.read(cx).text().to_string().trim().to_string())
-                    .unwrap_or_else(|| new_account_username.trim().to_string());
-                if user.is_empty() {
+                in_flight,
+                created,
+            } if !*in_flight && created.is_none() => {
+                let current_user =
+                    if let Some(ModalInputs::CreateStaffAccount { username: u, .. }) =
+                        &self.modal_inputs
+                    {
+                        u.read(cx).text().to_string().trim().to_string()
+                    } else {
+                        username.trim().to_string()
+                    };
+
+                if current_user.is_empty() {
                     *error = Some("Username is required.".into());
                     cx.notify();
                     return;
                 }
-                let pass = self
-                    .new_account_password_input
-                    .as_ref()
-                    .map(|input| input.read(cx).text().to_string())
-                    .unwrap_or_else(|| new_account_password.clone());
-                if pass.len() < 8 {
+                if current_user.len() > 64 {
+                    *error = Some("Username must not exceed 64 characters.".into());
+                    cx.notify();
+                    return;
+                }
+                if !current_user
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+                {
+                    *error = Some(
+                        "Username may only contain letters, numbers, '.', '_', or '-'.".into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+
+                let current_pass = if let Some(ModalInputs::CreateStaffAccount {
+                    temporary_password: p,
+                    ..
+                }) = &self.modal_inputs
+                {
+                    p.read(cx).text().to_string()
+                } else {
+                    temporary_password.clone()
+                };
+
+                if current_pass.len() < 8 {
                     *error = Some("Temporary password must contain at least 8 characters.".into());
                     cx.notify();
                     return;
                 }
+
+                let token = match &self.state {
+                    ScreenState::Connected {
+                        session_token,
+                        role: staff_role,
+                        ..
+                    } if staff_role == "admin" => session_token.clone(),
+                    _ => {
+                        *error = Some("Only administrators can create staff accounts.".into());
+                        cx.notify();
+                        return;
+                    }
+                };
+
                 *in_flight = true;
                 *error = None;
-                (session_token.clone(), user, new_account_role.clone(), pass)
+                *username = current_user.clone();
+                *temporary_password = current_pass.clone();
+                (token, current_user, role.clone(), current_pass)
             }
             _ => return,
         };
@@ -625,14 +660,18 @@ impl ControllerApp {
         let client_cfg = self.config.server.clone();
         let handle = self.tokio_handle.clone();
         let tok = session_token.clone();
+        let user_clone = user.clone();
+        let role_clone = role_str.clone();
+        let pass_clone = pass.clone();
+
         cx.spawn(async move |this, cx| {
             let res = handle
                 .spawn(async move {
                     let mut client = rustctrl_network::connect_staff_auth(&client_cfg).await?;
                     let mut req = tonic::Request::new(CreateStaffAccountRequest {
-                        username: new_user,
-                        role: new_role,
-                        temporary_password: new_pass,
+                        username: user_clone,
+                        role: role_clone,
+                        temporary_password: pass_clone,
                     });
                     req.metadata_mut()
                         .insert("authorization", format!("Bearer {tok}").parse()?);
@@ -642,25 +681,30 @@ impl ControllerApp {
                 .await;
 
             let _ = this.update(cx, |view, cx| {
-                if let ScreenState::Connected {
-                    session_token,
-                    new_account_username,
-                    new_account_password,
-                    in_flight,
+                if let Overlay::CreateStaffAccount {
                     error,
+                    in_flight,
+                    created,
                     ..
-                } = &mut view.state
+                } = &mut view.overlay
                 {
                     *in_flight = false;
                     match res {
                         Ok(Ok(_reply)) => {
-                            new_account_username.clear();
-                            new_account_password.clear();
-                            view.new_account_username_input = None;
-                            view.new_account_password_input = None;
                             *error = None;
-                            let token = session_token.clone();
-                            view.fetch_status(token, cx);
+                            *created = Some(crate::gui::state::StaffAccountCreatedInfo {
+                                username: user.clone(),
+                                role: role_str.clone(),
+                                temporary_password: pass.clone(),
+                            });
+                            view.toast_manager.success(
+                                "Staff Account Created",
+                                format!("Account '{}' created successfully", user),
+                            );
+                            if let ScreenState::Connected { session_token, .. } = &view.state {
+                                let tok = session_token.clone();
+                                view.fetch_status(tok, cx);
+                            }
                         }
                         Ok(Err(e)) => {
                             *error = Some(e.to_string());
