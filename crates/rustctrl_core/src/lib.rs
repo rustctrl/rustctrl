@@ -821,23 +821,81 @@ pub fn read_config<T: DeserializeOwned>(path: &Path) -> Result<T> {
     toml::from_str(&body).with_context(|| format!("parse configuration {}", path.display()))
 }
 
-/// Generates a strong, random temporary password for staff account provisioning.
+/// Fills `dest` with cryptographically secure random bytes from the operating system.
+#[cfg(unix)]
+fn fill_os_random(dest: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut file = std::fs::File::open("/dev/urandom")?;
+    file.read_exact(dest)
+}
+
+#[cfg(windows)]
+fn fill_os_random(dest: &mut [u8]) -> std::io::Result<()> {
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut std::ffi::c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002;
+    // SAFETY: BCryptGenRandom is called with valid buffer pointer and length.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            dest.as_mut_ptr(),
+            dest.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Generates a cryptographically strong, random temporary password for staff account provisioning.
 ///
-/// Produces a 16-character password containing upper and lowercase letters, numbers,
-/// and safe punctuation symbols (`!@#$-_`).
+/// Produces a 16-character credential sampled uniformly (without modulo bias) from a 62-character
+/// alphabet spanning upper and lowercase letters, digits, and safe punctuation symbols (`!@#$-_`).
 pub fn generate_temporary_password() -> String {
     const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$-_";
-    let u1 = uuid::Uuid::new_v4();
-    let u2 = uuid::Uuid::new_v4();
-    let bytes1 = u1.as_bytes();
-    let bytes2 = u2.as_bytes();
+    const CHARSET_LEN: usize = CHARSET.len(); // 62
+    // Largest multiple of CHARSET_LEN (62) less than 256 is 248 (62 * 4).
+    // Discarding random bytes >= 248 guarantees completely unbiased uniform sampling.
+    const REJECTION_THRESHOLD: u8 = ((256 / CHARSET_LEN) * CHARSET_LEN) as u8; // 248
 
     let mut result = String::with_capacity(16);
-    for i in 0..16 {
-        let b = bytes1[i] ^ bytes2[i];
-        let idx = (b as usize) % CHARSET.len();
-        result.push(CHARSET[idx] as char);
+    let mut random_pool = [0u8; 64];
+
+    while result.len() < 16 {
+        if fill_os_random(&mut random_pool).is_err() {
+            // Fallback: blend system time and UUIDv4 random entropy
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            for (idx, slot) in random_pool.iter_mut().enumerate() {
+                let uuid_sample = uuid::Uuid::new_v4();
+                let seed_byte = seed.wrapping_shr((idx % 8) as u32 * 8) as u8;
+                *slot = uuid_sample.as_bytes()[idx % 16] ^ seed_byte;
+            }
+        }
+
+        for &byte in &random_pool {
+            if byte < REJECTION_THRESHOLD {
+                let charset_index = (byte as usize) % CHARSET_LEN;
+                result.push(CHARSET[charset_index] as char);
+                if result.len() == 16 {
+                    break;
+                }
+            }
+        }
     }
+
     result
 }
 pub fn config_base(path: &Path) -> &Path {

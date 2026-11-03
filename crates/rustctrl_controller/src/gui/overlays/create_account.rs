@@ -11,7 +11,7 @@ use gpui::component::dialog::{
 };
 use gpui::component::input::Input;
 use gpui::component::tag::Tag;
-use gpui::component::{Disableable as _, Icon, Sizable as _};
+use gpui::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui::{
     App, ClipboardItem, Entity, InteractiveElement as _, ParentElement as _, Styled as _, px, rgb,
 };
@@ -78,6 +78,7 @@ pub(crate) fn render_create_account_dialog(
         let creds_for_copy = creds_text.clone();
         let pass_for_copy = info.temporary_password.clone();
         let role_is_admin = info.role == "admin";
+        let mono_font = cx.theme().mono_font_family.clone();
 
         dialog = dialog
             .child(
@@ -182,6 +183,7 @@ pub(crate) fn render_create_account_dialog(
                                                 gpui::div()
                                                     .text_sm()
                                                     .font_weight(gpui::FontWeight::BOLD)
+                                                    .font_family(mono_font)
                                                     .text_color(rgb(theme.accent_primary))
                                                     .child(info.temporary_password.clone()),
                                             ),
@@ -429,7 +431,7 @@ pub(crate) fn render_create_account_dialog(
                         .flex_col()
                         .gap_1p5()
                         .child(password_header)
-                        .child(Input::new(temporary_password))
+                        .child(Input::new(temporary_password).mask_toggle())
                         .child(
                             gpui::div()
                                 .text_xs()
@@ -473,4 +475,27 @@ pub(crate) fn render_create_account_dialog(
                         }),
                 ),
         )
+}
+
+pub(crate) fn validate_staff_account_inputs(
+    username: &str,
+    password: &str,
+) -> Result<(), &'static str> {
+    let trimmed_user = username.trim();
+    if trimmed_user.is_empty() {
+        return Err("Username is required.");
+    }
+    if trimmed_user.len() > 64 {
+        return Err("Username must not exceed 64 characters.");
+    }
+    if !trimmed_user
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err("Username may only contain letters, numbers, '.', '_', or '-'.");
+    }
+    if password.len() < 8 {
+        return Err("Temporary password must contain at least 8 characters.");
+    }
+    Ok(())
 }

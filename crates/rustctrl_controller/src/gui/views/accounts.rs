@@ -18,6 +18,22 @@ fn action_icon_button(
     Button::new(id).ghost().small().icon(icon).tooltip(tooltip)
 }
 
+pub(crate) fn format_accounts_badge(total: usize, active: usize) -> String {
+    if total == 0 {
+        "0 accounts".to_string()
+    } else if total == 1 {
+        if active == 1 {
+            "1 active account".to_string()
+        } else {
+            "1 account (0 active)".to_string()
+        }
+    } else if active == total {
+        format!("{total} active accounts")
+    } else {
+        format!("{total} accounts ({active} active)")
+    }
+}
+
 impl ControllerApp {
     pub(in crate::gui) fn render_accounts(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (accounts, is_admin) =
@@ -30,15 +46,12 @@ impl ControllerApp {
         let theme = self.theme;
         let app = cx.entity().clone();
         let total_accounts = accounts.len();
+        let active_accounts = accounts.iter().filter(|a| a.active).count();
 
         let app_refresh = app.clone();
         let app_create = app.clone();
 
-        let count_text = if total_accounts == 1 {
-            "1 account".to_string()
-        } else {
-            format!("{total_accounts} accounts")
-        };
+        let count_text = format_accounts_badge(total_accounts, active_accounts);
 
         let mut title_bar = div().flex().justify_between().items_center().child(
             div()

@@ -800,22 +800,13 @@ fn modernized_staff_accounts_view_and_role_actions() {
     let deactivated = &accounts[2];
     assert!(!deactivated.active); // Action button excluded for deactivated
 
-    // Account count badge text
-    let single_count = 1;
-    let single_text = if single_count == 1 {
-        "1 account".to_string()
-    } else {
-        format!("{single_count} accounts")
-    };
-    assert_eq!(single_text, "1 account");
-
-    let total_count = accounts.len();
-    let count_text = if total_count == 1 {
-        "1 account".to_string()
-    } else {
-        format!("{total_count} accounts")
-    };
-    assert_eq!(count_text, "3 accounts");
+    // Account count badge text with active accounts
+    use crate::gui::views::accounts::format_accounts_badge;
+    assert_eq!(format_accounts_badge(0, 0), "0 accounts");
+    assert_eq!(format_accounts_badge(1, 1), "1 active account");
+    assert_eq!(format_accounts_badge(1, 0), "1 account (0 active)");
+    assert_eq!(format_accounts_badge(3, 3), "3 active accounts");
+    assert_eq!(format_accounts_badge(3, 2), "3 accounts (2 active)");
 }
 
 #[test]
@@ -1116,4 +1107,85 @@ fn create_staff_account_overlay_state_and_success_transition() {
     } else {
         panic!("expected CreateStaffAccount overlay");
     }
+}
+
+#[test]
+fn create_staff_account_input_validation_rules() {
+    use crate::gui::overlays::create_account::validate_staff_account_inputs;
+
+    // Empty or whitespace-only username
+    assert_eq!(
+        validate_staff_account_inputs("", "ValidPass123!"),
+        Err("Username is required.")
+    );
+    assert_eq!(
+        validate_staff_account_inputs("   ", "ValidPass123!"),
+        Err("Username is required.")
+    );
+
+    // Username exceeding 64 characters
+    let long_user = "a".repeat(65);
+    assert_eq!(
+        validate_staff_account_inputs(&long_user, "ValidPass123!"),
+        Err("Username must not exceed 64 characters.")
+    );
+    let exact_64_user = "a".repeat(64);
+    assert!(validate_staff_account_inputs(&exact_64_user, "ValidPass123!").is_ok());
+
+    // Illegal characters
+    assert_eq!(
+        validate_staff_account_inputs("user name", "ValidPass123!"),
+        Err("Username may only contain letters, numbers, '.', '_', or '-'.")
+    );
+    assert_eq!(
+        validate_staff_account_inputs("user@admin", "ValidPass123!"),
+        Err("Username may only contain letters, numbers, '.', '_', or '-'.")
+    );
+    assert_eq!(
+        validate_staff_account_inputs("admin!", "ValidPass123!"),
+        Err("Username may only contain letters, numbers, '.', '_', or '-'.")
+    );
+
+    // Valid characters
+    assert!(validate_staff_account_inputs("sarah", "ValidPass123!").is_ok());
+    assert!(validate_staff_account_inputs("john.doe", "ValidPass123!").is_ok());
+    assert!(validate_staff_account_inputs("admin-01", "ValidPass123!").is_ok());
+    assert!(validate_staff_account_inputs("ops_user_2", "ValidPass123!").is_ok());
+
+    // Password length validation
+    assert_eq!(
+        validate_staff_account_inputs("valid_user", "short"),
+        Err("Temporary password must contain at least 8 characters.")
+    );
+    assert_eq!(
+        validate_staff_account_inputs("valid_user", "1234567"),
+        Err("Temporary password must contain at least 8 characters.")
+    );
+    assert!(validate_staff_account_inputs("valid_user", "12345678").is_ok());
+}
+
+#[test]
+fn temporary_password_generator_properties() {
+    const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$-_";
+
+    let mut generated_set = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let pass = rustctrl_core::generate_temporary_password();
+        assert_eq!(
+            pass.len(),
+            16,
+            "generated password must be exactly 16 chars"
+        );
+        assert!(
+            pass.bytes().all(|b| CHARSET.contains(&b)),
+            "generated password contains illegal characters: {pass}"
+        );
+        generated_set.insert(pass);
+    }
+    // With 16 characters from a 62-char alphabet, all 50 samples should be distinct
+    assert_eq!(
+        generated_set.len(),
+        50,
+        "all generated passwords should be unique"
+    );
 }

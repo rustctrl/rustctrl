@@ -597,27 +597,6 @@ impl ControllerApp {
                         username.trim().to_string()
                     };
 
-                if current_user.is_empty() {
-                    *error = Some("Username is required.".into());
-                    cx.notify();
-                    return;
-                }
-                if current_user.len() > 64 {
-                    *error = Some("Username must not exceed 64 characters.".into());
-                    cx.notify();
-                    return;
-                }
-                if !current_user
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-                {
-                    *error = Some(
-                        "Username may only contain letters, numbers, '.', '_', or '-'.".into(),
-                    );
-                    cx.notify();
-                    return;
-                }
-
                 let current_pass = if let Some(ModalInputs::CreateStaffAccount {
                     temporary_password: p,
                     ..
@@ -628,8 +607,13 @@ impl ControllerApp {
                     temporary_password.clone()
                 };
 
-                if current_pass.len() < 8 {
-                    *error = Some("Temporary password must contain at least 8 characters.".into());
+                if let Err(err_msg) =
+                    crate::gui::overlays::create_account::validate_staff_account_inputs(
+                        &current_user,
+                        &current_pass,
+                    )
+                {
+                    *error = Some(err_msg.into());
                     cx.notify();
                     return;
                 }
