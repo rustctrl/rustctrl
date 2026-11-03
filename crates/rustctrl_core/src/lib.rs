@@ -821,42 +821,6 @@ pub fn read_config<T: DeserializeOwned>(path: &Path) -> Result<T> {
     toml::from_str(&body).with_context(|| format!("parse configuration {}", path.display()))
 }
 
-/// Fills `dest` with cryptographically secure random bytes from the operating system.
-#[cfg(unix)]
-fn fill_os_random(dest: &mut [u8]) -> std::io::Result<()> {
-    use std::io::Read;
-    let mut file = std::fs::File::open("/dev/urandom")?;
-    file.read_exact(dest)
-}
-
-#[cfg(windows)]
-fn fill_os_random(dest: &mut [u8]) -> std::io::Result<()> {
-    #[link(name = "bcrypt")]
-    extern "system" {
-        fn BCryptGenRandom(
-            h_algorithm: *mut std::ffi::c_void,
-            pb_buffer: *mut u8,
-            cb_buffer: u32,
-            dw_flags: u32,
-        ) -> i32;
-    }
-    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002;
-    // SAFETY: BCryptGenRandom is called with valid buffer pointer and length.
-    let status = unsafe {
-        BCryptGenRandom(
-            std::ptr::null_mut(),
-            dest.as_mut_ptr(),
-            dest.len() as u32,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
 /// Generates a cryptographically strong, random temporary password for staff account provisioning.
 ///
 /// Produces a 16-character credential sampled uniformly (without modulo bias) from a 62-character
@@ -869,23 +833,18 @@ pub fn generate_temporary_password() -> String {
     const REJECTION_THRESHOLD: u8 = ((256 / CHARSET_LEN) * CHARSET_LEN) as u8; // 248
 
     let mut result = String::with_capacity(16);
-    let mut random_pool = [0u8; 64];
 
     while result.len() < 16 {
-        if fill_os_random(&mut random_pool).is_err() {
-            // Fallback: blend system time and UUIDv4 random entropy
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            for (idx, slot) in random_pool.iter_mut().enumerate() {
-                let uuid_sample = uuid::Uuid::new_v4();
-                let seed_byte = seed.wrapping_shr((idx % 8) as u32 * 8) as u8;
-                *slot = uuid_sample.as_bytes()[idx % 16] ^ seed_byte;
-            }
-        }
+        let u = uuid::Uuid::new_v4();
+        let bytes = u.as_bytes();
+        // UUIDv4 bytes 0..=5, 7, and 9..=15 (14 bytes total) are unconstrained cryptographically
+        // secure random bytes provided by the OS CSPRNG (bytes 6 and 8 contain version/variant bits).
+        let unbiased_random_bytes = [
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[7], bytes[9],
+            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ];
 
-        for &byte in &random_pool {
+        for byte in unbiased_random_bytes {
             if byte < REJECTION_THRESHOLD {
                 let charset_index = (byte as usize) % CHARSET_LEN;
                 result.push(CHARSET[charset_index] as char);
