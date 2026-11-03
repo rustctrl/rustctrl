@@ -1,39 +1,77 @@
 use super::super::*;
 use gpui::assets::IconName;
 use gpui::base::StyledExt as _;
-use gpui::component::Icon;
 use gpui::component::button::{Button, ButtonVariants as _};
+use gpui::component::input::Input;
+use gpui::component::{Disableable as _, Icon};
 use gpui::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div, px, rgb,
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, Window, div,
+    px, rgb,
 };
 
 impl ControllerApp {
+    pub(in crate::gui) fn ensure_new_account_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.new_account_username_input.is_none() {
+            let user_input = cx.new(|cx| {
+                gpui::component::input::InputState::new(window, cx).placeholder("Enter username...")
+            });
+            cx.subscribe(
+                &user_input,
+                |this: &mut ControllerApp,
+                 _input,
+                 event: &gpui::component::input::InputEvent,
+                 cx| {
+                    if matches!(event, gpui::component::input::InputEvent::PressEnter { .. }) {
+                        this.submit_create_account(cx);
+                    }
+                },
+            )
+            .detach();
+            self.new_account_username_input = Some(user_input);
+        }
+
+        if self.new_account_password_input.is_none() {
+            let pass_input = cx.new(|cx| {
+                gpui::component::input::InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder("Enter temporary password (min 12 chars)...")
+            });
+            cx.subscribe(
+                &pass_input,
+                |this: &mut ControllerApp,
+                 _input,
+                 event: &gpui::component::input::InputEvent,
+                 cx| {
+                    if matches!(event, gpui::component::input::InputEvent::PressEnter { .. }) {
+                        this.submit_create_account(cx);
+                    }
+                },
+            )
+            .detach();
+            self.new_account_password_input = Some(pass_input);
+        }
+    }
+
     pub(in crate::gui) fn render_accounts(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (accounts, new_account_username, new_account_role, new_account_password, _in_flight) =
-            if let ScreenState::Connected {
-                accounts,
-                new_account_username,
-                new_account_role,
-                new_account_password,
-                in_flight,
-                ..
-            } = &self.state
-            {
-                (
-                    accounts.clone(),
-                    new_account_username.clone(),
-                    new_account_role.clone(),
-                    new_account_password.clone(),
-                    *in_flight,
-                )
-            } else {
-                return div().into_any_element();
-            };
+        let (accounts, new_account_role, in_flight) = if let ScreenState::Connected {
+            accounts,
+            new_account_role,
+            in_flight,
+            ..
+        } = &self.state
+        {
+            (accounts.clone(), new_account_role.clone(), *in_flight)
+        } else {
+            return div().into_any_element();
+        };
 
         let theme = self.theme;
-        let user_active = self.active_field == ActiveField::NewAccountUsername;
-        let pass_active = self.active_field == ActiveField::NewAccountPassword;
-        let masked_new_pass = "•".repeat(new_account_password.len());
+        let username_input = self.new_account_username_input.as_ref();
+        let password_input = self.new_account_password_input.as_ref();
 
         let mut accounts_list = div().flex().flex_col().gap_3().child(
             div()
@@ -102,17 +140,19 @@ impl ControllerApp {
             for (ix, acc) in accounts.iter().enumerate() {
                 let acc_username = acc.username.clone();
                 let is_target_admin = acc.role == "admin";
-                let new_target_role = if is_target_admin { "operator" } else { "admin" };
                 let btn_label = if is_target_admin {
                     "Demote to Operator"
                 } else {
                     "Promote to Admin"
                 };
-
-                let target_user_clone = acc_username.clone();
-                let reset_target_clone = acc_username.clone();
-                let deactivate_target_clone = acc_username.clone();
-                let new_target_role_str = new_target_role.to_string();
+                let new_target_role_str = if is_target_admin {
+                    "operator".to_string()
+                } else {
+                    "admin".to_string()
+                };
+                let target_user_clone = acc.username.clone();
+                let reset_target_clone = acc.username.clone();
+                let deactivate_target_clone = acc.username.clone();
 
                 let status_badge = if !acc.active {
                     div()
@@ -143,7 +183,7 @@ impl ControllerApp {
                             div()
                                 .text_sm()
                                 .text_color(rgb(theme.status_reconnecting))
-                                .child("Temporary Password"),
+                                .child("Must Change Pass"),
                         )
                 } else {
                     div()
@@ -291,33 +331,7 @@ impl ControllerApp {
                             .text_color(rgb(theme.text_muted))
                             .child("NEW USERNAME"),
                     )
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(theme.bg_app))
-                            .border_1()
-                            .border_color(rgb(if user_active {
-                                theme.border_focus
-                            } else {
-                                theme.border_subtle
-                            }))
-                            .rounded_md()
-                            .id("new-account-username-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::NewAccountUsername;
-                                cx.notify();
-                            }))
-                            .child(if new_account_username.is_empty() {
-                                div()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Enter username...")
-                            } else {
-                                div()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(new_account_username.clone())
-                            }),
-                    ),
+                    .children(username_input.map(Input::new)),
             )
             .child(
                 div()
@@ -387,39 +401,19 @@ impl ControllerApp {
                             .text_color(rgb(theme.text_muted))
                             .child("TEMPORARY PASSWORD"),
                     )
-                    .child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .bg(rgb(theme.bg_app))
-                            .border_1()
-                            .border_color(rgb(if pass_active {
-                                theme.border_focus
-                            } else {
-                                theme.border_subtle
-                            }))
-                            .rounded_md()
-                            .id("new-account-password-input")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::NewAccountPassword;
-                                cx.notify();
-                            }))
-                            .child(if new_account_password.is_empty() {
-                                div()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Enter temporary password (min 12 chars)...")
-                            } else {
-                                div()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(masked_new_pass)
-                            }),
-                    ),
+                    .children(password_input.map(Input::new)),
             )
             .child(
                 div().pt_2().child(
                     Button::new("submit-create-account-btn")
                         .primary()
-                        .label("Create Staff Account")
+                        .loading(in_flight)
+                        .disabled(in_flight)
+                        .label(if in_flight {
+                            "Creating..."
+                        } else {
+                            "Create Staff Account"
+                        })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.submit_create_account(cx);
                         })),

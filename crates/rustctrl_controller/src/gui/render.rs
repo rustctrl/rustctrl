@@ -1,432 +1,481 @@
-use super::helpers::resolve_typed_text;
 use super::overlays;
 use super::state::*;
+use gpui::base::StyledExt as _;
 use gpui::{
     Context, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render,
     Styled as _, Window, div, prelude::*, rgb,
 };
 
 impl ControllerApp {
-    fn render_overlay_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(in crate::gui) fn ensure_modal_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_inputs.is_some() {
+            return;
+        }
+
+        use gpui::component::input::{InputEvent, InputState};
+
         match &self.overlay {
             Overlay::ChangePassword {
                 current_password,
                 new_password,
                 confirm_password,
-                error,
-                in_flight,
-            } => overlays::change_password::render_change_password_dialog(
-                current_password,
-                new_password,
-                confirm_password,
-                error.as_ref(),
-                *in_flight,
-                self.active_field,
-                &self.theme,
-                cx,
-            ),
-            Overlay::ResetPassword {
-                target_username,
-                temporary_password,
-                confirm_password,
-                error,
-                in_flight,
-            } => overlays::reset_password::render_reset_password_dialog(
-                target_username,
-                temporary_password,
-                confirm_password,
-                error.as_ref(),
-                *in_flight,
-                self.active_field,
-                &self.theme,
-                cx,
-            ),
-            Overlay::EditDevice {
-                device_id,
-                display_name,
-                location,
-                error,
-                in_flight,
                 ..
-            } => overlays::target_management::render_edit_device_dialog(
-                device_id,
+            } => {
+                let cur = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .placeholder("Enter current password...")
+                        .default_value(current_password.clone())
+                });
+                let new = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .placeholder("Minimum 8 characters...")
+                        .default_value(new_password.clone())
+                });
+                let conf = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .placeholder("Re-enter new password...")
+                        .default_value(confirm_password.clone())
+                });
+
+                cx.subscribe(
+                    &cur,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_change_password(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &new,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_change_password(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &conf,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_change_password(cx);
+                        }
+                    },
+                )
+                .detach();
+
+                self.modal_inputs = Some(ModalInputs::ChangePassword {
+                    current_password: cur,
+                    new_password: new,
+                    confirm_password: conf,
+                });
+            }
+            Overlay::ResetPassword {
+                temporary_password,
+                confirm_password,
+                ..
+            } => {
+                let temp = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .placeholder("Minimum 8 characters...")
+                        .default_value(temporary_password.clone())
+                });
+                let conf = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .placeholder("Re-enter temporary password...")
+                        .default_value(confirm_password.clone())
+                });
+
+                cx.subscribe(
+                    &temp,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_reset_password(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &conf,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_reset_password(cx);
+                        }
+                    },
+                )
+                .detach();
+
+                self.modal_inputs = Some(ModalInputs::ResetPassword {
+                    temporary_password: temp,
+                    confirm_password: conf,
+                });
+            }
+            Overlay::EditDevice {
                 display_name,
                 location,
-                error.as_ref(),
-                *in_flight,
-                self.active_field,
-                &self.theme,
-                cx,
-            ),
+                ..
+            } => {
+                let name = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("Friendly name...")
+                        .default_value(display_name.clone())
+                });
+                let loc = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("e.g. Building B Floor 3")
+                        .default_value(location.clone())
+                });
+
+                cx.subscribe(
+                    &name,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_edit_device(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &loc,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_edit_device(cx);
+                        }
+                    },
+                )
+                .detach();
+
+                self.modal_inputs = Some(ModalInputs::EditDevice {
+                    display_name: name,
+                    location: loc,
+                });
+            }
             Overlay::AddTarget {
                 display_name,
                 address,
                 location,
-                error,
-                in_flight,
                 ..
-            } => overlays::target_management::render_add_target_dialog(
-                display_name,
-                address,
-                location,
-                error.as_ref(),
-                *in_flight,
-                self.active_field,
-                &self.theme,
-                cx,
-            ),
+            } => {
+                let name = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("e.g. Conference Room TV")
+                        .default_value(display_name.clone())
+                });
+                let addr = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("192.168.1.50:5555")
+                        .default_value(address.clone())
+                });
+                let loc = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("Building A, 2nd Floor")
+                        .default_value(location.clone())
+                });
+
+                cx.subscribe(
+                    &name,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_add_target(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &addr,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_add_target(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &loc,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_add_target(cx);
+                        }
+                    },
+                )
+                .detach();
+
+                self.modal_inputs = Some(ModalInputs::AddTarget {
+                    display_name: name,
+                    address: addr,
+                    location: loc,
+                });
+            }
             Overlay::EditTarget {
-                target_id,
                 display_name,
                 address,
                 location,
-                error,
-                in_flight,
                 ..
-            } => overlays::target_management::render_edit_target_dialog(
-                target_id,
-                display_name,
-                address,
-                location,
-                error.as_ref(),
-                *in_flight,
-                self.active_field,
-                &self.theme,
-                cx,
-            ),
+            } => {
+                let name = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("e.g. Conference Room TV")
+                        .default_value(display_name.clone())
+                });
+                let addr = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("192.168.1.50:5555")
+                        .default_value(address.clone())
+                });
+                let loc = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("Building A, 2nd Floor")
+                        .default_value(location.clone())
+                });
+
+                cx.subscribe(
+                    &name,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_edit_target(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &addr,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_edit_target(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &loc,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_edit_target(cx);
+                        }
+                    },
+                )
+                .detach();
+
+                self.modal_inputs = Some(ModalInputs::EditTarget {
+                    display_name: name,
+                    address: addr,
+                    location: loc,
+                });
+            }
             Overlay::ReplaceDevice {
                 prior_device_id,
                 replacement_device_id,
-                error,
-                in_flight,
                 ..
-            } => overlays::replace_device::render_replace_device_dialog(
-                prior_device_id,
-                replacement_device_id,
-                error.as_ref(),
-                *in_flight,
-                self.active_field,
-                &self.theme,
-                cx,
-            ),
+            } => {
+                let prior = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("ID of decommissioned device...")
+                        .default_value(prior_device_id.clone())
+                });
+                let repl = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("ID of new target device...")
+                        .default_value(replacement_device_id.clone())
+                });
+
+                cx.subscribe(
+                    &prior,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_replace_device(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &repl,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_replace_device(cx);
+                        }
+                    },
+                )
+                .detach();
+
+                self.modal_inputs = Some(ModalInputs::ReplaceDevice {
+                    prior_device_id: prior,
+                    replacement_device_id: repl,
+                });
+            }
             Overlay::PrepareInstallationArtifact {
                 output_path,
                 agent_binary_path,
-                error,
-                in_flight,
-                success,
                 ..
-            } => overlays::prepare_artifact::render_prepare_artifact_dialog(
-                output_path,
-                agent_binary_path,
-                error.as_ref(),
-                success.as_ref(),
-                *in_flight,
-                self.active_field,
-                &self.theme,
-                cx,
-            ),
-            Overlay::None => div().into_any_element(),
+            } => {
+                let out = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("/path/to/rustctrl-agent-bundle.zip")
+                        .default_value(output_path.clone())
+                });
+                let bin = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("Optional path to custom agent executable...")
+                        .default_value(agent_binary_path.clone())
+                });
+
+                cx.subscribe(
+                    &out,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_prepare_installation_artifact(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &bin,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_prepare_installation_artifact(cx);
+                        }
+                    },
+                )
+                .detach();
+
+                self.modal_inputs = Some(ModalInputs::PrepareArtifact {
+                    output_path: out,
+                    agent_binary_path: bin,
+                });
+            }
+            Overlay::None => {}
         }
     }
 
-    fn handle_overlay_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let key = &event.keystroke.key;
-        let in_flight = match &self.overlay {
-            Overlay::ChangePassword { in_flight, .. }
-            | Overlay::ResetPassword { in_flight, .. }
-            | Overlay::EditDevice { in_flight, .. }
-            | Overlay::AddTarget { in_flight, .. }
-            | Overlay::EditTarget { in_flight, .. }
-            | Overlay::ReplaceDevice { in_flight, .. }
-            | Overlay::PrepareInstallationArtifact { in_flight, .. } => *in_flight,
-            Overlay::None => false,
-        };
-        if in_flight {
-            return;
-        }
-        match key.as_str() {
-            "escape" => {
-                self.close_overlay(cx);
-            }
-            "enter" => match &self.overlay {
-                Overlay::ChangePassword { .. } => self.submit_change_password(cx),
-                Overlay::ResetPassword { .. } => self.submit_reset_password(cx),
-                Overlay::EditDevice { .. } => self.submit_edit_device(cx),
-                Overlay::AddTarget { .. } => self.submit_add_target(cx),
-                Overlay::EditTarget { .. } => self.submit_edit_target(cx),
-                Overlay::ReplaceDevice { .. } => self.submit_replace_device(cx),
-                Overlay::PrepareInstallationArtifact { .. } => {
-                    self.submit_prepare_installation_artifact(cx)
-                }
-                Overlay::None => {}
-            },
-            "tab" => {
-                self.active_field = match &self.overlay {
-                    Overlay::ChangePassword { .. } => match self.active_field {
-                        ActiveField::CurrentPassword => ActiveField::NewPassword,
-                        ActiveField::NewPassword => ActiveField::ConfirmPassword,
-                        _ => ActiveField::CurrentPassword,
-                    },
-                    Overlay::ResetPassword { .. } => match self.active_field {
-                        ActiveField::TemporaryPassword => ActiveField::ConfirmPassword,
-                        _ => ActiveField::TemporaryPassword,
-                    },
-                    Overlay::EditDevice { .. } => match self.active_field {
-                        ActiveField::EditDeviceDisplayName => ActiveField::EditDeviceLocation,
-                        _ => ActiveField::EditDeviceDisplayName,
-                    },
-                    Overlay::AddTarget { .. } => match self.active_field {
-                        ActiveField::AddTargetDisplayName => ActiveField::AddTargetAddress,
-                        ActiveField::AddTargetAddress => ActiveField::AddTargetLocation,
-                        _ => ActiveField::AddTargetDisplayName,
-                    },
-                    Overlay::EditTarget { .. } => match self.active_field {
-                        ActiveField::EditTargetDisplayName => ActiveField::EditTargetAddress,
-                        ActiveField::EditTargetAddress => ActiveField::EditTargetLocation,
-                        _ => ActiveField::EditTargetDisplayName,
-                    },
-                    Overlay::ReplaceDevice { .. } => match self.active_field {
-                        ActiveField::ReplaceDevicePriorId => {
-                            ActiveField::ReplaceDeviceReplacementId
-                        }
-                        _ => ActiveField::ReplaceDevicePriorId,
-                    },
-                    Overlay::PrepareInstallationArtifact { .. } => match self.active_field {
-                        ActiveField::PrepareArtifactOutputPath => {
-                            ActiveField::PreparePackageAgentBinary
-                        }
-                        _ => ActiveField::PrepareArtifactOutputPath,
-                    },
-                    Overlay::None => self.active_field,
-                };
-                cx.notify();
-            }
-            "backspace" => {
-                match (&mut self.overlay, self.active_field) {
-                    (
+    pub(in crate::gui) fn sync_modal_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui::component::WindowExt as _;
+        let has_active_dialog = window.has_active_dialog(cx);
+
+        if !matches!(self.overlay, Overlay::None) {
+            self.ensure_modal_inputs(window, cx);
+            if !has_active_dialog {
+                let app = cx.entity().clone();
+                window.open_dialog(cx, move |dialog, _window, cx| {
+                    let (overlay, modal_inputs, theme) = {
+                        let app_ref = app.read(cx);
+                        (
+                            app_ref.overlay.clone(),
+                            app_ref.modal_inputs.clone(),
+                            app_ref.theme,
+                        )
+                    };
+
+                    let Some(inputs) = modal_inputs else {
+                        return dialog;
+                    };
+
+                    match overlay {
                         Overlay::ChangePassword {
-                            current_password, ..
-                        },
-                        ActiveField::CurrentPassword,
-                    ) => {
-                        current_password.pop();
-                    }
-                    (Overlay::ChangePassword { new_password, .. }, ActiveField::NewPassword) => {
-                        new_password.pop();
-                    }
-                    (
-                        Overlay::ChangePassword {
-                            confirm_password, ..
-                        },
-                        ActiveField::ConfirmPassword,
-                    ) => {
-                        confirm_password.pop();
-                    }
-                    (
+                            error, in_flight, ..
+                        } => overlays::change_password::render_change_password_dialog(
+                            &inputs,
+                            error.as_ref(),
+                            in_flight,
+                            &theme,
+                            app.clone(),
+                            cx,
+                        ),
                         Overlay::ResetPassword {
-                            temporary_password, ..
-                        },
-                        ActiveField::TemporaryPassword,
-                    ) => {
-                        temporary_password.pop();
-                    }
-                    (
-                        Overlay::ResetPassword {
-                            confirm_password, ..
-                        },
-                        ActiveField::ConfirmPassword,
-                    ) => {
-                        confirm_password.pop();
-                    }
-                    (
-                        Overlay::EditDevice { display_name, .. },
-                        ActiveField::EditDeviceDisplayName,
-                    ) => {
-                        display_name.pop();
-                    }
-                    (Overlay::EditDevice { location, .. }, ActiveField::EditDeviceLocation) => {
-                        location.pop();
-                    }
-                    (
-                        Overlay::AddTarget { display_name, .. },
-                        ActiveField::AddTargetDisplayName,
-                    ) => {
-                        display_name.pop();
-                    }
-                    (Overlay::AddTarget { address, .. }, ActiveField::AddTargetAddress) => {
-                        address.pop();
-                    }
-                    (Overlay::AddTarget { location, .. }, ActiveField::AddTargetLocation) => {
-                        location.pop();
-                    }
-                    (
-                        Overlay::EditTarget { display_name, .. },
-                        ActiveField::EditTargetDisplayName,
-                    ) => {
-                        display_name.pop();
-                    }
-                    (Overlay::EditTarget { address, .. }, ActiveField::EditTargetAddress) => {
-                        address.pop();
-                    }
-                    (Overlay::EditTarget { location, .. }, ActiveField::EditTargetLocation) => {
-                        location.pop();
-                    }
-                    (
-                        Overlay::ReplaceDevice {
-                            prior_device_id, ..
-                        },
-                        ActiveField::ReplaceDevicePriorId,
-                    ) => {
-                        prior_device_id.pop();
-                    }
-                    (
-                        Overlay::ReplaceDevice {
-                            replacement_device_id,
+                            target_username,
+                            error,
+                            in_flight,
                             ..
-                        },
-                        ActiveField::ReplaceDeviceReplacementId,
-                    ) => {
-                        replacement_device_id.pop();
-                    }
-                    (
-                        Overlay::PrepareInstallationArtifact { output_path, .. },
-                        ActiveField::PrepareArtifactOutputPath,
-                    ) => {
-                        output_path.pop();
-                    }
-                    (
+                        } => overlays::reset_password::render_reset_password_dialog(
+                            &target_username,
+                            &inputs,
+                            error.as_ref(),
+                            in_flight,
+                            &theme,
+                            app.clone(),
+                            cx,
+                        ),
+                        Overlay::EditDevice {
+                            device_id,
+                            error,
+                            in_flight,
+                            ..
+                        } => overlays::target_management::render_edit_device_dialog(
+                            &device_id,
+                            &inputs,
+                            error.as_ref(),
+                            in_flight,
+                            &theme,
+                            app.clone(),
+                            cx,
+                        ),
+                        Overlay::AddTarget {
+                            error, in_flight, ..
+                        } => overlays::target_management::render_add_target_dialog(
+                            &inputs,
+                            error.as_ref(),
+                            in_flight,
+                            &theme,
+                            app.clone(),
+                            cx,
+                        ),
+                        Overlay::EditTarget {
+                            target_id,
+                            error,
+                            in_flight,
+                            ..
+                        } => overlays::target_management::render_edit_target_dialog(
+                            &target_id,
+                            &inputs,
+                            error.as_ref(),
+                            in_flight,
+                            &theme,
+                            app.clone(),
+                            cx,
+                        ),
+                        Overlay::ReplaceDevice {
+                            error, in_flight, ..
+                        } => overlays::replace_device::render_replace_device_dialog(
+                            &inputs,
+                            error.as_ref(),
+                            in_flight,
+                            &theme,
+                            app.clone(),
+                            cx,
+                        ),
                         Overlay::PrepareInstallationArtifact {
-                            agent_binary_path, ..
-                        },
-                        ActiveField::PreparePackageAgentBinary,
-                    ) => {
-                        agent_binary_path.pop();
+                            error,
+                            success,
+                            in_flight,
+                            ..
+                        } => overlays::prepare_artifact::render_prepare_artifact_dialog(
+                            &inputs,
+                            error.as_ref(),
+                            success.as_ref(),
+                            in_flight,
+                            &theme,
+                            app.clone(),
+                            cx,
+                        ),
+                        Overlay::None => dialog,
                     }
-                    _ => {}
-                }
-                cx.notify();
+                });
             }
-            _ => {
-                if let Some(text) = resolve_typed_text(&event.keystroke) {
-                    match (&mut self.overlay, self.active_field) {
-                        (
-                            Overlay::ChangePassword {
-                                current_password, ..
-                            },
-                            ActiveField::CurrentPassword,
-                        ) => {
-                            current_password.push_str(text);
-                        }
-                        (
-                            Overlay::ChangePassword { new_password, .. },
-                            ActiveField::NewPassword,
-                        ) => {
-                            new_password.push_str(text);
-                        }
-                        (
-                            Overlay::ChangePassword {
-                                confirm_password, ..
-                            },
-                            ActiveField::ConfirmPassword,
-                        ) => {
-                            confirm_password.push_str(text);
-                        }
-                        (
-                            Overlay::ResetPassword {
-                                temporary_password, ..
-                            },
-                            ActiveField::TemporaryPassword,
-                        ) => {
-                            temporary_password.push_str(text);
-                        }
-                        (
-                            Overlay::ResetPassword {
-                                confirm_password, ..
-                            },
-                            ActiveField::ConfirmPassword,
-                        ) => {
-                            confirm_password.push_str(text);
-                        }
-                        (
-                            Overlay::EditDevice { display_name, .. },
-                            ActiveField::EditDeviceDisplayName,
-                        ) if display_name.len() + text.len() <= 128 => {
-                            display_name.push_str(text);
-                        }
-                        (Overlay::EditDevice { location, .. }, ActiveField::EditDeviceLocation)
-                            if location.len() + text.len() <= 128 =>
-                        {
-                            location.push_str(text);
-                        }
-                        (
-                            Overlay::AddTarget { display_name, .. },
-                            ActiveField::AddTargetDisplayName,
-                        ) if display_name.len() + text.len() <= 128 => {
-                            display_name.push_str(text);
-                        }
-                        (Overlay::AddTarget { address, .. }, ActiveField::AddTargetAddress)
-                            if address.len() + text.len() <= 128 =>
-                        {
-                            address.push_str(text);
-                        }
-                        (Overlay::AddTarget { location, .. }, ActiveField::AddTargetLocation)
-                            if location.len() + text.len() <= 128 =>
-                        {
-                            location.push_str(text);
-                        }
-                        (
-                            Overlay::EditTarget { display_name, .. },
-                            ActiveField::EditTargetDisplayName,
-                        ) if display_name.len() + text.len() <= 128 => {
-                            display_name.push_str(text);
-                        }
-                        (Overlay::EditTarget { address, .. }, ActiveField::EditTargetAddress)
-                            if address.len() + text.len() <= 128 =>
-                        {
-                            address.push_str(text);
-                        }
-                        (Overlay::EditTarget { location, .. }, ActiveField::EditTargetLocation)
-                            if location.len() + text.len() <= 128 =>
-                        {
-                            location.push_str(text);
-                        }
-                        (
-                            Overlay::ReplaceDevice {
-                                prior_device_id, ..
-                            },
-                            ActiveField::ReplaceDevicePriorId,
-                        ) if prior_device_id.len() + text.len() <= 64 => {
-                            prior_device_id.push_str(text);
-                        }
-                        (
-                            Overlay::ReplaceDevice {
-                                replacement_device_id,
-                                ..
-                            },
-                            ActiveField::ReplaceDeviceReplacementId,
-                        ) if replacement_device_id.len() + text.len() <= 64 => {
-                            replacement_device_id.push_str(text);
-                        }
-                        (
-                            Overlay::PrepareInstallationArtifact { output_path, .. },
-                            ActiveField::PrepareArtifactOutputPath,
-                        ) if output_path.len() + text.len() <= 256 => {
-                            output_path.push_str(text);
-                        }
-                        (
-                            Overlay::PrepareInstallationArtifact {
-                                agent_binary_path, ..
-                            },
-                            ActiveField::PreparePackageAgentBinary,
-                        ) if agent_binary_path.len() + text.len() <= 256 => {
-                            agent_binary_path.push_str(text);
-                        }
-                        _ => {}
-                    }
-                    cx.notify();
-                }
-            }
+        } else if has_active_dialog {
+            window.close_dialog(cx);
+            self.modal_inputs = None;
         }
     }
 
@@ -436,10 +485,6 @@ impl ControllerApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !matches!(self.overlay, Overlay::None) {
-            self.handle_overlay_key_down(event, cx);
-            return;
-        }
         let key = &event.keystroke.key;
         match &mut self.state {
             ScreenState::Login { in_flight, .. } => {
@@ -459,11 +504,7 @@ impl ControllerApp {
                 }
             }
             ScreenState::Connected {
-                new_account_username,
-                new_account_password,
-                in_flight,
-                role,
-                ..
+                in_flight, role, ..
             } => {
                 if *in_flight {
                     return;
@@ -480,54 +521,6 @@ impl ControllerApp {
                         && key == "escape"
                     {
                         self.ungrab_remote_keyboard(cx);
-                        return;
-                    }
-                }
-                if role != "admin"
-                    || self.navigation.active(role) != crate::navigation::Route::Accounts
-                    || !matches!(
-                        self.active_field,
-                        ActiveField::NewAccountUsername | ActiveField::NewAccountPassword
-                    )
-                {
-                    return;
-                }
-                match key.as_str() {
-                    "enter" => {
-                        self.submit_create_account(cx);
-                    }
-                    "tab" => {
-                        self.active_field = match self.active_field {
-                            ActiveField::NewAccountUsername => ActiveField::NewAccountPassword,
-                            _ => ActiveField::NewAccountUsername,
-                        };
-                        cx.notify();
-                    }
-                    "backspace" => {
-                        match self.active_field {
-                            ActiveField::NewAccountUsername => {
-                                new_account_username.pop();
-                            }
-                            ActiveField::NewAccountPassword => {
-                                new_account_password.pop();
-                            }
-                            _ => {}
-                        }
-                        cx.notify();
-                    }
-                    _ => {
-                        if let Some(text) = resolve_typed_text(&event.keystroke) {
-                            match self.active_field {
-                                ActiveField::NewAccountUsername => {
-                                    new_account_username.push_str(text);
-                                }
-                                ActiveField::NewAccountPassword => {
-                                    new_account_password.push_str(text);
-                                }
-                                _ => {}
-                            }
-                            cx.notify();
-                        }
                     }
                 }
             }
@@ -559,6 +552,7 @@ impl Render for ControllerApp {
         if matches!(self.state, ScreenState::Connected { .. }) {
             self.ensure_fleet_table(window, cx);
             self.ensure_fleet_search_input(window, cx);
+            self.ensure_new_account_inputs(window, cx);
         } else {
             use gpui::component::WindowExt as _;
             if window.has_active_sheet(cx) {
@@ -566,6 +560,8 @@ impl Render for ControllerApp {
                 self.fleet_state.close_inspector();
             }
         }
+
+        self.sync_modal_dialog(window, cx);
 
         let main_view: gpui::AnyElement = match &self.state {
             ScreenState::Login { .. } => self.render_login(container.p_8(), cx).into_any_element(),
@@ -607,9 +603,6 @@ impl Render for ControllerApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let ScreenState::Connected { role, .. } = &this.state {
                                     this.navigation.select(route, role);
-                                    if matches!(this.overlay, Overlay::None) {
-                                        this.active_field = ActiveField::Username;
-                                    }
                                     cx.notify();
                                 }
                             })),
@@ -637,52 +630,85 @@ impl Render for ControllerApp {
                         ("Server unreachable", self.theme.status_blocked)
                     }
                 };
-                let header = div()
-                    .w_full()
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(rgb(self.theme.border_subtle))
-                    .bg(rgb(self.theme.bg_surface))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .items_center()
-                            .child(div().text_color(rgb(status_color)).child(status))
-                            .child(div().text_color(rgb(self.theme.text_muted)).child(format!(
-                                "Server {server_version} · {registered_devices} devices"
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .items_center()
-                            .child(username.clone())
-                            .child(
-                                div()
-                                    .px_2()
-                                    .rounded_md()
-                                    .bg(rgb(self.theme.bg_surface_hover))
-                                    .child(if is_admin { "Admin" } else { "Operator" }),
-                            )
-                            .child(
-                                Button::new("change-password-btn")
-                                    .label("Change Password")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.open_change_password(cx)),
-                                    ),
-                            )
-                            .child(
-                                Button::new("signout-btn")
-                                    .label("Sign Out")
-                                    .on_click(cx.listener(|this, _, _, cx| this.submit_logout(cx))),
-                            ),
-                    );
+                let header =
+                    div()
+                        .p_4()
+                        .bg(rgb(self.theme.bg_surface))
+                        .border_b_1()
+                        .border_color(rgb(self.theme.border_subtle))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .text_xl()
+                                        .font_bold()
+                                        .text_color(rgb(self.theme.accent_primary))
+                                        .child("RustCtrl"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(div().size_2().rounded_full().bg(rgb(status_color)))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(self.theme.text_muted))
+                                                .child(status),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(self.theme.text_muted))
+                                        .child(format!("Server {server_version}")),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(self.theme.text_muted))
+                                        .child(format!("{registered_devices} registered")),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(self.theme.text_primary))
+                                        .child(username.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_md()
+                                        .text_color(rgb(self.theme.text_muted))
+                                        .bg(rgb(self.theme.bg_surface_hover))
+                                        .child(if is_admin { "Admin" } else { "Operator" }),
+                                )
+                                .child(
+                                    Button::new("change-password-btn")
+                                        .label("Change Password")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_change_password(cx)
+                                        })),
+                                )
+                                .child(Button::new("signout-btn").label("Sign Out").on_click(
+                                    cx.listener(|this, _, _, cx| this.submit_logout(cx)),
+                                )),
+                        );
                 let mut content = div()
                     .id("connected-scroll")
                     .size_full()
@@ -759,12 +785,6 @@ impl Render for ControllerApp {
             }
         };
 
-        let mut root = div().relative().size_full().child(main_view);
-
-        if !matches!(self.overlay, Overlay::None) {
-            root = root.child(self.render_overlay_form(cx));
-        }
-
-        root
+        div().relative().size_full().child(main_view)
     }
 }

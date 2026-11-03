@@ -1,80 +1,103 @@
-use super::{
-    render_cancel_button, render_dialog_card, render_dialog_input, render_error_box,
-    render_submit_button,
-};
-use crate::gui::{ActiveField, ControllerApp};
+use super::{render_dialog_error, render_dialog_field};
+use crate::gui::ControllerApp;
+use crate::gui::state::ModalInputs;
 use crate::theme::Theme;
-use gpui::{AnyElement, Context, ParentElement as _, Styled as _, div, rgb};
+use gpui::component::Disableable as _;
+use gpui::component::alert::Alert;
+use gpui::component::button::{Button, ButtonVariants as _};
+use gpui::component::dialog::{
+    Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+};
+use gpui::component::input::Input;
+use gpui::{App, Entity, ParentElement as _, Styled as _, px};
 
 pub(crate) fn render_replace_device_dialog(
-    prior_device_id: &str,
-    replacement_device_id: &str,
+    inputs: &ModalInputs,
     error: Option<&String>,
     in_flight: bool,
-    active_field: ActiveField,
     theme: &Theme,
-    cx: &mut Context<ControllerApp>,
-) -> AnyElement {
-    let warning = div()
-        .p_2()
-        .bg(gpui::rgba(0xe0af6822))
-        .border_1()
-        .border_color(rgb(theme.status_reconnecting))
-        .rounded_md()
-        .text_xs()
-        .text_color(rgb(theme.status_reconnecting))
-        .child("Replacing a device identity rebinds credentials and invalidates the previous endpoint certificate.");
+    app: Entity<ControllerApp>,
+    cx: &mut App,
+) -> Dialog {
+    let ModalInputs::ReplaceDevice {
+        prior_device_id,
+        replacement_device_id,
+    } = inputs
+    else {
+        return Dialog::new(cx);
+    };
 
-    let content = div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(warning)
-        .child(render_dialog_input(
-            "rd-prior-input",
-            "Prior Device ID",
-            prior_device_id,
-            "ID of decommissioned device...",
-            false,
-            active_field == ActiveField::ReplaceDevicePriorId,
-            ActiveField::ReplaceDevicePriorId,
-            theme,
-            cx,
-        ))
-        .child(render_dialog_input(
-            "rd-replacement-input",
-            "Replacement Device ID",
-            replacement_device_id,
-            "ID of new target device...",
-            false,
-            active_field == ActiveField::ReplaceDeviceReplacementId,
-            ActiveField::ReplaceDeviceReplacementId,
-            theme,
-            cx,
-        ))
-        .children(render_error_box(error, theme));
+    let app_close = app.clone();
+    let app_cancel = app.clone();
+    let app_submit = app.clone();
 
-    let footer = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(render_cancel_button("rd-cancel-btn", in_flight, cx))
-        .child(render_submit_button(
-            "rd-submit-btn",
-            "Replace Identity",
-            "Replacing...",
-            in_flight,
-            |this, cx| this.submit_replace_device(cx),
-            cx,
-        ));
-
-    render_dialog_card(
-        "Replace Device Identity",
-        Some("Migrate device configuration and access credentials to a replacement endpoint."),
-        content,
-        footer,
-        in_flight,
-        theme,
-        cx,
-    )
+    Dialog::new(cx)
+        .w(px(480.0))
+        .centered()
+        .close_button(!in_flight)
+        .keyboard(!in_flight)
+        .overlay_closable(!in_flight)
+        .on_close(move |_, _, cx| {
+            app_close.update(cx, |this, cx| {
+                this.close_overlay(cx);
+            });
+        })
+        .child(
+            DialogHeader::new()
+                .child(DialogTitle::new().child("Replace Device Identity"))
+                .child(DialogDescription::new().child(
+                    "Migrate device configuration and access credentials to a replacement endpoint.",
+                )),
+        )
+        .child(
+            DialogContent::new()
+                .gap_3()
+                .child(Alert::warning(
+                    "rd-warning-alert",
+                    "Replacing a device identity rebinds credentials and invalidates the previous endpoint certificate.",
+                ))
+                .child(render_dialog_field(
+                    "Prior Device ID",
+                    Input::new(prior_device_id),
+                    theme,
+                ))
+                .child(render_dialog_field(
+                    "Replacement Device ID",
+                    Input::new(replacement_device_id),
+                    theme,
+                ))
+                .children(render_dialog_error("rd-error-alert", error)),
+        )
+        .footer(
+            DialogFooter::new()
+                .child(
+                    Button::new("rd-cancel-btn")
+                        .outline()
+                        .disabled(in_flight)
+                        .label("Cancel")
+                        .on_click(move |_, window, cx| {
+                            if !in_flight {
+                                use gpui::component::WindowExt as _;
+                                window.close_dialog(cx);
+                                app_cancel.update(cx, |this, cx| this.close_overlay(cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("rd-submit-btn")
+                        .primary()
+                        .loading(in_flight)
+                        .disabled(in_flight)
+                        .label(if in_flight {
+                            "Replacing..."
+                        } else {
+                            "Replace Identity"
+                        })
+                        .on_click(move |_, _, cx| {
+                            if !in_flight {
+                                app_submit.update(cx, |this, cx| this.submit_replace_device(cx));
+                            }
+                        }),
+                ),
+        )
 }

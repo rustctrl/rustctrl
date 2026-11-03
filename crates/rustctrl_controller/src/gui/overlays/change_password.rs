@@ -1,83 +1,105 @@
-#![allow(clippy::too_many_arguments)]
-
-use super::{
-    render_cancel_button, render_dialog_card, render_dialog_input, render_error_box,
-    render_submit_button,
-};
-use crate::gui::{ActiveField, ControllerApp};
+use super::{render_dialog_error, render_dialog_field};
+use crate::gui::ControllerApp;
+use crate::gui::state::ModalInputs;
 use crate::theme::Theme;
-use gpui::{AnyElement, Context, ParentElement as _, Styled as _, div};
+use gpui::component::Disableable as _;
+use gpui::component::button::{Button, ButtonVariants as _};
+use gpui::component::dialog::{
+    Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+};
+use gpui::component::input::Input;
+use gpui::{App, Entity, ParentElement as _, Styled as _, px};
 
 pub(crate) fn render_change_password_dialog(
-    current_password: &str,
-    new_password: &str,
-    confirm_password: &str,
+    inputs: &ModalInputs,
     error: Option<&String>,
     in_flight: bool,
-    active_field: ActiveField,
     theme: &Theme,
-    cx: &mut Context<ControllerApp>,
-) -> AnyElement {
-    let content = div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(render_dialog_input(
-            "cp-current-input",
-            "Current Password",
-            current_password,
-            "Enter current password...",
-            true,
-            active_field == ActiveField::CurrentPassword,
-            ActiveField::CurrentPassword,
-            theme,
-            cx,
-        ))
-        .child(render_dialog_input(
-            "cp-new-input",
-            "New Password",
-            new_password,
-            "Minimum 8 characters...",
-            true,
-            active_field == ActiveField::NewPassword,
-            ActiveField::NewPassword,
-            theme,
-            cx,
-        ))
-        .child(render_dialog_input(
-            "cp-confirm-input",
-            "Confirm New Password",
-            confirm_password,
-            "Re-enter new password...",
-            true,
-            active_field == ActiveField::ConfirmPassword,
-            ActiveField::ConfirmPassword,
-            theme,
-            cx,
-        ))
-        .children(render_error_box(error, theme));
+    app: Entity<ControllerApp>,
+    cx: &mut App,
+) -> Dialog {
+    let ModalInputs::ChangePassword {
+        current_password,
+        new_password,
+        confirm_password,
+    } = inputs
+    else {
+        return Dialog::new(cx);
+    };
 
-    let footer = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(render_cancel_button("cp-cancel-btn", in_flight, cx))
-        .child(render_submit_button(
-            "cp-submit-btn",
-            "Update Password",
-            "Updating...",
-            in_flight,
-            |this, cx| this.submit_change_password(cx),
-            cx,
-        ));
+    let app_close = app.clone();
+    let app_cancel = app.clone();
+    let app_submit = app.clone();
 
-    render_dialog_card(
-        "Change Password",
-        Some("Update your personal staff account credentials."),
-        content,
-        footer,
-        in_flight,
-        theme,
-        cx,
-    )
+    Dialog::new(cx)
+        .w(px(480.0))
+        .centered()
+        .close_button(!in_flight)
+        .keyboard(!in_flight)
+        .overlay_closable(!in_flight)
+        .on_close(move |_, _, cx| {
+            app_close.update(cx, |this, cx| {
+                this.close_overlay(cx);
+            });
+        })
+        .child(
+            DialogHeader::new()
+                .child(DialogTitle::new().child("Change Password"))
+                .child(
+                    DialogDescription::new()
+                        .child("Update your personal staff account credentials."),
+                ),
+        )
+        .child(
+            DialogContent::new()
+                .gap_3()
+                .child(render_dialog_field(
+                    "Current Password",
+                    Input::new(current_password),
+                    theme,
+                ))
+                .child(render_dialog_field(
+                    "New Password",
+                    Input::new(new_password),
+                    theme,
+                ))
+                .child(render_dialog_field(
+                    "Confirm New Password",
+                    Input::new(confirm_password),
+                    theme,
+                ))
+                .children(render_dialog_error("cp-error-alert", error)),
+        )
+        .footer(
+            DialogFooter::new()
+                .child(
+                    Button::new("cp-cancel-btn")
+                        .outline()
+                        .disabled(in_flight)
+                        .label("Cancel")
+                        .on_click(move |_, window, cx| {
+                            if !in_flight {
+                                use gpui::component::WindowExt as _;
+                                window.close_dialog(cx);
+                                app_cancel.update(cx, |this, cx| this.close_overlay(cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("cp-submit-btn")
+                        .primary()
+                        .loading(in_flight)
+                        .disabled(in_flight)
+                        .label(if in_flight {
+                            "Updating..."
+                        } else {
+                            "Update Password"
+                        })
+                        .on_click(move |_, _, cx| {
+                            if !in_flight {
+                                app_submit.update(cx, |this, cx| this.submit_change_password(cx));
+                            }
+                        }),
+                ),
+        )
 }

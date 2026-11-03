@@ -1,223 +1,286 @@
-#![allow(clippy::too_many_arguments)]
-
-use super::{
-    render_cancel_button, render_dialog_card, render_dialog_input, render_error_box,
-    render_submit_button,
-};
-use crate::gui::{ActiveField, ControllerApp};
+use super::{render_dialog_error, render_dialog_field};
+use crate::gui::ControllerApp;
+use crate::gui::state::ModalInputs;
 use crate::theme::Theme;
-use gpui::{AnyElement, Context, ParentElement as _, Styled as _, div};
+use gpui::component::Disableable as _;
+use gpui::component::button::{Button, ButtonVariants as _};
+use gpui::component::dialog::{
+    Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+};
+use gpui::component::input::Input;
+use gpui::{App, Entity, ParentElement as _, Styled as _, px};
 
 pub(crate) fn render_add_target_dialog(
-    display_name: &str,
-    address: &str,
-    location: &str,
+    inputs: &ModalInputs,
     error: Option<&String>,
     in_flight: bool,
-    active_field: ActiveField,
     theme: &Theme,
-    cx: &mut Context<ControllerApp>,
-) -> AnyElement {
-    let content = div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(render_dialog_input(
-            "at-name-input",
-            "Display Name",
-            display_name,
-            "e.g. Conference Room TV",
-            false,
-            active_field == ActiveField::AddTargetDisplayName,
-            ActiveField::AddTargetDisplayName,
-            theme,
-            cx,
-        ))
-        .child(render_dialog_input(
-            "at-address-input",
-            "Network Address (IP:Port)",
-            address,
-            "192.168.1.50:5555",
-            false,
-            active_field == ActiveField::AddTargetAddress,
-            ActiveField::AddTargetAddress,
-            theme,
-            cx,
-        ))
-        .child(render_dialog_input(
-            "at-location-input",
-            "Physical Location (Optional)",
-            location,
-            "Building A, 2nd Floor",
-            false,
-            active_field == ActiveField::AddTargetLocation,
-            ActiveField::AddTargetLocation,
-            theme,
-            cx,
-        ))
-        .children(render_error_box(error, theme));
+    app: Entity<ControllerApp>,
+    cx: &mut App,
+) -> Dialog {
+    let ModalInputs::AddTarget {
+        display_name,
+        address,
+        location,
+    } = inputs
+    else {
+        return Dialog::new(cx);
+    };
 
-    let footer = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(render_cancel_button("at-cancel-btn", in_flight, cx))
-        .child(render_submit_button(
-            "at-submit-btn",
-            "Add Target",
-            "Adding...",
-            in_flight,
-            |this, cx| this.submit_add_target(cx),
-            cx,
-        ));
+    let app_close = app.clone();
+    let app_cancel = app.clone();
+    let app_submit = app.clone();
 
-    render_dialog_card(
-        "Add Android TV Target",
-        Some("Configure a network endpoint target for remote control and media display."),
-        content,
-        footer,
-        in_flight,
-        theme,
-        cx,
-    )
+    Dialog::new(cx)
+        .w(px(480.0))
+        .centered()
+        .close_button(!in_flight)
+        .keyboard(!in_flight)
+        .overlay_closable(!in_flight)
+        .on_close(move |_, _, cx| {
+            app_close.update(cx, |this, cx| {
+                this.close_overlay(cx);
+            });
+        })
+        .child(
+            DialogHeader::new()
+                .child(DialogTitle::new().child("Add Android TV Target"))
+                .child(DialogDescription::new().child(
+                    "Configure a network endpoint target for remote control and media display.",
+                )),
+        )
+        .child(
+            DialogContent::new()
+                .gap_3()
+                .child(render_dialog_field(
+                    "Display Name",
+                    Input::new(display_name),
+                    theme,
+                ))
+                .child(render_dialog_field(
+                    "Network Address (IP:Port)",
+                    Input::new(address),
+                    theme,
+                ))
+                .child(render_dialog_field(
+                    "Physical Location (Optional)",
+                    Input::new(location),
+                    theme,
+                ))
+                .children(render_dialog_error("at-error-alert", error)),
+        )
+        .footer(
+            DialogFooter::new()
+                .child(
+                    Button::new("at-cancel-btn")
+                        .outline()
+                        .disabled(in_flight)
+                        .label("Cancel")
+                        .on_click(move |_, window, cx| {
+                            if !in_flight {
+                                use gpui::component::WindowExt as _;
+                                window.close_dialog(cx);
+                                app_cancel.update(cx, |this, cx| this.close_overlay(cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("at-submit-btn")
+                        .primary()
+                        .loading(in_flight)
+                        .disabled(in_flight)
+                        .label(if in_flight { "Adding..." } else { "Add Target" })
+                        .on_click(move |_, _, cx| {
+                            if !in_flight {
+                                app_submit.update(cx, |this, cx| this.submit_add_target(cx));
+                            }
+                        }),
+                ),
+        )
 }
 
 pub(crate) fn render_edit_target_dialog(
     target_id: &str,
-    display_name: &str,
-    address: &str,
-    location: &str,
+    inputs: &ModalInputs,
     error: Option<&String>,
     in_flight: bool,
-    active_field: ActiveField,
     theme: &Theme,
-    cx: &mut Context<ControllerApp>,
-) -> AnyElement {
+    app: Entity<ControllerApp>,
+    cx: &mut App,
+) -> Dialog {
+    let ModalInputs::EditTarget {
+        display_name,
+        address,
+        location,
+    } = inputs
+    else {
+        return Dialog::new(cx);
+    };
+
+    let app_close = app.clone();
+    let app_cancel = app.clone();
+    let app_submit = app.clone();
     let title = format!("Edit Android TV Target '{target_id}'");
-    let content = div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(render_dialog_input(
-            "et-name-input",
-            "Display Name",
-            display_name,
-            "e.g. Conference Room TV",
-            false,
-            active_field == ActiveField::EditTargetDisplayName,
-            ActiveField::EditTargetDisplayName,
-            theme,
-            cx,
-        ))
-        .child(render_dialog_input(
-            "et-address-input",
-            "Network Address (IP:Port)",
-            address,
-            "192.168.1.50:5555",
-            false,
-            active_field == ActiveField::EditTargetAddress,
-            ActiveField::EditTargetAddress,
-            theme,
-            cx,
-        ))
-        .child(render_dialog_input(
-            "et-location-input",
-            "Physical Location (Optional)",
-            location,
-            "Building A, 2nd Floor",
-            false,
-            active_field == ActiveField::EditTargetLocation,
-            ActiveField::EditTargetLocation,
-            theme,
-            cx,
-        ))
-        .children(render_error_box(error, theme));
 
-    let footer = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(render_cancel_button("et-cancel-btn", in_flight, cx))
-        .child(render_submit_button(
-            "et-submit-btn",
-            "Save Target",
-            "Saving...",
-            in_flight,
-            |this, cx| this.submit_edit_target(cx),
-            cx,
-        ));
-
-    render_dialog_card(
-        &title,
-        Some("Update endpoint address or location information."),
-        content,
-        footer,
-        in_flight,
-        theme,
-        cx,
-    )
+    Dialog::new(cx)
+        .w(px(480.0))
+        .centered()
+        .close_button(!in_flight)
+        .keyboard(!in_flight)
+        .overlay_closable(!in_flight)
+        .on_close(move |_, _, cx| {
+            app_close.update(cx, |this, cx| {
+                this.close_overlay(cx);
+            });
+        })
+        .child(
+            DialogHeader::new()
+                .child(DialogTitle::new().child(title))
+                .child(
+                    DialogDescription::new()
+                        .child("Update endpoint address or location information."),
+                ),
+        )
+        .child(
+            DialogContent::new()
+                .gap_3()
+                .child(render_dialog_field(
+                    "Display Name",
+                    Input::new(display_name),
+                    theme,
+                ))
+                .child(render_dialog_field(
+                    "Network Address (IP:Port)",
+                    Input::new(address),
+                    theme,
+                ))
+                .child(render_dialog_field(
+                    "Physical Location (Optional)",
+                    Input::new(location),
+                    theme,
+                ))
+                .children(render_dialog_error("et-error-alert", error)),
+        )
+        .footer(
+            DialogFooter::new()
+                .child(
+                    Button::new("et-cancel-btn")
+                        .outline()
+                        .disabled(in_flight)
+                        .label("Cancel")
+                        .on_click(move |_, window, cx| {
+                            if !in_flight {
+                                use gpui::component::WindowExt as _;
+                                window.close_dialog(cx);
+                                app_cancel.update(cx, |this, cx| this.close_overlay(cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("et-submit-btn")
+                        .primary()
+                        .loading(in_flight)
+                        .disabled(in_flight)
+                        .label(if in_flight {
+                            "Saving..."
+                        } else {
+                            "Save Target"
+                        })
+                        .on_click(move |_, _, cx| {
+                            if !in_flight {
+                                app_submit.update(cx, |this, cx| this.submit_edit_target(cx));
+                            }
+                        }),
+                ),
+        )
 }
 
 pub(crate) fn render_edit_device_dialog(
     device_id: &str,
-    display_name: &str,
-    location: &str,
+    inputs: &ModalInputs,
     error: Option<&String>,
     in_flight: bool,
-    active_field: ActiveField,
     theme: &Theme,
-    cx: &mut Context<ControllerApp>,
-) -> AnyElement {
+    app: Entity<ControllerApp>,
+    cx: &mut App,
+) -> Dialog {
+    let ModalInputs::EditDevice {
+        display_name,
+        location,
+    } = inputs
+    else {
+        return Dialog::new(cx);
+    };
+
+    let app_close = app.clone();
+    let app_cancel = app.clone();
+    let app_submit = app.clone();
     let title = format!("Edit Device '{device_id}'");
-    let content = div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(render_dialog_input(
-            "ed-name-input",
-            "Display Name",
-            display_name,
-            "Friendly name...",
-            false,
-            active_field == ActiveField::EditDeviceDisplayName,
-            ActiveField::EditDeviceDisplayName,
-            theme,
-            cx,
-        ))
-        .child(render_dialog_input(
-            "ed-location-input",
-            "Physical Location",
-            location,
-            "e.g. Building B Floor 3",
-            false,
-            active_field == ActiveField::EditDeviceLocation,
-            ActiveField::EditDeviceLocation,
-            theme,
-            cx,
-        ))
-        .children(render_error_box(error, theme));
 
-    let footer = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(render_cancel_button("ed-cancel-btn", in_flight, cx))
-        .child(render_submit_button(
-            "ed-submit-btn",
-            "Save Device",
-            "Saving...",
-            in_flight,
-            |this, cx| this.submit_edit_device(cx),
-            cx,
-        ));
-
-    render_dialog_card(
-        &title,
-        Some("Modify friendly hostname or location metadata."),
-        content,
-        footer,
-        in_flight,
-        theme,
-        cx,
-    )
+    Dialog::new(cx)
+        .w(px(480.0))
+        .centered()
+        .close_button(!in_flight)
+        .keyboard(!in_flight)
+        .overlay_closable(!in_flight)
+        .on_close(move |_, _, cx| {
+            app_close.update(cx, |this, cx| {
+                this.close_overlay(cx);
+            });
+        })
+        .child(
+            DialogHeader::new()
+                .child(DialogTitle::new().child(title))
+                .child(
+                    DialogDescription::new()
+                        .child("Modify friendly hostname or location metadata."),
+                ),
+        )
+        .child(
+            DialogContent::new()
+                .gap_3()
+                .child(render_dialog_field(
+                    "Display Name",
+                    Input::new(display_name),
+                    theme,
+                ))
+                .child(render_dialog_field(
+                    "Physical Location",
+                    Input::new(location),
+                    theme,
+                ))
+                .children(render_dialog_error("ed-error-alert", error)),
+        )
+        .footer(
+            DialogFooter::new()
+                .child(
+                    Button::new("ed-cancel-btn")
+                        .outline()
+                        .disabled(in_flight)
+                        .label("Cancel")
+                        .on_click(move |_, window, cx| {
+                            if !in_flight {
+                                use gpui::component::WindowExt as _;
+                                window.close_dialog(cx);
+                                app_cancel.update(cx, |this, cx| this.close_overlay(cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("ed-submit-btn")
+                        .primary()
+                        .loading(in_flight)
+                        .disabled(in_flight)
+                        .label(if in_flight {
+                            "Saving..."
+                        } else {
+                            "Save Device"
+                        })
+                        .on_click(move |_, _, cx| {
+                            if !in_flight {
+                                app_submit.update(cx, |this, cx| this.submit_edit_device(cx));
+                            }
+                        }),
+                ),
+        )
 }

@@ -5,27 +5,39 @@ use rustctrl_protocol::auth::{
 };
 use std::time::Duration;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ActiveField {
-    Username,
-    NewPassword,
-    ConfirmPassword,
-    CurrentPassword,
-    TemporaryPassword,
-    NewAccountUsername,
-    NewAccountPassword,
-    EditDeviceDisplayName,
-    EditDeviceLocation,
-    AddTargetDisplayName,
-    AddTargetAddress,
-    AddTargetLocation,
-    EditTargetDisplayName,
-    EditTargetAddress,
-    EditTargetLocation,
-    ReplaceDevicePriorId,
-    ReplaceDeviceReplacementId,
-    PrepareArtifactOutputPath,
-    PreparePackageAgentBinary,
+#[derive(Clone)]
+pub(crate) enum ModalInputs {
+    ChangePassword {
+        current_password: Entity<gpui::component::input::InputState>,
+        new_password: Entity<gpui::component::input::InputState>,
+        confirm_password: Entity<gpui::component::input::InputState>,
+    },
+    ResetPassword {
+        temporary_password: Entity<gpui::component::input::InputState>,
+        confirm_password: Entity<gpui::component::input::InputState>,
+    },
+    EditDevice {
+        display_name: Entity<gpui::component::input::InputState>,
+        location: Entity<gpui::component::input::InputState>,
+    },
+    AddTarget {
+        display_name: Entity<gpui::component::input::InputState>,
+        address: Entity<gpui::component::input::InputState>,
+        location: Entity<gpui::component::input::InputState>,
+    },
+    EditTarget {
+        display_name: Entity<gpui::component::input::InputState>,
+        address: Entity<gpui::component::input::InputState>,
+        location: Entity<gpui::component::input::InputState>,
+    },
+    ReplaceDevice {
+        prior_device_id: Entity<gpui::component::input::InputState>,
+        replacement_device_id: Entity<gpui::component::input::InputState>,
+    },
+    PrepareArtifact {
+        output_path: Entity<gpui::component::input::InputState>,
+        agent_binary_path: Entity<gpui::component::input::InputState>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -143,7 +155,7 @@ pub struct ControllerApp {
     pub(crate) config_path: std::path::PathBuf,
     pub(crate) state: ScreenState,
     pub(crate) overlay: Overlay,
-    pub(crate) active_field: ActiveField,
+    pub(crate) modal_inputs: Option<ModalInputs>,
     pub(crate) focus_handle: FocusHandle,
     pub(crate) tokio_handle: tokio::runtime::Handle,
     pub(crate) next_edit_device_request_id: u64,
@@ -162,6 +174,8 @@ pub struct ControllerApp {
     pub(crate) must_change_new_password_input: Option<Entity<gpui::component::input::InputState>>,
     pub(crate) must_change_confirm_password_input:
         Option<Entity<gpui::component::input::InputState>>,
+    pub(crate) new_account_username_input: Option<Entity<gpui::component::input::InputState>>,
+    pub(crate) new_account_password_input: Option<Entity<gpui::component::input::InputState>>,
     pub(crate) remote_state: crate::remote::RemoteSessionState,
     pub(crate) window_handle: Option<gpui::AnyWindowHandle>,
     pub(crate) toast_manager: crate::toast::ToastManager,
@@ -358,7 +372,7 @@ impl ControllerApp {
                 in_flight: false,
             },
             overlay: Overlay::None,
-            active_field: ActiveField::Username,
+            modal_inputs: None,
             focus_handle,
             tokio_handle,
             next_edit_device_request_id: 0,
@@ -374,6 +388,8 @@ impl ControllerApp {
             login_password_input: None,
             must_change_new_password_input: None,
             must_change_confirm_password_input: None,
+            new_account_username_input: None,
+            new_account_password_input: None,
             remote_state: crate::remote::RemoteSessionState::default(),
             window_handle,
             toast_manager: crate::toast::ToastManager::new(),
