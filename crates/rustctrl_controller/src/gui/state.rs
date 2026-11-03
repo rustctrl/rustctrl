@@ -8,7 +8,6 @@ use std::time::Duration;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ActiveField {
     Username,
-    FleetSearch,
     NewPassword,
     ConfirmPassword,
     CurrentPassword,
@@ -157,6 +156,7 @@ pub struct ControllerApp {
     pub(crate) fleet_table: Option<
         Entity<gpui::component::table::TableState<crate::gui::views::fleet::FleetTableDelegate>>,
     >,
+    pub(crate) fleet_search_input: Option<Entity<gpui::component::input::InputState>>,
     pub(crate) login_username_input: Option<Entity<gpui::component::input::InputState>>,
     pub(crate) login_password_input: Option<Entity<gpui::component::input::InputState>>,
     pub(crate) must_change_new_password_input: Option<Entity<gpui::component::input::InputState>>,
@@ -369,6 +369,7 @@ impl ControllerApp {
             navigation: crate::navigation::Navigation::default(),
             fleet_state: crate::fleet::FleetState::new(),
             fleet_table: None,
+            fleet_search_input: None,
             login_username_input: None,
             login_password_input: None,
             must_change_new_password_input: None,
@@ -458,6 +459,7 @@ impl ControllerApp {
         device_name: String,
         cx: &mut Context<Self>,
     ) {
+        self.fleet_state.close_inspector();
         self.remote_state.start_session(&device_id, &device_name);
         if let ScreenState::Connected { role, .. } = &self.state {
             self.navigation
