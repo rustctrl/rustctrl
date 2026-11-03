@@ -414,6 +414,7 @@ impl TableDelegate for FleetTableDelegate {
                                     )
                                     .on_click(
                                         move |_, _, cx| {
+                                            cx.stop_propagation();
                                             app_edit.update(cx, |this, cx| {
                                                 this.open_edit_target(
                                                     id_edit.clone(),
@@ -434,6 +435,7 @@ impl TableDelegate for FleetTableDelegate {
                                     )
                                     .on_click(
                                         move |_, _, cx| {
+                                            cx.stop_propagation();
                                             app_remove.update(cx, |this, cx| {
                                                 this.submit_remove_target(id_remove.clone(), cx);
                                             });
@@ -453,6 +455,7 @@ impl TableDelegate for FleetTableDelegate {
                                     "Edit Device Details",
                                 )
                                 .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
                                     app_edit.update(cx, |this, cx| {
                                         this.open_edit_device(
                                             id_edit.clone(),
@@ -475,6 +478,7 @@ impl TableDelegate for FleetTableDelegate {
                                     )
                                     .on_click(
                                         move |_, _, cx| {
+                                            cx.stop_propagation();
                                             app_unblock.update(cx, |this, cx| {
                                                 this.submit_unblock_device(id_unblock.clone(), cx);
                                             });
@@ -492,6 +496,7 @@ impl TableDelegate for FleetTableDelegate {
                                     )
                                     .on_click(
                                         move |_, _, cx| {
+                                            cx.stop_propagation();
                                             app_block.update(cx, |this, cx| {
                                                 this.submit_block_device(id_block.clone(), cx);
                                             });
@@ -509,6 +514,7 @@ impl TableDelegate for FleetTableDelegate {
                                         )
                                         .on_click(
                                             move |_, _, cx| {
+                                                cx.stop_propagation();
                                                 app_clean.update(cx, |this, cx| {
                                                     this.submit_clean_offline_device(
                                                         id_clean.clone(),
@@ -530,6 +536,7 @@ impl TableDelegate for FleetTableDelegate {
                                     "Replace Device",
                                 )
                                 .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
                                     app_replace.update(cx, |this, cx| {
                                         this.open_replace_device(
                                             id_replace.clone(),
@@ -593,6 +600,10 @@ impl ControllerApp {
                             }
                         }
                     }
+                    TableEvent::ClearSelection => {
+                        this.fleet_state.close_inspector();
+                        cx.notify();
+                    }
                     _ => {}
                 },
             )
@@ -639,6 +650,12 @@ impl ControllerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let devices = match &self.state {
+            ScreenState::Connected { devices, .. } => devices.as_slice(),
+            _ => &[][..],
+        };
+        self.fleet_state.sync_selection(devices);
+
         let has_active_sheet = window.has_active_sheet(cx);
         let selected_id = self.fleet_state.selected_device_id.clone();
 
@@ -658,14 +675,24 @@ impl ControllerApp {
                         (selected, telemetry, theme)
                     };
 
+                    let app_close = app.clone();
                     let Some(item) = selected else {
-                        return sheet;
+                        return sheet.on_close(move |_, _, cx| {
+                            app_close.update(cx, |this, cx| {
+                                this.fleet_state.close_inspector();
+                                cx.notify();
+                            });
+                        });
                     };
                     let Some(telemetry) = telemetry else {
-                        return sheet;
+                        return sheet.on_close(move |_, _, cx| {
+                            app_close.update(cx, |this, cx| {
+                                this.fleet_state.close_inspector();
+                                cx.notify();
+                            });
+                        });
                     };
 
-                    let app_close = app.clone();
                     sheet = sheet
                         .size(px(380.0))
                         .title(render_inspector_title(&item, &theme))
@@ -711,6 +738,11 @@ impl ControllerApp {
                 delegate.theme = theme;
                 delegate.is_admin = is_admin;
                 delegate.empty_state = empty_state;
+                if let Some(selected_row) = table.selected_row()
+                    && selected_row >= filtered_items.len()
+                {
+                    table.clear_selection(cx);
+                }
                 table.refresh(cx);
             });
         }

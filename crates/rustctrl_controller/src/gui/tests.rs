@@ -906,6 +906,36 @@ fn fleet_inspector_selection_lifecycle() {
 }
 
 #[test]
+fn fleet_inspector_sync_selection_clears_removed_or_cleaned_device() {
+    use rustctrl_protocol::auth::FleetDeviceEntry;
+
+    let mut fleet_state = crate::fleet::FleetState::new();
+    let entry = FleetDeviceEntry {
+        device_id: "dev-pc-01".into(),
+        display_name: "Desktop 1".into(),
+        device_type: "windows".into(),
+        last_address: "192.168.1.10:50051".into(),
+        online: false,
+        last_seen_unix_ms: 1000,
+        location: Some("HQ".into()),
+        configured_address: None,
+        status: "offline".into(),
+        blocked: false,
+    };
+
+    fleet_state.select_device(Some("dev-pc-01".into()));
+    assert_eq!(fleet_state.selected_device_id.as_deref(), Some("dev-pc-01"));
+
+    // Still present: remains selected
+    fleet_state.sync_selection(&[entry]);
+    assert_eq!(fleet_state.selected_device_id.as_deref(), Some("dev-pc-01"));
+
+    // Removed / cleaned from fleet: sync clears the selected device ID
+    fleet_state.sync_selection(&[]);
+    assert!(fleet_state.selected_device_id.is_none());
+}
+
+#[test]
 fn unified_shell_route_labels_and_sidebar_header_state() {
     use crate::navigation::{Navigation, Route};
 

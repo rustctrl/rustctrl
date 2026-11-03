@@ -259,6 +259,12 @@ impl FleetState {
         self.selected_device_id = None;
     }
 
+    pub fn sync_selection(&mut self, devices: &[FleetDeviceEntry]) {
+        if self.selected_device_id.is_some() && self.selected_device(devices).is_none() {
+            self.selected_device_id = None;
+        }
+    }
+
     pub fn selected_device(&self, devices: &[FleetDeviceEntry]) -> Option<FleetDeviceItem> {
         let id = self.selected_device_id.as_deref()?;
         devices
@@ -640,5 +646,11 @@ mod tests {
         state.close_inspector();
         assert_eq!(state.selected_device_id, None);
         assert!(state.selected_device(&devices).is_none());
+
+        // Sync selection clears stale device when device list changes or becomes empty
+        state.select_device(Some("win-pc-01".into()));
+        assert_eq!(state.selected_device_id.as_deref(), Some("win-pc-01"));
+        state.sync_selection(&[]);
+        assert_eq!(state.selected_device_id, None);
     }
 }

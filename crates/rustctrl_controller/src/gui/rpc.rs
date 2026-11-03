@@ -534,6 +534,9 @@ impl ControllerApp {
                                 notice: keep_notice,
                                 in_flight: *in_flight,
                             };
+                            if let ScreenState::Connected { devices, .. } = &view.state {
+                                view.fleet_state.sync_selection(devices);
+                            }
                         }
                         Ok(Err(err)) => {
                             view.state = ScreenState::Connected {
@@ -1786,6 +1789,10 @@ impl ControllerApp {
                                 format!("Removed target '{target_label}'."),
                                 cx,
                             );
+                            if view.fleet_state.selected_device_id.as_deref() == Some(&target_label)
+                            {
+                                view.fleet_state.close_inspector();
+                            }
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
@@ -1994,6 +2001,10 @@ impl ControllerApp {
                                 format!("Cleaned offline device '{device_label}'."),
                                 cx,
                             );
+                            if view.fleet_state.selected_device_id.as_deref() == Some(&device_label)
+                            {
+                                view.fleet_state.close_inspector();
+                            }
                             let token = tok_check.clone();
                             view.fetch_status(token, cx);
                         }
