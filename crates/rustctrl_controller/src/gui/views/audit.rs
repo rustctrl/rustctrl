@@ -2,9 +2,12 @@ use super::super::*;
 use gpui::assets::IconName;
 use gpui::base::StyledExt as _;
 use gpui::component::Icon;
-use gpui::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div, px, rgb,
+use gpui::component::empty::{
+    Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
 };
+use gpui::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
+use gpui::component::tag::Tag;
+use gpui::{Context, IntoElement, ParentElement as _, Styled as _, div, px, rgb};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditEntryItem {
@@ -174,124 +177,93 @@ impl ControllerApp {
                     .child(format!("{} recorded activity entries", audit_events.len())),
             );
 
-        let table_header = div()
-            .flex()
-            .gap_4()
-            .px_4()
-            .py_2()
-            .border_b_1()
-            .border_color(rgb(theme.border_subtle))
-            .bg(rgb(theme.bg_surface))
-            .rounded_t_lg()
-            .text_xs()
-            .font_semibold()
-            .text_color(rgb(theme.text_muted))
-            .child(div().w(px(70.0)).child("ID"))
-            .child(div().w(px(100.0)).child("TIME"))
-            .child(div().w(px(130.0)).child("ACTOR"))
-            .child(div().w(px(120.0)).child("CATEGORY"))
-            .child(div().w(px(180.0)).child("ACTION"))
-            .child(div().w(px(100.0)).child("STATUS"))
-            .child(div().flex_1().child("DETAILS"));
-
-        let mut table_container = div()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(theme.border_subtle))
-            .bg(rgb(theme.bg_surface))
-            .child(table_header);
-
-        if audit_events.is_empty() {
-            table_container = table_container.child(
-                div()
-                    .p_6()
-                    .text_sm()
-                    .text_color(rgb(theme.text_muted))
-                    .child("No audit events recorded yet."),
-            );
+        let table_content = if audit_events.is_empty() {
+            Empty::new()
+                .header(
+                    EmptyHeader::new()
+                        .media(
+                            EmptyMedia::new()
+                                .with_variant(EmptyMediaVariant::Icon)
+                                .child(Icon::new(IconName::FileClock)),
+                        )
+                        .title(EmptyTitle::new().child("No Audit Events"))
+                        .description(EmptyDescription::new().child(
+                            "No administrative or session audit events have been recorded yet.",
+                        )),
+                )
+                .into_any_element()
         } else {
-            for (ix, ev) in audit_events.iter().enumerate() {
-                let status_color = match ev.result {
-                    "Success" | "Active" => theme.status_online,
-                    "Revoked" | "Restricted" => theme.status_blocked,
-                    _ => theme.status_reconnecting,
-                };
+            Table::new()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(theme.border_subtle))
+                .overflow_hidden()
+                .child(
+                    TableHeader::new().child(
+                        TableRow::new()
+                            .child(TableHead::new().w(px(70.0)).child("ID"))
+                            .child(TableHead::new().w(px(100.0)).child("TIME"))
+                            .child(TableHead::new().w(px(130.0)).child("ACTOR"))
+                            .child(TableHead::new().w(px(120.0)).child("CATEGORY"))
+                            .child(TableHead::new().w(px(180.0)).child("ACTION"))
+                            .child(TableHead::new().w(px(110.0)).child("STATUS"))
+                            .child(TableHead::new().flex_1().child("DETAILS")),
+                    ),
+                )
+                .child(TableBody::new().children(audit_events.iter().map(|ev| {
+                    let status_tag = match ev.result {
+                        "Success" | "Active" => Tag::success().child(ev.result),
+                        "Revoked" | "Restricted" => Tag::danger().child(ev.result),
+                        _ => Tag::warning().child(ev.result),
+                    };
 
-                let is_last = ix == audit_events.len() - 1;
-                let mut row = div()
-                    .flex()
-                    .gap_4()
-                    .items_center()
-                    .px_4()
-                    .py_2p5()
-                    .hover(|s| s.bg(rgb(theme.bg_surface_hover)));
-
-                if !is_last {
-                    row = row.border_b_1().border_color(rgb(theme.border_subtle));
-                }
-
-                row = row
-                    .child(
-                        div()
-                            .w(px(70.0))
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(format!("#{}", ev.id)),
-                    )
-                    .child(
-                        div()
-                            .w(px(100.0))
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(ev.relative_time()),
-                    )
-                    .child(
-                        div()
-                            .w(px(130.0))
-                            .font_semibold()
-                            .text_color(rgb(theme.text_primary))
-                            .child(ev.actor.clone()),
-                    )
-                    .child(
-                        div()
-                            .w(px(120.0))
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(ev.category),
-                    )
-                    .child(
-                        div()
-                            .w(px(180.0))
-                            .text_sm()
-                            .text_color(rgb(theme.text_primary))
-                            .child(ev.action.clone()),
-                    )
-                    .child(
-                        div()
-                            .w(px(100.0))
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(div().size_2().rounded_full().bg(rgb(status_color)))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(rgb(status_color))
-                                    .child(ev.result),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .text_color(rgb(theme.text_muted))
-                            .child(ev.detail.clone()),
-                    );
-
-                table_container = table_container.child(row);
-            }
-        }
+                    TableRow::new()
+                        .child(
+                            TableCell::new()
+                                .w(px(70.0))
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child(format!("#{}", ev.id)),
+                        )
+                        .child(
+                            TableCell::new()
+                                .w(px(100.0))
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child(ev.relative_time()),
+                        )
+                        .child(
+                            TableCell::new()
+                                .w(px(130.0))
+                                .font_semibold()
+                                .text_color(rgb(theme.text_primary))
+                                .child(ev.actor.clone()),
+                        )
+                        .child(
+                            TableCell::new()
+                                .w(px(120.0))
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child(ev.category),
+                        )
+                        .child(
+                            TableCell::new()
+                                .w(px(180.0))
+                                .text_sm()
+                                .text_color(rgb(theme.text_primary))
+                                .child(ev.action.clone()),
+                        )
+                        .child(TableCell::new().w(px(110.0)).child(status_tag))
+                        .child(
+                            TableCell::new()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(rgb(theme.text_muted))
+                                .child(ev.detail.clone()),
+                        )
+                })))
+                .into_any_element()
+        };
 
         div()
             .size_full()
@@ -299,7 +271,7 @@ impl ControllerApp {
             .flex_col()
             .gap_4()
             .child(header)
-            .child(table_container)
+            .child(table_content)
             .into_any_element()
     }
 }

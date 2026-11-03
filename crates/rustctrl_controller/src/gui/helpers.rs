@@ -1,6 +1,4 @@
 #[cfg(test)]
-use gpui::Keystroke;
-#[cfg(test)]
 use rustctrl_protocol::auth::FleetDeviceEntry;
 
 pub fn configure_tokyo_night_theme(
@@ -67,29 +65,6 @@ pub fn configure_tokyo_night_theme(
     kit.button_hover = rgb(theme.border_subtle).into();
     kit.button_active = rgb(theme.border_focus).into();
     kit.button_foreground = rgb(theme.text_primary).into();
-}
-
-#[cfg(test)]
-pub fn resolve_typed_text(keystroke: &Keystroke) -> Option<&str> {
-    if keystroke.modifiers.control || keystroke.modifiers.platform {
-        return None;
-    }
-    if let Some(kc) = keystroke.key_char.as_deref()
-        && !kc.is_empty()
-        && !kc.chars().any(|c| c.is_control())
-    {
-        return Some(kc);
-    }
-    if keystroke.key == "space" {
-        return Some(" ");
-    }
-    if keystroke.key.chars().count() == 1 {
-        let c = keystroke.key.chars().next().unwrap();
-        if !c.is_control() {
-            return Some(&keystroke.key);
-        }
-    }
-    None
 }
 
 #[cfg(test)]

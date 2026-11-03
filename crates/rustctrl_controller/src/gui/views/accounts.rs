@@ -2,12 +2,14 @@ use super::super::*;
 use gpui::assets::IconName;
 use gpui::base::StyledExt as _;
 use gpui::component::button::{Button, ButtonVariants as _};
-use gpui::component::input::Input;
-use gpui::component::{Disableable as _, Icon};
-use gpui::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, Window, div,
-    px, rgb,
+use gpui::component::empty::{
+    Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle,
 };
+use gpui::component::input::Input;
+use gpui::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
+use gpui::component::tag::Tag;
+use gpui::component::{Disableable as _, Icon};
+use gpui::{Context, IntoElement, ParentElement as _, Styled as _, Window, div, px, rgb};
 
 impl ControllerApp {
     pub(in crate::gui) fn ensure_new_account_inputs(
@@ -102,195 +104,118 @@ impl ControllerApp {
 
         if accounts.is_empty() {
             accounts_list = accounts_list.child(
-                div()
-                    .p_6()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(theme.border_subtle))
-                    .bg(rgb(theme.bg_surface))
-                    .text_sm()
-                    .text_color(rgb(theme.text_muted))
-                    .child("No staff accounts loaded or loading..."),
+                Empty::new().header(
+                    EmptyHeader::new()
+                        .media(
+                            EmptyMedia::new()
+                                .with_variant(EmptyMediaVariant::Icon)
+                                .child(Icon::new(IconName::Users)),
+                        )
+                        .title(EmptyTitle::new().child("No Staff Accounts"))
+                        .description(
+                            EmptyDescription::new().child("No staff accounts loaded or loading..."),
+                        ),
+                ),
             );
         } else {
-            let header_row = div()
-                .flex()
-                .gap_4()
-                .px_4()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(theme.border_subtle))
-                .bg(rgb(theme.bg_surface))
-                .rounded_t_lg()
-                .text_xs()
-                .font_semibold()
-                .text_color(rgb(theme.text_muted))
-                .child(div().w(px(180.0)).child("USERNAME"))
-                .child(div().w(px(120.0)).child("ROLE"))
-                .child(div().w(px(160.0)).child("STATUS"))
-                .child(div().flex_1().child("ACTIONS"));
-
-            let mut table_container = div()
+            let table = Table::new()
                 .rounded_lg()
                 .border_1()
                 .border_color(rgb(theme.border_subtle))
-                .bg(rgb(theme.bg_surface))
-                .child(header_row);
+                .overflow_hidden()
+                .child(
+                    TableHeader::new().child(
+                        TableRow::new()
+                            .child(TableHead::new().w(px(180.0)).child("USERNAME"))
+                            .child(TableHead::new().w(px(120.0)).child("ROLE"))
+                            .child(TableHead::new().w(px(160.0)).child("STATUS"))
+                            .child(TableHead::new().flex_1().child("ACTIONS")),
+                    ),
+                )
+                .child(TableBody::new().children(accounts.iter().map(|acc| {
+                    let acc_username = acc.username.clone();
+                    let is_target_admin = acc.role == "admin";
+                    let btn_label = if is_target_admin {
+                        "Demote to Operator"
+                    } else {
+                        "Promote to Admin"
+                    };
+                    let new_target_role_str = if is_target_admin {
+                        "operator".to_string()
+                    } else {
+                        "admin".to_string()
+                    };
+                    let target_user_clone = acc.username.clone();
+                    let reset_target_clone = acc.username.clone();
+                    let deactivate_target_clone = acc.username.clone();
 
-            for (ix, acc) in accounts.iter().enumerate() {
-                let acc_username = acc.username.clone();
-                let is_target_admin = acc.role == "admin";
-                let btn_label = if is_target_admin {
-                    "Demote to Operator"
-                } else {
-                    "Promote to Admin"
-                };
-                let new_target_role_str = if is_target_admin {
-                    "operator".to_string()
-                } else {
-                    "admin".to_string()
-                };
-                let target_user_clone = acc.username.clone();
-                let reset_target_clone = acc.username.clone();
-                let deactivate_target_clone = acc.username.clone();
+                    let status_badge = if !acc.active {
+                        Tag::danger().child("Deactivated")
+                    } else if acc.must_change_password {
+                        Tag::warning().child("Must Change Pass")
+                    } else {
+                        Tag::success().child("Active")
+                    };
 
-                let status_badge = if !acc.active {
-                    div()
-                        .w(px(160.0))
+                    let role_badge = if is_target_admin {
+                        Tag::primary().child("Admin")
+                    } else {
+                        Tag::secondary().child("Operator")
+                    };
+
+                    let mut actions_cell = div()
                         .flex()
+                        .gap_2()
                         .items_center()
-                        .gap_1p5()
-                        .child(div().size_2().rounded_full().bg(rgb(theme.status_blocked)))
                         .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(theme.status_blocked))
-                                .child("Deactivated"),
-                        )
-                } else if acc.must_change_password {
-                    div()
-                        .w(px(160.0))
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(
-                            div()
-                                .size_2()
-                                .rounded_full()
-                                .bg(rgb(theme.status_reconnecting)),
+                            Button::new(format!("role-btn-{}", acc_username))
+                                .secondary()
+                                .label(btn_label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.submit_change_role(
+                                        target_user_clone.clone(),
+                                        new_target_role_str.clone(),
+                                        cx,
+                                    );
+                                })),
                         )
                         .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(theme.status_reconnecting))
-                                .child("Must Change Pass"),
-                        )
-                } else {
-                    div()
-                        .w(px(160.0))
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(div().size_2().rounded_full().bg(rgb(theme.status_online)))
+                            Button::new(format!("reset-btn-{}", acc_username))
+                                .ghost()
+                                .label("Reset Password")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_reset_password(reset_target_clone.clone(), cx);
+                                })),
+                        );
+
+                    if acc.active {
+                        actions_cell = actions_cell.child(
+                            Button::new(format!("deactivate-btn-{}", acc_username))
+                                .danger()
+                                .label("Deactivate")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.submit_deactivate_account(
+                                        deactivate_target_clone.clone(),
+                                        cx,
+                                    );
+                                })),
+                        );
+                    }
+
+                    TableRow::new()
                         .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(theme.status_online))
-                                .child("Active"),
+                            TableCell::new()
+                                .w(px(180.0))
+                                .font_semibold()
+                                .text_color(rgb(theme.text_primary))
+                                .child(acc_username),
                         )
-                };
+                        .child(TableCell::new().w(px(120.0)).child(role_badge))
+                        .child(TableCell::new().w(px(160.0)).child(status_badge))
+                        .child(TableCell::new().flex_1().child(actions_cell))
+                })));
 
-                let role_badge = if is_target_admin {
-                    div().w(px(120.0)).child(
-                        div()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .bg(rgb(theme.accent_primary))
-                            .text_color(rgb(theme.bg_app))
-                            .text_xs()
-                            .font_semibold()
-                            .child("Admin"),
-                    )
-                } else {
-                    div().w(px(120.0)).child(
-                        div()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .bg(rgb(theme.bg_surface_hover))
-                            .text_color(rgb(theme.text_muted))
-                            .text_xs()
-                            .child("Operator"),
-                    )
-                };
-
-                let is_last = ix == accounts.len() - 1;
-                let mut row = div()
-                    .flex()
-                    .gap_4()
-                    .items_center()
-                    .px_4()
-                    .py_2p5()
-                    .hover(|s| s.bg(rgb(theme.bg_surface_hover)));
-
-                if !is_last {
-                    row = row.border_b_1().border_color(rgb(theme.border_subtle));
-                }
-
-                let mut actions_cell = div()
-                    .flex_1()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Button::new(format!("role-btn-{}", acc_username))
-                            .secondary()
-                            .label(btn_label)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.submit_change_role(
-                                    target_user_clone.clone(),
-                                    new_target_role_str.clone(),
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new(format!("reset-btn-{}", acc_username))
-                            .ghost()
-                            .label("Reset Password")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_reset_password(reset_target_clone.clone(), cx);
-                            })),
-                    );
-
-                if acc.active {
-                    actions_cell = actions_cell.child(
-                        Button::new(format!("deactivate-btn-{}", acc_username))
-                            .danger()
-                            .label("Deactivate")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.submit_deactivate_account(deactivate_target_clone.clone(), cx);
-                            })),
-                    );
-                }
-
-                row = row
-                    .child(
-                        div()
-                            .w(px(180.0))
-                            .font_semibold()
-                            .text_color(rgb(theme.text_primary))
-                            .child(acc_username.clone()),
-                    )
-                    .child(role_badge)
-                    .child(status_badge)
-                    .child(actions_cell);
-
-                table_container = table_container.child(row);
-            }
-
-            accounts_list = accounts_list.child(table_container);
+            accounts_list = accounts_list.child(table);
         }
 
         // Create Staff Account Form Card

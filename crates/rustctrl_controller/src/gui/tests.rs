@@ -1,79 +1,7 @@
 use super::*;
-use gpui::{Keystroke, Modifiers};
 use rustctrl_protocol::auth::{
     FleetDeviceEntry, InstallationAuthorizationEntry, StaffAccountEntry,
 };
-
-#[test]
-fn resolve_typed_text_handles_spaces_characters_and_key_char() {
-    // Space key with no key_char
-    let space_key = Keystroke {
-        modifiers: Modifiers::default(),
-        key: "space".into(),
-        key_char: None,
-    };
-    assert_eq!(resolve_typed_text(&space_key), Some(" "));
-
-    // Key with key_char payload (e.g. non-ASCII or multi-word)
-    let thai_key = Keystroke {
-        modifiers: Modifiers::default(),
-        key: "q".into(),
-        key_char: Some("ๆ".into()),
-    };
-    assert_eq!(resolve_typed_text(&thai_key), Some("ๆ"));
-
-    // Normal ASCII letter
-    let ascii_key = Keystroke {
-        modifiers: Modifiers::default(),
-        key: "a".into(),
-        key_char: Some("a".into()),
-    };
-    assert_eq!(resolve_typed_text(&ascii_key), Some("a"));
-
-    // Control or command modifier should be ignored
-    let mut ctrl_s = Keystroke {
-        modifiers: Modifiers::default(),
-        key: "s".into(),
-        key_char: Some("s".into()),
-    };
-    ctrl_s.modifiers.control = true;
-    assert_eq!(resolve_typed_text(&ctrl_s), None);
-
-    // Control character should be ignored
-    let enter_key = Keystroke {
-        modifiers: Modifiers::default(),
-        key: "enter".into(),
-        key_char: Some("\n".into()),
-    };
-    assert_eq!(resolve_typed_text(&enter_key), None);
-}
-
-#[test]
-fn typing_multiword_values_accumulates_correctly() {
-    let mut display_name = String::new();
-    let words = ["Reception", " ", "Front", " ", "Desk"];
-    for word in words {
-        for ch in word.chars() {
-            let ks = if ch == ' ' {
-                Keystroke {
-                    modifiers: Modifiers::default(),
-                    key: "space".into(),
-                    key_char: None,
-                }
-            } else {
-                Keystroke {
-                    modifiers: Modifiers::default(),
-                    key: ch.to_string(),
-                    key_char: Some(ch.to_string()),
-                }
-            };
-            if let Some(text) = resolve_typed_text(&ks) {
-                display_name.push_str(text);
-            }
-        }
-    }
-    assert_eq!(display_name, "Reception Front Desk");
-}
 
 #[test]
 fn edit_device_overlay_form_matching_checks_request_id_and_device_id() {
