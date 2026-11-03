@@ -897,3 +897,53 @@ fn configure_tokyo_night_theme_registers_semantic_tokens() {
     assert_eq!(kit_theme.info, gpui::rgb(0x7aa2f7).into());
     assert_eq!(kit_theme.sidebar, gpui::rgb(0x16161e).into());
 }
+
+#[test]
+fn login_and_must_change_password_states_initial_values() {
+    let login_state = ScreenState::Login {
+        username: "admin".into(),
+        password: "secret_password".into(),
+        error: None,
+        notice: None,
+        remember: true,
+        in_flight: false,
+    };
+    if let ScreenState::Login {
+        username,
+        password,
+        remember,
+        in_flight,
+        ..
+    } = &login_state
+    {
+        assert_eq!(username, "admin");
+        assert_eq!(password, "secret_password");
+        assert!(*remember);
+        assert!(!*in_flight);
+    } else {
+        panic!("expected login screen state");
+    }
+
+    let mcp_state = ScreenState::MustChangePassword {
+        session_token: "temp-tok-123".into(),
+        username: "temporary_user".into(),
+        role: "operator".into(),
+        new_password: "NewPassword123".into(),
+        confirm_password: "NewPassword123".into(),
+        error: None,
+        in_flight: false,
+    };
+    if let ScreenState::MustChangePassword {
+        new_password,
+        confirm_password,
+        in_flight,
+        ..
+    } = &mcp_state
+    {
+        assert_eq!(new_password, confirm_password);
+        assert!(new_password.len() >= 8);
+        assert!(!*in_flight);
+    } else {
+        panic!("expected must change password screen state");
+    }
+}
