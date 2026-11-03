@@ -352,6 +352,47 @@ impl ControllerApp {
                     agent_binary_path: bin,
                 });
             }
+            Overlay::CreateStaffAccount {
+                username,
+                temporary_password,
+                ..
+            } => {
+                let user = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("Enter username (e.g. jdoe)...")
+                        .default_value(username.clone())
+                });
+                let pass = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .masked(true)
+                        .placeholder("Minimum 8 characters...")
+                        .default_value(temporary_password.clone())
+                });
+
+                cx.subscribe(
+                    &user,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_create_staff_account(cx);
+                        }
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &pass,
+                    |this: &mut ControllerApp, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.submit_create_staff_account(cx);
+                        }
+                    },
+                )
+                .detach();
+
+                self.modal_inputs = Some(ModalInputs::CreateStaffAccount {
+                    username: user,
+                    temporary_password: pass,
+                });
+            }
             Overlay::None => {}
         }
     }
@@ -469,6 +510,15 @@ impl ControllerApp {
                             app.clone(),
                             cx,
                         ),
+                        Overlay::CreateStaffAccount { .. } => {
+                            overlays::create_account::render_create_account_dialog(
+                                &overlay,
+                                &inputs,
+                                &theme,
+                                app.clone(),
+                                cx,
+                            )
+                        }
                         Overlay::None => dialog,
                     }
                 });
@@ -552,7 +602,6 @@ impl Render for ControllerApp {
         if matches!(self.state, ScreenState::Connected { .. }) {
             self.ensure_fleet_table(window, cx);
             self.ensure_fleet_search_input(window, cx);
-            self.ensure_new_account_inputs(window, cx);
         } else {
             use gpui::component::WindowExt as _;
             if window.has_active_sheet(cx) {

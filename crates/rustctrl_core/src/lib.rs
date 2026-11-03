@@ -820,6 +820,43 @@ pub fn read_config<T: DeserializeOwned>(path: &Path) -> Result<T> {
         .with_context(|| format!("read configuration {}", path.display()))?;
     toml::from_str(&body).with_context(|| format!("parse configuration {}", path.display()))
 }
+
+/// Generates a cryptographically strong, random temporary password for staff account provisioning.
+///
+/// Produces a 16-character credential sampled uniformly (without modulo bias) from a 62-character
+/// alphabet spanning upper and lowercase letters, digits, and safe punctuation symbols (`!@#$-_`).
+pub fn generate_temporary_password() -> String {
+    const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$-_";
+    const CHARSET_LEN: usize = CHARSET.len(); // 62
+    // Largest multiple of CHARSET_LEN (62) less than 256 is 248 (62 * 4).
+    // Discarding random bytes >= 248 guarantees completely unbiased uniform sampling.
+    const REJECTION_THRESHOLD: u8 = ((256 / CHARSET_LEN) * CHARSET_LEN) as u8; // 248
+
+    let mut result = String::with_capacity(16);
+
+    while result.len() < 16 {
+        let u = uuid::Uuid::new_v4();
+        let bytes = u.as_bytes();
+        // UUIDv4 bytes 0..=5, 7, and 9..=15 (14 bytes total) are unconstrained cryptographically
+        // secure random bytes provided by the OS CSPRNG (bytes 6 and 8 contain version/variant bits).
+        let unbiased_random_bytes = [
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[7], bytes[9],
+            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ];
+
+        for byte in unbiased_random_bytes {
+            if byte < REJECTION_THRESHOLD {
+                let charset_index = (byte as usize) % CHARSET_LEN;
+                result.push(CHARSET[charset_index] as char);
+                if result.len() == 16 {
+                    break;
+                }
+            }
+        }
+    }
+
+    result
+}
 pub fn config_base(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new("."))
 }
@@ -999,5 +1036,24 @@ mod tests {
         assert!(AgentInstallationPackage::new(artifact, vec![]).is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn temporary_password_generation_meets_length_and_charset_rules() {
+        const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$-_";
+        for _ in 0..50 {
+            let pass = generate_temporary_password();
+            assert_eq!(pass.len(), 16);
+            assert!(
+                pass.len() >= 8,
+                "must satisfy server minimum password length"
+            );
+            for ch in pass.chars() {
+                assert!(
+                    CHARSET.contains(&(ch as u8)),
+                    "character '{ch}' must belong to allowed charset"
+                );
+            }
+        }
     }
 }

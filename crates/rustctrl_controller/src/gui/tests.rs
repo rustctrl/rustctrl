@@ -352,9 +352,6 @@ fn connected_state_installation_authorizations_display_and_filtering() {
         devices: Vec::new(),
         accounts: Vec::new(),
         authorizations: vec![auth_active.clone(), auth_revoked.clone()],
-        new_account_username: String::new(),
-        new_account_role: "operator".into(),
-        new_account_password: String::new(),
         error: None,
         notice: None,
         in_flight: false,
@@ -392,9 +389,6 @@ fn connected_state_preserves_authorizations_when_refresh_fails() {
         devices: Vec::new(),
         accounts: Vec::new(),
         authorizations: vec![auth_active.clone()],
-        new_account_username: String::new(),
-        new_account_role: "operator".into(),
-        new_account_password: String::new(),
         error: None,
         notice: None,
         in_flight: false,
@@ -748,6 +742,74 @@ fn staff_accounts_view_model_and_role_transitions() {
 }
 
 #[test]
+fn modernized_staff_accounts_view_and_role_actions() {
+    use gpui::assets::IconName;
+
+    let accounts = [
+        StaffAccountEntry {
+            username: "sarah_admin".into(),
+            role: "admin".into(),
+            active: true,
+            must_change_password: false,
+            created_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_000_000,
+        },
+        StaffAccountEntry {
+            username: "jordan_op".into(),
+            role: "operator".into(),
+            active: true,
+            must_change_password: true,
+            created_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_000_000,
+        },
+        StaffAccountEntry {
+            username: "legacy_user".into(),
+            role: "operator".into(),
+            active: false,
+            must_change_password: false,
+            created_at_unix_ms: 1_700_000_000_000,
+            updated_at_unix_ms: 1_700_000_000_000,
+        },
+    ];
+
+    // Admin target demotion action metadata
+    let admin_target = &accounts[0];
+    let is_target_admin = admin_target.role == "admin";
+    let (role_icon, role_tooltip) = if is_target_admin {
+        (IconName::ShieldMinus, "Demote to Operator")
+    } else {
+        (IconName::ShieldCheck, "Promote to Administrator")
+    };
+    assert_eq!(role_icon, IconName::ShieldMinus);
+    assert_eq!(role_tooltip, "Demote to Operator");
+
+    // Operator target promotion action metadata
+    let op_target = &accounts[1];
+    let is_target_admin = op_target.role == "admin";
+    let (role_icon, role_tooltip) = if is_target_admin {
+        (IconName::ShieldMinus, "Demote to Operator")
+    } else {
+        (IconName::ShieldCheck, "Promote to Administrator")
+    };
+    assert_eq!(role_icon, IconName::ShieldCheck);
+    assert_eq!(role_tooltip, "Promote to Administrator");
+
+    // Deactivation action visibility
+    assert!(admin_target.active); // Action button included
+    assert!(op_target.active); // Action button included
+    let deactivated = &accounts[2];
+    assert!(!deactivated.active); // Action button excluded for deactivated
+
+    // Account count badge text with active accounts
+    use crate::gui::views::accounts::format_accounts_badge;
+    assert_eq!(format_accounts_badge(0, 0), "0 accounts");
+    assert_eq!(format_accounts_badge(1, 1), "1 active account");
+    assert_eq!(format_accounts_badge(1, 0), "1 account (0 active)");
+    assert_eq!(format_accounts_badge(3, 3), "3 active accounts");
+    assert_eq!(format_accounts_badge(3, 2), "3 accounts (2 active)");
+}
+
+#[test]
 fn agent_deployment_authorization_filtering_and_revocation_state() {
     use rustctrl_protocol::auth::InstallationAuthorizationEntry;
 
@@ -997,4 +1059,133 @@ fn fleet_device_item_presentation_attributes() {
     assert_eq!(tv_item.location_label(), "—");
     assert_eq!(tv_item.status, DeviceStatusKind::Unverified);
     assert!(tv_item.is_android_tv());
+}
+
+#[test]
+fn create_staff_account_overlay_state_and_success_transition() {
+    let mut overlay = Overlay::CreateStaffAccount {
+        username: String::new(),
+        role: "operator".into(),
+        temporary_password: "InitialPassword123!".into(),
+        error: None,
+        in_flight: false,
+        created: None,
+    };
+
+    if let Overlay::CreateStaffAccount {
+        role,
+        temporary_password,
+        in_flight,
+        created,
+        ..
+    } = &mut overlay
+    {
+        assert_eq!(role, "operator");
+        assert_eq!(temporary_password, "InitialPassword123!");
+        assert!(!*in_flight);
+        assert!(created.is_none());
+
+        // Toggle to admin role
+        *role = "admin".into();
+        assert_eq!(role, "admin");
+
+        // Simulate successful submission and transition to created state
+        *created = Some(StaffAccountCreatedInfo {
+            username: "sarah_admin".into(),
+            role: "admin".into(),
+            temporary_password: "GeneratedPass#456".into(),
+        });
+    } else {
+        panic!("expected CreateStaffAccount overlay");
+    }
+
+    if let Overlay::CreateStaffAccount { created, .. } = &overlay {
+        let info = created.as_ref().expect("created info should be present");
+        assert_eq!(info.username, "sarah_admin");
+        assert_eq!(info.role, "admin");
+        assert_eq!(info.temporary_password, "GeneratedPass#456");
+    } else {
+        panic!("expected CreateStaffAccount overlay");
+    }
+}
+
+#[test]
+fn create_staff_account_input_validation_rules() {
+    use crate::gui::overlays::create_account::validate_staff_account_inputs;
+
+    // Empty or whitespace-only username
+    assert_eq!(
+        validate_staff_account_inputs("", "ValidPass123!"),
+        Err("Username is required.")
+    );
+    assert_eq!(
+        validate_staff_account_inputs("   ", "ValidPass123!"),
+        Err("Username is required.")
+    );
+
+    // Username exceeding 64 characters
+    let long_user = "a".repeat(65);
+    assert_eq!(
+        validate_staff_account_inputs(&long_user, "ValidPass123!"),
+        Err("Username must not exceed 64 characters.")
+    );
+    let exact_64_user = "a".repeat(64);
+    assert!(validate_staff_account_inputs(&exact_64_user, "ValidPass123!").is_ok());
+
+    // Illegal characters
+    assert_eq!(
+        validate_staff_account_inputs("user name", "ValidPass123!"),
+        Err("Username may only contain letters, numbers, '.', '_', or '-'.")
+    );
+    assert_eq!(
+        validate_staff_account_inputs("user@admin", "ValidPass123!"),
+        Err("Username may only contain letters, numbers, '.', '_', or '-'.")
+    );
+    assert_eq!(
+        validate_staff_account_inputs("admin!", "ValidPass123!"),
+        Err("Username may only contain letters, numbers, '.', '_', or '-'.")
+    );
+
+    // Valid characters
+    assert!(validate_staff_account_inputs("sarah", "ValidPass123!").is_ok());
+    assert!(validate_staff_account_inputs("john.doe", "ValidPass123!").is_ok());
+    assert!(validate_staff_account_inputs("admin-01", "ValidPass123!").is_ok());
+    assert!(validate_staff_account_inputs("ops_user_2", "ValidPass123!").is_ok());
+
+    // Password length validation
+    assert_eq!(
+        validate_staff_account_inputs("valid_user", "short"),
+        Err("Temporary password must contain at least 8 characters.")
+    );
+    assert_eq!(
+        validate_staff_account_inputs("valid_user", "1234567"),
+        Err("Temporary password must contain at least 8 characters.")
+    );
+    assert!(validate_staff_account_inputs("valid_user", "12345678").is_ok());
+}
+
+#[test]
+fn temporary_password_generator_properties() {
+    const CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#$-_";
+
+    let mut generated_set = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let pass = rustctrl_core::generate_temporary_password();
+        assert_eq!(
+            pass.len(),
+            16,
+            "generated password must be exactly 16 chars"
+        );
+        assert!(
+            pass.bytes().all(|b| CHARSET.contains(&b)),
+            "generated password contains illegal characters: {pass}"
+        );
+        generated_set.insert(pass);
+    }
+    // With 16 characters from a 62-char alphabet, all 50 samples should be distinct
+    assert_eq!(
+        generated_set.len(),
+        50,
+        "all generated passwords should be unique"
+    );
 }
